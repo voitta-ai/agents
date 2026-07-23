@@ -1,0 +1,27 @@
+# Copy to config.yaml (gitignored) and fill in real values.
+agent: reddit-leads
+# Declarative only for now — a human/install-schedule helper wires this into
+# cron/launchd; the framework does not enforce it.
+schedule: "*/15 * * * *"
+
+source:
+  type: reddit
+  subreddits:
+    - construction
+    - smallbusiness
+    - contractors
+    - realestate
+    - hvac
+    - dentistry
+
+scorer:
+  type: regex
+
+destination:
+  type: slack
+  workspace: voitta2
+  routes:
+    - min_score: 30
+      channel: "#leads"
+    - min_score: 10
+      channel: "#leads-firehose"
