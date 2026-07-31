@@ -1,0 +1,18 @@
+[project]
+name = "agents-framework"
+version = "0.1.0"
+description = "Framework for small, single-purpose pain-signal / lead-finding agents."
+requires-python = ">=3.10"
+dependencies = [
+    "PyYAML>=6.0",
+]
+
+[project.scripts]
+agent = "framework.cli:main"
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["framework", "framework.plugins"]
