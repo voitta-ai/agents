@@ -5,6 +5,8 @@ description = "Framework for small, single-purpose pain-signal / lead-finding ag
 requires-python = ">=3.10"
 dependencies = [
     "PyYAML>=6.0",
+    "requests>=2.31",
+    "feedparser>=6.0",
 ]
 
 [project.scripts]
