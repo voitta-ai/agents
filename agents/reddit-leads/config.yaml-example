@@ -1,4 +1,5 @@
 # Copy to config.yaml (gitignored) and fill in real values.
+# Secrets never live here: each route names an env var holding its webhook URL.
 agent: reddit-leads
 # Declarative only for now — a human/install-schedule helper wires this into
 # cron/launchd; the framework does not enforce it.
@@ -6,6 +7,9 @@ schedule: "*/15 * * * *"
 
 source:
   type: reddit
+  # Plain list = newest posts from each subreddit (/new.rss). This is the
+  # reliable path: Reddit has been returning 403 for search RSS feeds since
+  # roughly March 2026.
   subreddits:
     - construction
     - smallbusiness
@@ -13,15 +17,73 @@ source:
     - realestate
     - hvac
     - dentistry
+  # Reddit rate-limits /new.rss aggressively: 0.5s (the hq monitor's pacing)
+  # earns a 429 within a couple of requests. 2s per feed measured clean.
+  delay_seconds: 2.0
+  # Mapping form adds per-subreddit search terms. Kept because it mirrors the
+  # hq monitor's config, but expect the searches to be blocked:
+  #
+  # subreddits:
+  #   construction:
+  #     searches: [paperwork, scheduling, invoicing, tracking]
+  #   smallbusiness:
+  #     searches: [spreadsheet, manual, overwhelmed, nightmare]
 
 scorer:
   type: regex
+  ignore_case: true
+  # presence = score a keyword once however often it appears (the hq reference
+  # behaviour). Use `count` only if repetition should genuinely mean more.
+  match: presence
+  floor: 0
+  rules:
+    # Pain indicators.
+    - {pattern: "nightmare", points: 20}
+    - {pattern: "spending hours", points: 20}
+    - {pattern: "frustrating", points: 15}
+    - {pattern: "overwhelmed", points: 15}
+    - {pattern: "drowning", points: 15}
+    - {pattern: "waste of time", points: 15}
+    - {pattern: "fed up", points: 15}
+    - {pattern: "manual process", points: 15}
+    - {pattern: "headache", points: 10}
+    - {pattern: "tired of", points: 10}
+    - {pattern: "better way", points: 10}
+    - {pattern: "spreadsheet", points: 10}
+    - {pattern: "paperwork", points: 10}
+    - {pattern: "chasing", points: 10}
+    - {pattern: "behind on", points: 10}
+    - {pattern: "struggling", points: 10}
+    - {pattern: "hate", points: 10}
+    - {pattern: "help!", points: 10}
+    - {pattern: "ugh", points: 5}
+    # Vendor/spam indicators — negative, to push marketing back down.
+    - {pattern: "#ad", points: -50}
+    - {pattern: "sponsored", points: -50}
+    - {pattern: "book a demo", points: -40}
+    - {pattern: "we built", points: -30}
+    - {pattern: "check out our", points: -30}
+    - {pattern: "try our", points: -30}
+    - {pattern: "link in bio", points: -30}
+    - {pattern: "free trial", points: -30}
+    - {pattern: "our platform", points: -25}
+    - {pattern: "our solution", points: -25}
+    - {pattern: "dm me", points: -20}
+    - {pattern: "sign up", points: -20}
+    - {pattern: "introducing", points: -15}
+  # Industry relevance boosts the whole score once, exactly as the hq reference
+  # did — matching several of these still multiplies only once.
+  multipliers:
+    - factor: 1.5
+      pattern: "construction|contractor|subcontractor|trades|real estate|property manager|landlord|tenant|healthcare|medical|dental|clinic|practice|plumber|electrician|hvac|technician|restaurant|hospitality|hotel|accounting|cpa|bookkeeping|law firm|small business|smb|owner|founder"
 
 destination:
   type: slack
-  workspace: voitta2
+  # A signal goes to the highest route it qualifies for, and only that one.
   routes:
     - min_score: 30
+      webhook_env: SLACK_LEADS_WEBHOOK_URL
       channel: "#leads"
     - min_score: 10
+      webhook_env: SLACK_LEADS_FIREHOSE_WEBHOOK_URL
       channel: "#leads-firehose"
