@@ -1,9 +1,9 @@
 # Copy to config.yaml (gitignored) and fill in real values.
 # Secrets never live here: each route names an env var holding its webhook URL.
 agent: reddit-leads
-# Declarative only for now — a human/install-schedule helper wires this into
-# cron/launchd; the framework does not enforce it.
-schedule: "*/15 * * * *"
+# Declarative only — launchd/cron owns the clock, the framework does not.
+# Matches the cadence of the pipeline this replaces (every 4 hours).
+schedule: "0 */4 * * *"
 
 source:
   type: reddit
@@ -26,64 +26,56 @@ source:
   # subreddits:
   #   construction:
   #     searches: [paperwork, scheduling, invoicing, tracking]
-  #   smallbusiness:
-  #     searches: [spreadsheet, manual, overwhelmed, nightmare]
 
 scorer:
   type: regex
   ignore_case: true
-  # presence = score a keyword once however often it appears (the hq reference
-  # behaviour). Use `count` only if repetition should genuinely mean more.
+  # presence = score a keyword once however often it appears. Required for
+  # parity: the reference counts distinct keywords matched, not occurrences.
   match: presence
   floor: 0
+  # These rules reproduce hq/leads/signals/reddit_monitor.py `score_post()`
+  # exactly. Verified case-by-case — see the PR for #8.
+  #
+  # Note the grouped alternations below are deliberate, not stylistic. The
+  # reference applies each bonus/penalty ONCE via `any(x in text for x in ...)`.
+  # Splitting them into separate rules would stack the bonus per matching
+  # phrase and inflate scores.
   rules:
-    # Pain indicators.
-    - {pattern: "nightmare", points: 20}
-    - {pattern: "spending hours", points: 20}
-    - {pattern: "frustrating", points: 15}
-    - {pattern: "overwhelmed", points: 15}
-    - {pattern: "drowning", points: 15}
-    - {pattern: "waste of time", points: 15}
-    - {pattern: "fed up", points: 15}
-    - {pattern: "manual process", points: 15}
+    # Pain keywords: the reference scores len(matched) * 10, so one rule each.
+    - {pattern: "nightmare", points: 10}
+    - {pattern: "frustrating", points: 10}
+    - {pattern: "hate", points: 10}
+    - {pattern: "struggle", points: 10}
+    - {pattern: "drowning", points: 10}
+    - {pattern: "overwhelmed", points: 10}
+    - {pattern: "spending hours", points: 10}
+    - {pattern: "waste of time", points: 10}
     - {pattern: "headache", points: 10}
     - {pattern: "tired of", points: 10}
+    - {pattern: "fed up", points: 10}
     - {pattern: "better way", points: 10}
+    - {pattern: "manual", points: 10}
     - {pattern: "spreadsheet", points: 10}
     - {pattern: "paperwork", points: 10}
     - {pattern: "chasing", points: 10}
     - {pattern: "behind on", points: 10}
-    - {pattern: "struggling", points: 10}
-    - {pattern: "hate", points: 10}
-    - {pattern: "help!", points: 10}
-    - {pattern: "ugh", points: 5}
-    # Vendor/spam indicators — negative, to push marketing back down.
-    - {pattern: "#ad", points: -50}
-    - {pattern: "sponsored", points: -50}
-    - {pattern: "book a demo", points: -40}
-    - {pattern: "we built", points: -30}
-    - {pattern: "check out our", points: -30}
-    - {pattern: "try our", points: -30}
-    - {pattern: "link in bio", points: -30}
-    - {pattern: "free trial", points: -30}
-    - {pattern: "our platform", points: -25}
-    - {pattern: "our solution", points: -25}
-    - {pattern: "dm me", points: -20}
-    - {pattern: "sign up", points: -20}
-    - {pattern: "introducing", points: -15}
-  # Industry relevance boosts the whole score once, exactly as the hq reference
-  # did — matching several of these still multiplies only once.
-  multipliers:
-    - factor: 1.5
-      pattern: "construction|contractor|subcontractor|trades|real estate|property manager|landlord|tenant|healthcare|medical|dental|clinic|practice|plumber|electrician|hvac|technician|restaurant|hospitality|hotel|accounting|cpa|bookkeeping|law firm|small business|smb|owner|founder"
+    - {pattern: "falling behind", points: 10}
+    # Question posts are often pain points. The reference tests the TITLE only,
+    # which `^[^\n]*` expresses because Signal.text is "title\n\ncontent".
+    - {pattern: "^[^\n]*\\?|^(how do|why do|what do|anyone else)", points: 15}
+    # Frustration markers — once, however many match.
+    - {pattern: "!!!|ugh|smh|ffs", points: 10}
+    # Vendor/solution posts — once, however many match.
+    - {pattern: "check out|we built|try our|dm me|link in", points: -30}
 
 destination:
   type: slack
-  # A signal goes to the highest route it qualifies for, and only that one.
+  # The live pipeline routes everything to one channel: its leads_webhook is
+  # deliberately blank so hot signals are not posted twice. Mirrored here as a
+  # single route. To restore two tiers, add a route with min_score 30 and its
+  # own webhook env var — the destination sends to the highest match only.
   routes:
-    - min_score: 30
-      webhook_env: SLACK_LEADS_WEBHOOK_URL
-      channel: "#leads"
     - min_score: 10
-      webhook_env: SLACK_LEADS_FIREHOSE_WEBHOOK_URL
-      channel: "#leads-firehose"
+      webhook_env: SLACK_COSIMA_APP_HOOK_VOITTA2
+      channel: "#voitta2"
