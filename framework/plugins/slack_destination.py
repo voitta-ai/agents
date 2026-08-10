@@ -50,30 +50,71 @@ class _Route:
 
 
 class SlackDestination:
-    def __init__(self, routes: list[_Route], timeout: int = 30):
+    def __init__(self, routes: list[_Route], timeout: int = 30, mode: str = "stream"):
+        if mode not in ("stream", "batch"):
+            raise ValueError(f"slack destination: mode must be 'stream' or 'batch', got {mode!r}")
         # Highest bar first, so the first match wins and a hot signal is not
         # also sent to the firehose.
         self._routes = sorted(routes, key=lambda r: r.min_score, reverse=True)
         self._timeout = timeout
+        self._mode = mode
+        self._buffered: dict[int, list[str]] = {}
 
-    def _format(self, scored: ScoredSignal) -> str:
+    def _format(self, scored: ScoredSignal, compact: bool = False) -> str:
+        """Render one signal.
+
+        Streaming keeps the full `signal.text` — that is what deployed agents
+        already post, and changing it would silently alter their output.
+        Batching uses `meta.title` when a source provides one, because ten full
+        post bodies in a single Slack message is unreadable. Sources without a
+        title fall back to the full text either way.
+        """
         sig = scored.signal
-        text = f"*[{scored.score}]* {sig.text}"
+        body = sig.text
+        if compact and isinstance(sig.meta, dict) and sig.meta.get("title"):
+            body = sig.meta["title"]
+        text = f"*[{scored.score}]* {body}"
         if sig.url:
             text += f"\n{sig.url}"
         return text
 
-    def send(self, scored: ScoredSignal) -> None:
+    def _post(self, route: _Route, text: str) -> None:
+        resp = requests.post(
+            route.webhook_url,
+            json={"text": text},
+            headers={"Content-type": "application/json"},
+            timeout=self._timeout,
+        )
+        resp.raise_for_status()
+
+    def _route_for(self, scored: ScoredSignal) -> _Route | None:
         for route in self._routes:
             if scored.score >= route.min_score:
-                resp = requests.post(
-                    route.webhook_url,
-                    json={"text": self._format(scored)},
-                    headers={"Content-type": "application/json"},
-                    timeout=self._timeout,
-                )
-                resp.raise_for_status()
-                return
+                return route
+        return None
+
+    def send(self, scored: ScoredSignal) -> None:
+        route = self._route_for(scored)
+        if route is None:
+            return
+        if self._mode == "stream":
+            self._post(route, self._format(scored))
+            return
+        self._buffered.setdefault(id(route), []).append(self._format(scored, compact=True))
+
+    def flush(self) -> None:
+        """Emit one message per route in batch mode. No-op when streaming."""
+        if self._mode != "batch":
+            return
+        for route in self._routes:
+            lines = self._buffered.get(id(route))
+            if not lines:
+                continue
+            header = f"*{len(lines)} signal(s)*"
+            if route.channel_label:
+                header += f" — {route.channel_label}"
+            self._post(route, header + "\n\n" + "\n\n".join(lines))
+        self._buffered.clear()
 
 
 def _build_route(cfg: dict, label: str) -> _Route:
@@ -102,5 +143,9 @@ def build(cfg: dict) -> Destination:
         # Flat single-route form, for agents that only ever post to one channel.
         routes = [_build_route(cfg, cfg.get("channel") or "destination")]
 
-    retval = SlackDestination(routes=routes, timeout=int(cfg.get("timeout", 30)))
+    retval = SlackDestination(
+        routes=routes,
+        timeout=int(cfg.get("timeout", 30)),
+        mode=cfg.get("mode", "stream"),
+    )
     return retval
