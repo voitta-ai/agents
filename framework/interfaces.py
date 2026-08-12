@@ -45,7 +45,14 @@ class Scorer(Protocol):
 
 
 class Destination(Protocol):
-    """Delivers a ScoredSignal somewhere. Slack for v1; email later."""
+    """Delivers a ScoredSignal somewhere. Slack for v1; email later.
+
+    A destination may also define `flush()`, called once by the runner after the
+    last signal. Streaming destinations deliver in `send()` and need no flush;
+    batching and digest destinations buffer in `send()` and emit in `flush()`.
+    It is deliberately not part of this Protocol — the runner discovers it with
+    getattr, so existing destinations stay valid without change (issue #26).
+    """
 
     def send(self, scored: ScoredSignal) -> None:
         ...
