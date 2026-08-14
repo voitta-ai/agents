@@ -34,6 +34,7 @@ Contract: see docs/PLUGIN-CONTRACT.md.
 """
 from __future__ import annotations
 
+import html
 import re
 import time
 from urllib.parse import quote
@@ -46,6 +47,44 @@ from framework.registry import register_source
 
 _DEFAULT_USER_AGENT = "voitta-agents:reddit-source/1.0 (+https://github.com/voitta-ai/agents)"
 _SUBREDDIT_RE = re.compile(r"/r/(\w+)/")
+
+# Reddit wraps post bodies in its own markers and appends a fixed footer that
+# carries no signal: "submitted by /u/x [link] [comments]".
+_SC_MARKERS = re.compile(r"<!--\s*SC_O(FF|N)\s*-->")
+_RSS_FOOTER = re.compile(
+    r"\s*submitted by\s*/?u?/?\S*\s*(\[link\])?\s*(\[comments\])?\s*$",
+    re.IGNORECASE | re.DOTALL,
+)
+_BLOCK_END = re.compile(r"</(p|div|li|h[1-6]|blockquote)>|<br\s*/?>", re.IGNORECASE)
+_TAG = re.compile(r"<[^>]+>")
+_WS = re.compile(r"[ \t]+")
+_BLANKS = re.compile(r"\n{3,}")
+
+
+def _clean_html(raw: str) -> str:
+    """Reddit's RSS `summary` is HTML, not text.
+
+    Left alone it reaches Slack as literal `<div class="md">`, `<br />` and
+    `&#32;`, and the scorer matches against markup instead of prose. Both are
+    fixed here rather than at the destination: markup is an artefact of this
+    source's transport, and every consumer downstream wants it gone.
+
+    Deliberately not a Markdown converter — the text is scored, and bold markers
+    would just be more noise to match against. Block-level tags become newlines
+    so paragraphs survive; everything else is dropped.
+    """
+    if not raw:
+        return ""
+    text = _SC_MARKERS.sub("", raw)
+    text = _BLOCK_END.sub("\n", text)
+    text = _TAG.sub("", text)
+    text = html.unescape(text)
+    # &#32; unescapes to a space, so collapse only after unescaping.
+    text = _WS.sub(" ", text)
+    text = "\n".join(line.strip() for line in text.splitlines())
+    text = _RSS_FOOTER.sub("", text)
+    retval = _BLANKS.sub("\n\n", text).strip()
+    return retval
 
 
 def _new_url(subreddit: str) -> str:
@@ -119,7 +158,7 @@ class RedditSource:
                 {
                     "id": entry.get("id", ""),
                     "title": entry.get("title", ""),
-                    "content": entry.get("summary", ""),
+                    "content": _clean_html(entry.get("summary", "")),
                     "author": entry.get("author", ""),
                     "url": entry.get("link", ""),
                     "published": entry.get("published", ""),
