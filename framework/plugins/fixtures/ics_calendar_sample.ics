@@ -1,0 +1,99 @@
+BEGIN:VCALENDAR
+VERSION:2.0
+PRODID:-//voitta-ai/agents//ics_source fixture//EN
+CALSCALE:GREGORIAN
+BEGIN:VEVENT
+UID:uid-standup-recurring@example.com
+DTSTAMP:20260601T000000Z
+DTSTART;TZID=America/Los_Angeles:20260701T090000
+DTEND;TZID=America/Los_Angeles:20260701T091500
+RRULE:FREQ=DAILY;COUNT=90
+SUMMARY:Daily team standup
+ORGANIZER;CN=Colleague One:mailto:colleague1@example.com
+ATTENDEE;CN=Calendar Owner;PARTSTAT=ACCEPTED:mailto:owner@example.com
+ATTENDEE;CN=Colleague One;PARTSTAT=ACCEPTED:mailto:colleague1@example.com
+ATTENDEE;CN=Colleague Two;PARTSTAT=NEEDS-ACTION:mailto:colleague2@example.com
+END:VEVENT
+BEGIN:VEVENT
+UID:uid-standup-recurring@example.com
+RECURRENCE-ID;TZID=America/Los_Angeles:20260824T090000
+DTSTAMP:20260820T000000Z
+DTSTART;TZID=America/Los_Angeles:20260824T093000
+DTEND;TZID=America/Los_Angeles:20260824T100000
+SUMMARY:Daily team standup (moved 30 min)
+ORGANIZER;CN=Colleague One:mailto:colleague1@example.com
+ATTENDEE;CN=Calendar Owner;PARTSTAT=ACCEPTED:mailto:owner@example.com
+ATTENDEE;CN=Colleague One;PARTSTAT=ACCEPTED:mailto:colleague1@example.com
+ATTENDEE;CN=Colleague Two;PARTSTAT=NEEDS-ACTION:mailto:colleague2@example.com
+END:VEVENT
+BEGIN:VEVENT
+UID:uid-recurring-excluded@example.com
+DTSTAMP:20260601T000000Z
+DTSTART;TZID=America/Los_Angeles:20260701T110000
+DTEND;TZID=America/Los_Angeles:20260701T113000
+RRULE:FREQ=DAILY;COUNT=90
+EXDATE;TZID=America/Los_Angeles:20260824T110000
+SUMMARY:Weekly leadership sync
+ORGANIZER;CN=Calendar Owner:mailto:owner@example.com
+ATTENDEE;CN=Calendar Owner;PARTSTAT=ACCEPTED:mailto:owner@example.com
+ATTENDEE;CN=VP:mailto:vp@example.com
+END:VEVENT
+BEGIN:VEVENT
+UID:uid-accepted-1@example.com
+DTSTAMP:20260820T000000Z
+DTSTART;TZID=America/New_York:20260824T130000
+DTEND;TZID=America/New_York:20260824T133000
+SUMMARY:Double Door weekly sync
+ORGANIZER;CN=Colleague One:mailto:colleague1@example.com
+ATTENDEE;CN=Calendar Owner;PARTSTAT=ACCEPTED:mailto:owner@example.com
+ATTENDEE;CN=Colleague One;PARTSTAT=ACCEPTED:mailto:colleague1@example.com
+ATTENDEE;CN=Colleague Two;PARTSTAT=ACCEPTED:mailto:colleague2@example.com
+END:VEVENT
+BEGIN:VEVENT
+UID:uid-organized-1@example.com
+DTSTAMP:20260820T000000Z
+DTSTART;TZID=America/Los_Angeles:20260824T150000
+DTEND;TZID=America/Los_Angeles:20260824T153000
+SUMMARY:1:1 with report
+ORGANIZER;CN=Calendar Owner:mailto:owner@example.com
+ATTENDEE;CN=Calendar Owner;PARTSTAT=ACCEPTED:mailto:owner@example.com
+ATTENDEE;CN=Direct Report;PARTSTAT=NEEDS-ACTION:mailto:report@example.com
+END:VEVENT
+BEGIN:VEVENT
+UID:uid-group-invite-1@example.com
+DTSTAMP:20260820T000000Z
+DTSTART;TZID=America/Los_Angeles:20260824T140000
+DTEND;TZID=America/Los_Angeles:20260824T150000
+SUMMARY:ctox accelerator office hours
+ORGANIZER;CN=Community Team:mailto:community@example.com
+ATTENDEE;CN=Calendar Owner;PARTSTAT=NEEDS-ACTION:mailto:owner@example.com
+ATTENDEE;CN=Founder A:mailto:foundera@example.com
+ATTENDEE;CN=Founder B:mailto:founderb@example.com
+END:VEVENT
+BEGIN:VEVENT
+UID:uid-declined-1@example.com
+DTSTAMP:20260820T000000Z
+DTSTART;TZID=America/Los_Angeles:20260824T160000
+DTEND;TZID=America/Los_Angeles:20260824T163000
+SUMMARY:Optional vendor demo
+ORGANIZER;CN=Vendor Rep:mailto:vendor@example.com
+ATTENDEE;CN=Calendar Owner;PARTSTAT=DECLINED:mailto:owner@example.com
+ATTENDEE;CN=Vendor Rep;PARTSTAT=ACCEPTED:mailto:vendor@example.com
+END:VEVENT
+BEGIN:VEVENT
+UID:uid-allday-1@example.com
+DTSTAMP:20260820T000000Z
+DTSTART;VALUE=DATE:20260824
+DTEND;VALUE=DATE:20260825
+SUMMARY:Company holiday
+END:VEVENT
+BEGIN:VEVENT
+UID:uid-today-1@example.com
+DTSTAMP:20260820T000000Z
+DTSTART;TZID=America/Los_Angeles:20260823T090000
+DTEND;TZID=America/Los_Angeles:20260823T093000
+SUMMARY:Today control event (must not appear in tomorrow's output)
+ORGANIZER;CN=Colleague One:mailto:colleague1@example.com
+ATTENDEE;CN=Calendar Owner;PARTSTAT=ACCEPTED:mailto:owner@example.com
+END:VEVENT
+END:VCALENDAR

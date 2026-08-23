@@ -13,6 +13,7 @@ Wave 1 lands the first real plugins:
 from __future__ import annotations
 
 from framework.plugins import agentmail_source  # noqa: F401
+from framework.plugins import ics_source  # noqa: F401
 from framework.plugins import reddit_source  # noqa: F401
 from framework.plugins import regex_scorer  # noqa: F401
 from framework.plugins import slack_destination  # noqa: F401
