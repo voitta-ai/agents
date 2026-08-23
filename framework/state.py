@@ -31,3 +31,9 @@ class SeenStore:
     def save(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.path.write_text(json.dumps(sorted(self._seen)))
+
+    def __len__(self) -> int:
+        # Total dedupe-store size, for the runner's per-run summary line
+        # (issue #31) -- lets "seen" grow visibly even on a zero-signal run.
+        retval = len(self._seen)
+        return retval
