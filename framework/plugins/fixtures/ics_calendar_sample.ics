@@ -43,7 +43,7 @@ UID:uid-accepted-1@example.com
 DTSTAMP:20260820T000000Z
 DTSTART;TZID=America/New_York:20260824T130000
 DTEND;TZID=America/New_York:20260824T133000
-SUMMARY:Double Door weekly sync
+SUMMARY:Partner org weekly sync
 ORGANIZER;CN=Colleague One:mailto:colleague1@example.com
 ATTENDEE;CN=Calendar Owner;PARTSTAT=ACCEPTED:mailto:owner@example.com
 ATTENDEE;CN=Colleague One;PARTSTAT=ACCEPTED:mailto:colleague1@example.com
@@ -64,7 +64,7 @@ UID:uid-group-invite-1@example.com
 DTSTAMP:20260820T000000Z
 DTSTART;TZID=America/Los_Angeles:20260824T140000
 DTEND;TZID=America/Los_Angeles:20260824T150000
-SUMMARY:ctox accelerator office hours
+SUMMARY:Accelerator office hours
 ORGANIZER;CN=Community Team:mailto:community@example.com
 ATTENDEE;CN=Calendar Owner;PARTSTAT=NEEDS-ACTION:mailto:owner@example.com
 ATTENDEE;CN=Founder A:mailto:foundera@example.com
@@ -94,6 +94,56 @@ DTSTART;TZID=America/Los_Angeles:20260823T090000
 DTEND;TZID=America/Los_Angeles:20260823T093000
 SUMMARY:Today control event (must not appear in tomorrow's output)
 ORGANIZER;CN=Colleague One:mailto:colleague1@example.com
+ATTENDEE;CN=Calendar Owner;PARTSTAT=ACCEPTED:mailto:owner@example.com
+END:VEVENT
+BEGIN:VEVENT
+UID:uid-spans-midnight-1@example.com
+DTSTAMP:20260820T000000Z
+DTSTART;TZID=America/Los_Angeles:20260823T230000
+DTEND;TZID=America/Los_Angeles:20260824T003000
+SUMMARY:Spans midnight into tomorrow (must appear)
+ORGANIZER;CN=Colleague One:mailto:colleague1@example.com
+ATTENDEE;CN=Calendar Owner;PARTSTAT=ACCEPTED:mailto:owner@example.com
+END:VEVENT
+BEGIN:VEVENT
+UID:uid-ends-at-midnight-1@example.com
+DTSTAMP:20260820T000000Z
+DTSTART;TZID=America/Los_Angeles:20260823T220000
+DTEND;TZID=America/Los_Angeles:20260824T000000
+SUMMARY:Ends exactly at midnight (must NOT appear)
+ORGANIZER;CN=Colleague One:mailto:colleague1@example.com
+ATTENDEE;CN=Calendar Owner;PARTSTAT=ACCEPTED:mailto:owner@example.com
+END:VEVENT
+BEGIN:VEVENT
+UID:uid-floating-1@example.com
+DTSTAMP:20260820T000000Z
+DTSTART:20260824T110000
+DTEND:20260824T113000
+SUMMARY:Floating time no TZID (must appear, owner-local)
+ORGANIZER;CN=Colleague Two:mailto:colleague2@example.com
+ATTENDEE;CN=Calendar Owner;PARTSTAT=ACCEPTED:mailto:owner@example.com
+END:VEVENT
+BEGIN:VEVENT
+UID:uid-multiday-allday-1@example.com
+DTSTAMP:20260820T000000Z
+DTSTART;VALUE=DATE:20260823
+DTEND;VALUE=DATE:20260826
+SUMMARY:Multi-day all-day spanning tomorrow exclusive DTEND (must appear)
+END:VEVENT
+BEGIN:VEVENT
+UID:uid-allday-ends-tomorrow-1@example.com
+DTSTAMP:20260820T000000Z
+DTSTART;VALUE=DATE:20260822
+DTEND;VALUE=DATE:20260824
+SUMMARY:All-day whose exclusive DTEND is tomorrow (must NOT appear)
+END:VEVENT
+BEGIN:VEVENT
+UID:uid-dst-boundary-1@example.com
+DTSTAMP:20260820T000000Z
+DTSTART;TZID=America/Los_Angeles:20260824T013000
+DTEND;TZID=America/Los_Angeles:20260824T023000
+SUMMARY:Early-morning local time near a DST-style boundary (must appear)
+ORGANIZER;CN=Colleague Two:mailto:colleague2@example.com
 ATTENDEE;CN=Calendar Owner;PARTSTAT=ACCEPTED:mailto:owner@example.com
 END:VEVENT
 END:VCALENDAR

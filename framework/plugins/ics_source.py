@@ -185,6 +185,19 @@ def _all_day_covers(start_date: date, end_date_exclusive: date, day: date) -> bo
     return retval
 
 
+def _timed_overlaps(
+    start: datetime, end: datetime, window_start: datetime, window_end: datetime
+) -> bool:
+    """Whether a timed event intersects the window at all.
+
+    Deliberately overlap rather than start-in-window: an event that begins today
+    and runs past midnight is on tomorrow's calendar, and silently dropping it is
+    the exact failure this agent exists to prevent. Half-open on both sides, so
+    an event ending exactly at midnight does not count as tomorrow's."""
+    retval = start < window_end and end > window_start
+    return retval
+
+
 def _exdate_instants(component: icalendar.Event, owner_tz: ZoneInfo) -> set[datetime]:
     prop = component.get("exdate")
     if prop is None:
@@ -224,9 +237,12 @@ def _expand_master(
     exdates = _exdate_instants(component, owner_tz)
 
     occurrences: list[tuple[datetime, datetime]] = []
-    for occ_start_native in rule.between(window_start, window_end, inc=True):
+    # Search back by one duration: an occurrence that starts before the window
+    # but runs into it overlaps tomorrow and must be reported.
+    search_start = window_start - duration
+    for occ_start_native in rule.between(search_start, window_end, inc=True):
         occ_start = occ_start_native.astimezone(owner_tz)
-        if not (window_start <= occ_start < window_end):
+        if not _timed_overlaps(occ_start, occ_start + duration, window_start, window_end):
             continue
         instant = occ_start.astimezone(dt_timezone.utc)
         if instant in exdates or instant in skip_instants:
@@ -260,7 +276,7 @@ def _expand_calendar(
             if all_day:
                 if _all_day_covers(start, end, tomorrow):
                     results.append((override, start, end, all_day))
-            elif window_start <= start < window_end:
+            elif _timed_overlaps(start, end, window_start, window_end):
                 results.append((override, start, end, all_day))
 
         for master in masters:
@@ -277,7 +293,7 @@ def _expand_calendar(
                 if all_day:
                     if _all_day_covers(start, end, tomorrow):
                         results.append((master, start, end, all_day))
-                elif window_start <= start < window_end:
+                elif _timed_overlaps(start, end, window_start, window_end):
                     results.append((master, start, end, all_day))
     return results
 
@@ -315,17 +331,23 @@ def _classify(
          guess "must".
     """
     if not attendees:
-        return ("must", "Personal calendar entry.")
+        retval = ("must", "Personal calendar entry.")
+        return retval
     if owner_email and organizer_email == owner_email:
-        return ("must", "You organized it.")
+        retval = ("must", "You organized it.")
+        return retval
     for email, partstat in attendees:
         if email == owner_email:
             if partstat in _ACCEPTED_PARTSTATS:
-                return ("must", "You accepted.")
+                retval = ("must", "You accepted.")
+                return retval
             if partstat in _DECLINED_PARTSTATS:
-                return None
-            return ("may", "Group event, optional, you have not responded.")
-    return ("may", "Group event, optional; your response status could not be determined.")
+                retval = None
+                return retval
+            retval = ("may", "Group event, optional, you have not responded.")
+            return retval
+    retval = ("may", "Group event, optional; your response status could not be determined.")
+    return retval
 
 
 class ICSSource:
@@ -364,7 +386,28 @@ class ICSSource:
     def parse(self, raw: bytes) -> list[Signal]:
         """Split out from `fetch()` so it can be exercised directly against a
         fixture file, with no network involved."""
-        cal = icalendar.Calendar.from_ical(raw)
+        try:
+            cal = icalendar.Calendar.from_ical(raw)
+        except Exception as exc:
+            raise RuntimeError(
+                f"ICS feed at {self.url} did not parse as a calendar: {exc}. "
+                "Treating this as a hard failure rather than an empty day - a "
+                "feed that stops being a calendar must not read as 'nothing "
+                "scheduled tomorrow'."
+            ) from exc
+
+        # An empty day is legitimate; a feed carrying no VEVENT at all is not.
+        # Distinguishing them is the whole point: the repo has already been
+        # bitten twice by a broken source that looked like a quiet one.
+        if not list(cal.walk("VEVENT")):
+            raise RuntimeError(
+                f"ICS feed at {self.url} contains no VEVENT components. "
+                "A calendar with zero events is almost always a broken or "
+                "wrong URL, an auth redirect, or an HTML error page - not a "
+                "genuinely empty calendar. Verify the URL before assuming "
+                "there is nothing scheduled."
+            )
+
         window_start, window_end = self._tomorrow_window()
 
         signals: list[Signal] = []
