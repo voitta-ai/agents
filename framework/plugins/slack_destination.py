@@ -59,7 +59,6 @@ class SlackDestination:
         self._timeout = timeout
         self._mode = mode
         self._buffered: dict[int, list[str]] = {}
-        self._declined = 0
 
     def _format(self, scored: ScoredSignal, compact: bool = False) -> str:
         """Render one signal.
@@ -97,7 +96,6 @@ class SlackDestination:
     def send(self, scored: ScoredSignal) -> None:
         route = self._route_for(scored)
         if route is None:
-            self._declined += 1
             return
         if self._mode == "stream":
             self._post(route, self._format(scored))
@@ -117,16 +115,6 @@ class SlackDestination:
                 header += f" — {route.channel_label}"
             self._post(route, header + "\n\n" + "\n\n".join(lines))
         self._buffered.clear()
-
-    def declined_count(self) -> int:
-        """Signals this run that scored below every route's min_score.
-
-        Read by the runner's per-run summary line via getattr, the same
-        optional-hook discovery pattern as `flush()` (issue #31) -- this
-        keeps the Destination protocol itself unaware of min_score.
-        """
-        retval = self._declined
-        return retval
 
 
 def _build_route(cfg: dict, label: str) -> _Route:

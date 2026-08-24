@@ -52,13 +52,6 @@ class Destination(Protocol):
     batching and digest destinations buffer in `send()` and emit in `flush()`.
     It is deliberately not part of this Protocol — the runner discovers it with
     getattr, so existing destinations stay valid without change (issue #26).
-
-    A destination may also define `declined_count() -> int`, discovered the
-    same way, reporting how many signals passed to `send()` this run it chose
-    not to deliver (e.g. below a configured min_score). This lets the runner's
-    per-run summary line distinguish "declined by the destination" from
-    "nothing new to send" without the runner knowing any destination's own
-    gating rules (issue #31).
     """
 
     def send(self, scored: ScoredSignal) -> None:
