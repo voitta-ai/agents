@@ -31,7 +31,7 @@ import os
 import requests
 
 from framework.interfaces import Destination, ScoredSignal
-from framework.llm import LLMClient, LLMError
+from framework.llm import LLMClient, load_openclaw_chain, LLMError
 from framework.registry import register_destination
 
 _DEFAULT_SYSTEM = (
@@ -133,20 +133,33 @@ def build(cfg: dict) -> Destination:
     if not prompt:
         raise RuntimeError("digest destination needs a 'prompt'")
 
+    # An explicit model chain in the agent's own config wins. Absent one, fall
+    # back to OpenClaw's shared chain so there is a single waterfall to
+    # maintain rather than one copy per agent.
     model_cfg = cfg.get("model") or {}
     primary = model_cfg.get("primary")
+    fallbacks = model_cfg.get("fallbacks")
     if not primary:
-        raise RuntimeError("digest destination needs 'model.primary'")
+        shared = load_openclaw_chain()
+        if shared is None:
+            raise RuntimeError(
+                "digest destination needs 'model.primary', or an OpenClaw config "
+                "at ~/.openclaw/openclaw.json providing agents.defaults.model"
+            )
+        primary, fallbacks = shared
 
+    # Only OpenRouter entries need a key. A chain whose entries are all
+    # `codex/...` runs on the ChatGPT subscription with no API key at all, which
+    # is the main reason that transport exists -- so requiring the key up front
+    # would defeat it. A missing key becomes a per-model failure at the point an
+    # OpenRouter entry is actually attempted.
     key_env = cfg.get("api_key_env", "OPENROUTER_API_KEY")
     api_key = os.environ.get(key_env)
-    if not api_key:
-        raise RuntimeError(f"digest destination needs the LLM API key in ${key_env}")
 
     llm = LLMClient(
         api_key=api_key,
         primary=primary,
-        fallbacks=model_cfg.get("fallbacks"),
+        fallbacks=fallbacks,
         timeout=int(cfg.get("llm_timeout", 120)),
         max_tokens=int(cfg.get("max_tokens", 2000)),
         temperature=float(cfg.get("temperature", 0.3)),

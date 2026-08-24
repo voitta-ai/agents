@@ -175,6 +175,8 @@ class GitHubOrgSource:
         signals: list[Signal] = []
         repos = self._repos()
 
+        attempted = 0
+        succeeded = 0
         for repo in repos:
             name = repo["name"]
             for label, fn, enabled in (
@@ -184,16 +186,23 @@ class GitHubOrgSource:
             ):
                 if not enabled:
                     continue
+                attempted += 1
                 try:
                     signals.extend(fn(name))
+                    succeeded += 1
                 except GitHubCLIError as exc:
                     # One inaccessible repo must not sink the whole run, but the
                     # gap has to be visible rather than looking like a quiet week.
                     self.skipped.append((f"{name}:{label}", str(exc)[:120]))
 
-        if repos and len(self.skipped) >= len(repos):
+        # Compare feed calls against feed calls. Counting failures against the
+        # *repo* count meant one failing feed per repo (say issues disabled
+        # org-wide) tripped the all-failed guard even though pulls and commits
+        # had succeeded everywhere -- turning a good run into a hard error.
+        if attempted and not succeeded:
             raise GitHubCLIError(
-                f"github-org: every repo failed — {self.skipped[0][1] if self.skipped else ''}"
+                f"github-org: all {attempted} feed call(s) failed — "
+                f"{self.skipped[0][1] if self.skipped else ''}"
             )
 
         retval = signals

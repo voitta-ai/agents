@@ -8,10 +8,9 @@ models; the same shape applies here.
 Two transports, chosen by the prefix on each chain entry:
 
   - `codex/<model>` runs the local `codex` CLI, which authenticates with the
-    **ChatGPT subscription** rather than an API key. This is what
-    voitta-ai/shmobster#35 asked for — using the subscription as part of the
-    waterfall, the way OpenClaw already can. Output is read from
-    `--output-last-message` rather than scraped from stdout, which also carries
+    **ChatGPT subscription** rather than an API key, putting the subscription
+    into the waterfall the way OpenClaw already can. Output is read from the
+    `-o` last-message file rather than scraped from stdout, which also carries
     hook chatter and token counts.
   - `openrouter/<model>` calls OpenRouter's OpenAI-compatible endpoint with an
     API key. One key covers every model behind it.
@@ -30,28 +29,93 @@ a quiet week, which is the failure mode this codebase keeps running into.
 """
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import subprocess
 import tempfile
+from pathlib import Path
 
 import requests
 
 _OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+_OPENCLAW_CONFIG = "~/.openclaw/openclaw.json"
+
+# OpenClaw names the subscription transport `openai-codex/`; this module keys
+# the transport off `codex/`. Same thing, different label, so normalise on the
+# way in rather than teaching `complete()` two spellings.
+_TRANSPORT_ALIASES = {"openai-codex": "codex"}
 
 
 class LLMError(RuntimeError):
     """Every model in the waterfall failed."""
 
 
+class LLMConfigError(RuntimeError):
+    """A model chain was configured, but could not be read."""
+
+
 class _ModelUnavailable(RuntimeError):
     """This model could not answer; try the next one in the chain."""
+
+
+def _normalise_entry(entry: str) -> str:
+    """Map an OpenClaw transport prefix onto this module's."""
+    provider, sep, model = str(entry).partition("/")
+    if sep and provider in _TRANSPORT_ALIASES:
+        retval = f"{_TRANSPORT_ALIASES[provider]}/{model}"
+        return retval
+    retval = str(entry)
+    return retval
+
+
+def load_openclaw_chain(path: str | os.PathLike | None = None) -> tuple[str, list[str]] | None:
+    """Read `agents.defaults.model` from OpenClaw's config, as (primary, fallbacks).
+
+    The point of reading OpenClaw's config rather than duplicating a chain in
+    every agent config is that there is then exactly one waterfall to maintain:
+    change the fallback list once and every agent follows.
+
+    Missing config is not an error — it means "this machine has no OpenClaw, use
+    the agent's own model config", so this returns None and the caller decides.
+    Config that *exists but cannot be used* is always an error, never a silent
+    fallback: a typo'd chain that quietly degraded to some default would be
+    exactly the class of silent failure this repo keeps getting bitten by.
+    """
+    config_path = Path(path).expanduser() if path is not None else Path(_OPENCLAW_CONFIG).expanduser()
+    if not config_path.exists():
+        return None
+
+    try:
+        raw = json.loads(config_path.read_text())
+    except (OSError, ValueError) as exc:
+        raise LLMConfigError(f"{config_path} exists but could not be read as JSON: {exc}") from exc
+
+    if not isinstance(raw, dict):
+        raise LLMConfigError(f"{config_path} is not a JSON object")
+
+    model_cfg = (raw.get("agents") or {}).get("defaults", {}).get("model")
+    if model_cfg is None:
+        return None
+    if not isinstance(model_cfg, dict):
+        raise LLMConfigError(f"{config_path}: agents.defaults.model is not an object")
+
+    primary = model_cfg.get("primary")
+    if not primary or not isinstance(primary, str):
+        raise LLMConfigError(f"{config_path}: agents.defaults.model.primary is missing or not a string")
+
+    raw_fallbacks = model_cfg.get("fallbacks") or []
+    if not isinstance(raw_fallbacks, list) or not all(isinstance(f, str) for f in raw_fallbacks):
+        raise LLMConfigError(f"{config_path}: agents.defaults.model.fallbacks must be a list of strings")
+
+    retval = (_normalise_entry(primary), [_normalise_entry(f) for f in raw_fallbacks])
+    return retval
 
 
 class LLMClient:
     def __init__(
         self,
-        api_key: str,
+        api_key: str | None,
         primary: str,
         fallbacks: list[str] | None = None,
         timeout: int = 120,
@@ -72,6 +136,16 @@ class LLMClient:
         """Run one turn through the codex CLI, on the ChatGPT subscription."""
         if not shutil.which("codex"):
             raise _ModelUnavailable("codex CLI not on PATH")
+        try:
+            retval = self._run_codex(model, system, user)
+        except OSError as exc:
+            # A local temp-dir or file-read problem says nothing about whether
+            # the next model can answer, so fall through instead of aborting
+            # the whole waterfall.
+            raise _ModelUnavailable(f"codex local I/O failed: {exc}") from exc
+        return retval
+
+    def _run_codex(self, model: str, system: str, user: str) -> str:
         with tempfile.TemporaryDirectory() as tmp:
             out = os.path.join(tmp, "last-message.txt")
             args = ["codex", "exec", "--skip-git-repo-check", "-o", out]
@@ -110,6 +184,13 @@ class LLMClient:
             # Anything else is an OpenRouter model id; strip a leading
             # "openrouter/" if present, since that names the transport not the model.
             model = model if provider == "openrouter" else entry
+            if not self.api_key:
+                # Only OpenRouter entries need a key. A codex-first chain must
+                # stay runnable on the subscription alone, which is the main
+                # reason that transport exists -- so this is a per-model skip,
+                # not a hard precondition.
+                failures.append(f"{entry}: no OpenRouter API key configured")
+                continue
             try:
                 resp = requests.post(
                     self.base_url,
@@ -140,12 +221,19 @@ class LLMClient:
                 # reject the same request identically.
                 raise LLMError(f"{entry}: HTTP {resp.status_code} {resp.text[:200]}")
 
-            payload = resp.json()
-            choices = payload.get("choices") or []
+            try:
+                payload = resp.json()
+                choices = payload.get("choices") or []
+                content = (choices[0].get("message") or {}).get("content") or "" if choices else ""
+            except (ValueError, AttributeError, TypeError, IndexError) as exc:
+                # A 200 carrying HTML, an empty body, or an unexpected shape is
+                # this model failing, not the request being wrong. Record it and
+                # try the next one rather than aborting the chain.
+                failures.append(f"{entry}: unreadable response ({type(exc).__name__})")
+                continue
             if not choices:
                 failures.append(f"{entry}: no choices in response")
                 continue
-            content = (choices[0].get("message") or {}).get("content") or ""
             if not content.strip():
                 failures.append(f"{entry}: empty completion")
                 continue
