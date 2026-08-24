@@ -1,10 +1,9 @@
 """Slack-workspace source — read community workspaces we don't administer (issue #19).
 
-Every Slack token this repo holds (`MANDA_SLACK_BOT_TOKEN`, `SLACK_ORIG_BOT_TOKEN`,
-`SLACK_BARRYMORE_BOT_TOKEN`, `SLACK_COSIMA_BOT_TOKEN`) is scoped to our own
-workspace, so there is no bot path into a community workspace, and getting an
-app installed there needs admin approval we are unlikely to get. See issue #19
-for the full feasibility writeup.
+Every Slack bot token this repo holds is scoped to a workspace we administer, so
+there is no bot path into a community workspace, and getting an app installed
+there needs admin approval we are unlikely to get. See issue #19 for the full
+feasibility writeup.
 
 ## Two transports, one shipped
 
@@ -15,7 +14,7 @@ later without reshaping the config or the Source interface:
     emails are forwarded to an AgentMail inbox; this plugin is a thin
     composition wrapper over the existing `agentmail` source
     (`framework/plugins/agentmail_source.py`). Zero new auth, unambiguously
-    within ToS, identical in shape to the already-deployed toptal agent.
+    within ToS, identical in shape to an already-deployed agent.
     Coarse granularity: you get what Slack chooses to email, not full channel
     history, and per-message links rather than threads.
 

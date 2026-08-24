@@ -28,9 +28,9 @@ source:
   inbox: "<agent-inbox>@agentmail.to"
   api_key_env: AGENTMAIL_API_KEY
 
-  # An inbox is often shared across agents (e.g. toptal digests land in the
-  # same one) — scope to this workspace's notification sender so unrelated
-  # mail is never scored as a Slack signal.
+  # An inbox is often shared across agents (another agent's digests may land
+  # in the same one) — scope to this workspace's notification sender so
+  # unrelated mail is never scored as a Slack signal.
   from_contains:
     - "<notification-sender-domain>"
 
