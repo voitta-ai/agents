@@ -22,3 +22,4 @@ from framework.plugins import github_org_source  # noqa: F401
 from framework.plugins import reddit_source  # noqa: F401
 from framework.plugins import regex_scorer  # noqa: F401
 from framework.plugins import slack_destination  # noqa: F401
+from framework.plugins import slack_workspace_source  # noqa: F401
