@@ -1,0 +1,61 @@
+# Copy to config.yaml (gitignored) and fill in real values.
+# Secrets never live here: credentials are named by env var, not stored.
+#
+# This is one agent per community workspace. Copy this directory (or just
+# this file, renamed) per workspace and give each its own `agent:` name so
+# their .seen-*.json dedupe state does not collide.
+agent: slack-workspace-example
+schedule: "0 */6 * * *"
+
+source:
+  type: slack-workspace
+  # Only 'agentmail' is implemented (issue #19). 'session' (xoxc token) is a
+  # real option with a working client in voitta-ai/skillz
+  # (slack-xoxc-session-client), but using it against a community workspace
+  # is an explicit authorization decision that has not been made yet -
+  # selecting it raises rather than silently doing something else.
+  transport: agentmail
+
+  # Label only, for the Signal's source/meta fields — not a credential.
+  # Setup: turn on the workspace's own notification/digest emails (Slack
+  # workspace preferences -> Notifications) and forward them to the
+  # AgentMail inbox below.
+  workspace: "<workspace-label>"
+
+  # AgentMail inbox that receives the forwarded digest emails, and the env
+  # var holding its API key. Falls back to AGENTMAIL_EMAIL if 'inbox' is
+  # omitted, same as the agentmail source (issue #12).
+  inbox: "<agent-inbox>@agentmail.to"
+  api_key_env: AGENTMAIL_API_KEY
+
+  # An inbox is often shared across agents (another agent's digests may land
+  # in the same one) — scope to this workspace's notification sender so
+  # unrelated mail is never scored as a Slack signal.
+  from_contains:
+    - "<notification-sender-domain>"
+
+  # Coarse, best-effort: AgentMail's message list has no structured channel
+  # field, so this matches the channel name against the combined
+  # subject+body text. Omit for everything the digest emails cover.
+  channels:
+    - "#<channel-name>"
+
+  # Bounds how many recent inbox messages are considered per run (not a
+  # time window — AgentMail's list endpoint doesn't support one, and the
+  # digest emails already arrive on Slack's own cadence).
+  limit: 50
+
+scorer:
+  type: regex
+  ignore_case: true
+  match: presence
+  floor: 0
+  rules:
+    - {pattern: "<keyword-worth-flagging>", points: 10}
+
+destination:
+  type: slack
+  routes:
+    - min_score: 10
+      webhook_env: SLACK_WORKSPACE_DIGEST_WEBHOOK
+      channel: "#<internal-digest-channel>"
