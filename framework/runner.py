@@ -38,7 +38,14 @@ destination declined by its own gating (say a per-route min_score). That would
 mean new optional protocol surface on `Destination`, which is wider than issue
 #31 asked for, and absent that hook the number is simply unknowable — so
 reporting `declined=0` by default would be a guess presented as a fact.
-Comparing `sent` against `new` already shows whether anything was held back.
+
+Note what this does *not* buy: `sent` and `new` are equal by construction on any
+successful run, because a signal is counted and appended in the same iteration.
+They diverge only on a failure path. So the line cannot tell you a destination
+gated something internally, and nothing here pretends otherwise — a destination
+that drops signals by its own rules has to say so in its own logs. Naming the
+counter `sent` rather than `delivered` is the whole of the honesty available at
+this layer.
 """
 from __future__ import annotations
 
