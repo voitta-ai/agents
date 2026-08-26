@@ -7,6 +7,9 @@ dependencies = [
     "PyYAML>=6.0",
     "requests>=2.31",
     "feedparser>=6.0",
+    "icalendar>=6.0",
+    "python-dateutil>=2.9",
+    "tzdata>=2024.1",
 ]
 
 [project.scripts]

@@ -38,6 +38,9 @@ agents/<name>/       one dir per agent: its config + any agent-specific glue
 
 - `agents/reddit-leads/` — first agent, porting the pain-signal Reddit
   monitor currently running out of `hq/leads/signals/`. See issue #8.
+- `agents/slack-workspace/` — digests community Slack workspaces we
+  participate in but don't administer, via their own notification emails
+  forwarded to AgentMail. See issue #19.
 
 ## Operating notes
 
