@@ -38,7 +38,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
     state_path = Path(args.state) if args.state else _default_state_path(cfg.dir, cfg.agent)
     seen = SeenStore(state_path)
 
-    retval = run(source, scorer, destination, seen)
+    retval = run(source, scorer, destination, seen, cfg.agent)
     return retval
 
 
