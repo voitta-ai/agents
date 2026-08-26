@@ -11,7 +11,9 @@ import sys
 from pathlib import Path
 
 from framework.config import ConfigError, load_config
+from framework.plugins import PluginImportFailure
 from framework.registry import (
+    PluginImportError,
     UnknownPluginError,
     build_destination,
     build_scorer,
@@ -27,10 +29,32 @@ def _default_state_path(config_dir: Path, agent: str) -> Path:
     return retval
 
 
+def _report_failed_plugins(failures: dict[str, PluginImportFailure]) -> None:
+    """Say on stderr which plugins are unavailable, before anything uses them.
+
+    A plugin that could not be imported is tolerated (issue #39) but never
+    silent: if the run later succeeds, this line is the only evidence that the
+    fleet is running on an incomplete venv, and if it dies at build time the
+    line sits directly above the error that names the same plugin.
+
+    Keyed by `type:` name, so one module maps to several entries; report each
+    module once.
+    """
+    by_module = {failure.module: failure for failure in failures.values()}
+    for module in sorted(by_module):
+        failure = by_module[module]
+        types = ", ".join(failure.types)
+        print(
+            f"agent: warning: plugin module {module!r} unavailable "
+            f"(types: {types}): {failure.error}",
+            file=sys.stderr,
+        )
+
+
 def _cmd_run(args: argparse.Namespace) -> int:
     cfg = load_config(args.config)
 
-    load_plugins()
+    _report_failed_plugins(load_plugins())
     source = build_source(cfg.source)
     scorer = build_scorer(cfg.scorer)
     destination = build_destination(cfg.destination)
@@ -66,7 +90,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         retval = args.func(args)
-    except (ConfigError, UnknownPluginError) as exc:
+    except (ConfigError, UnknownPluginError, PluginImportError) as exc:
         print(f"agent: {exc}", file=sys.stderr)
         return 2
     return retval
