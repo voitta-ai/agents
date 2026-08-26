@@ -23,11 +23,26 @@ that never touch that plugin. Merging #35 did exactly that: `ics_source` does
 `import icalendar` at module scope, the live venv did not have `icalendar`, and
 the Reddit agent, which has nothing to do with calendars, died at startup.
 
-So `import_all()` imports each module in isolation and tolerates `ImportError`,
-recording which module failed and why. It deliberately does *not* catch
-`Exception`: an optional dependency that is not installed is a known,
-recoverable condition, whereas a plugin whose module-level code raises anything
-else is broken and should stay loud.
+So `import_all()` imports each module in isolation and tolerates the failure of
+an *external* import, recording which module failed and why.
+
+What counts as external is the whole distinction, and `ImportError` alone is too
+broad a test for it. It covers a missing third-party package, which is the
+recoverable case, but it equally covers `cannot import name 'register_sourcee'
+from 'framework.registry'` and a plugin importing a sibling module that no
+longer exists - a plugin broken by a refactor, not a plugin missing an optional
+dependency. Tolerating those would let a real regression degrade into a warning
+line for every agent that happens not to use the broken plugin, which is the
+failure class this repo keeps fighting.
+
+`ImportError.name` separates them: it holds the module that could not be
+imported, on both `ModuleNotFoundError` and the `cannot import name X from Y`
+form. Anything under `framework` is our own code and re-raises; anything else
+is an optional dependency and is recorded. A missing `name` re-raises too, since
+an `ImportError` too unusual to classify is the wrong thing to swallow.
+
+Nor does this catch `Exception`: a plugin whose module-level code raises
+anything else is broken for a different reason and should stay just as loud.
 
 Tolerating the failure here is only half of it. The registry turns a config
 that names a failed plugin into an immediate, specific startup error (see
@@ -74,19 +89,33 @@ class PluginImportFailure:
         return retval
 
 
+def _is_external(exc: ImportError) -> bool:
+    """Did this `ImportError` come from a dependency outside the framework?
+
+    Only those are tolerable. An import that fails inside `framework` means the
+    plugin itself is broken, and it propagates.
+    """
+    origin = exc.name or ""
+    retval = bool(origin) and not origin.startswith("framework")
+    return retval
+
+
 def import_all() -> dict[str, PluginImportFailure]:
     """Import every plugin module; return failures keyed by `type:` name.
 
     A module that imports cleanly has registered its factories by the time this
-    returns. A module that raised `ImportError` contributes one entry per
-    `type:` name it would have registered, so the registry can name the plugin
-    the config asked for rather than only the module that broke.
+    returns. A module that failed on an external dependency contributes one
+    entry per `type:` name it would have registered, so the registry can name
+    the plugin the config asked for rather than only the module that broke.
+    Any other import failure propagates.
     """
     retval: dict[str, PluginImportFailure] = {}
     for module, types in _PLUGIN_MODULES.items():
         try:
             importlib.import_module(f"{__name__}.{module}")
         except ImportError as exc:
+            if not _is_external(exc):
+                raise
             failure = PluginImportFailure(module=module, types=types, error=exc)
             for type_name in types:
                 retval[type_name] = failure

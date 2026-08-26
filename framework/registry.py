@@ -92,16 +92,24 @@ def register_destination(type_name: str) -> Callable[[DestinationFactory], Desti
 
 
 def _build(kind: str, registry: dict, cfg: dict):
+    # A failed import outranks whatever is in the registry, and the order here
+    # is the whole guarantee. Registration is a side effect on this module's
+    # dicts, so a plugin that registers its factory and only then raises
+    # ImportError leaves that factory behind after the module itself is gone.
+    # Checking the registry first would hand back that orphan and build a
+    # plugin whose module is known to be broken -- the failure would resurface
+    # later, at first use, stripped of the context that explains it. No plugin
+    # imports in that order today; nothing stops one from doing so tomorrow.
     type_name = cfg.get("type")
+    failure = _failed_plugins.get(type_name)
+    if failure is not None:
+        raise PluginImportError(
+            f"{kind} type {type_name!r} is provided by plugin module "
+            f"{failure.qualified_module!r}, which failed to import: "
+            f"{failure.reason()}"
+        )
     factory = registry.get(type_name)
     if factory is None:
-        failure = _failed_plugins.get(type_name)
-        if failure is not None:
-            raise PluginImportError(
-                f"{kind} type {type_name!r} is provided by plugin module "
-                f"{failure.qualified_module!r}, which failed to import: "
-                f"{failure.reason()}"
-            )
         known = ", ".join(sorted(registry)) or "(none registered)"
         raise UnknownPluginError(
             f"unknown {kind} type {type_name!r}; registered: {known}"

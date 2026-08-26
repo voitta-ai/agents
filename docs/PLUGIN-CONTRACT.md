@@ -57,10 +57,10 @@ _PLUGIN_MODULES: dict[str, tuple[str, ...]] = {
 
 ### Import failures are per-plugin (issue #39)
 
-`load_plugins()` imports each module in that table separately and tolerates
-`ImportError`. A plugin whose third-party dependency is not installed does not
-prevent the others from registering, so an agent using only `reddit` + `regex`
-+ `slack` still runs on a venv missing `icalendar`.
+`load_plugins()` imports each module in that table separately and tolerates a
+failed import of an *external* dependency. A plugin whose third-party package is
+not installed does not prevent the others from registering, so an agent using
+only `reddit` + `regex` + `slack` still runs on a venv missing `icalendar`.
 
 Tolerated is not silent. Every failed module is reported on stderr at startup,
 and if a config names a type that a failed module would have registered,
@@ -79,9 +79,14 @@ Two consequences for plugin authors:
   reaches its `@register_source` call, so the table is the only place that
   knows which types it owns. Get the row wrong and the error message for a
   missing dependency degrades to a plain unknown-type error.
-- **Only `ImportError` is tolerated.** Module-level code that raises anything
-  else still fails the whole load, loudly, which is the right treatment for a
-  broken plugin as opposed to an uninstalled optional dependency.
+- **Only an external `ImportError` is tolerated.** The test is
+  `ImportError.name`: a module outside `framework` is an optional dependency and
+  is recorded, while anything under `framework` — a mistyped `register_source`
+  import, a sibling module deleted in a refactor — propagates and fails the
+  whole load. Module-level code raising anything other than `ImportError` fails
+  the load too. A plugin broken by a refactor is not the same thing as a plugin
+  missing an optional package, and must not be quiet just because no agent in
+  the current config happens to use it.
 
 Adding a plugin with a new third-party dependency means adding it to
 `pyproject.toml` *and* reinstalling the venv the live agents run from
