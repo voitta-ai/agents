@@ -7,8 +7,9 @@ as short-lived, cron/launchd-invoked processes (not daemons).
 
 - **Source** — where signals come from (e.g. Reddit RSS). Plugin interface,
   one implementation per source. See `framework/interfaces.py`.
-- **Scorer** — turns raw signals into a score (regex/keyword for v1; LLM-based
-  waterfall scorer is a tracked future issue, not v1).
+- **Scorer** — turns raw signals into a score. `regex` is presence-based keyword
+  matching; `llm` asks a model through the waterfall in `framework/llm.py` and is
+  configured by a prompt rather than rules (issue #9).
 - **Destination** — where scored signals get sent (Slack first; email later).
   Two-tier routing (hot / firehose) is a Slack-destination concern, not a
   framework concern.
