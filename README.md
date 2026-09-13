@@ -42,6 +42,59 @@ agents/<name>/       one dir per agent: its config + any agent-specific glue
   participate in but don't administer, via their own notification emails
   forwarded to AgentMail. See issue #19.
 
+## Approval-gated actions
+
+Some agents end in something that should not happen without a human saying so:
+publishing a post, sending an application. For those the destination is
+`approval`, which wraps the destination that writes the content and records a
+**proposal** instead of posting it (issue #21):
+
+```json
+"destination": {
+  "type": "approval",
+  "webhook_env": "SOME_WEBHOOK",
+  "wrap": {"type": "digest", "webhook_env": "SOME_WEBHOOK", "prompt": "..."},
+  "actions": ["publish-post"]
+},
+"approvals": {
+  "channel_id": "C0123456789",
+  "bot_token_env": "SOME_BOT_TOKEN",
+  "trusted_user_ids": ["U0123456789"],
+  "hours": 24
+},
+"actions": {
+  "publish-post": {
+    "steps": [
+      {"type": "slack-post", "webhook_env": "SOME_WEBHOOK", "text": "Published: {url}"}
+    ]
+  }
+}
+```
+
+The run posts the rendered content plus `Proposal p7: publish-post. Reply "do
+p7" or "skip p7".` and writes the proposal to `<workspace>/state/proposals.json`.
+The proposal is the delivery, so dedupe state is marked as usual.
+
+```
+agent approvals --workspace <workspaces-root>/<agent-name>
+```
+
+is the second scheduled entrypoint (every few minutes). It reads the channel's
+last `hours` of history with the bot token, and for each pending proposal a
+user in `trusted_user_ids` has answered with exactly `do <id>` or `skip <id>`,
+runs the named action's `steps` in order or marks it skipped, posts one outcome
+message, and prints `agent=<name> status=ok approvals=N executed=N skipped=N
+failed=N`. A failing step stops the sequence, leaves the proposal `failed`
+naming the step, and nothing is retried. Anything that is not exactly `do`/
+`skip` from a trusted user is ignored. The bot token needs `channels:history`
+(or `groups:history` for a private channel) and `chat:write`.
+
+Steps are **action** plugins, the fourth kind (`docs/PLUGIN-CONTRACT.md`).
+Later steps see earlier results by `{name}` templating over the proposal's
+payload merged with each step's returned dict. Shipped: `slack-post`
+(`webhook_env`, `text`). `wordpress-publish`, `twitter-post`, `linkedin-post`
+are their own issues.
+
 ## Operating notes
 
 ### Secrets live in the environment, never in config

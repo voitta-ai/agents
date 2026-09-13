@@ -9,3 +9,7 @@ agents/*/config.yaml
 
 # per-agent dedupe state written by SeenStore at run time
 agents/*/.seen-*.json
+
+# proposals store written by the approval destination (issue #21) when the
+# config dir doubles as the workspace; workspaces proper live outside the checkout
+agents/*/state/
