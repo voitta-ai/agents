@@ -3,9 +3,9 @@ __pycache__/
 .venv/
 *.egg-info/
 
-# real per-agent config with secrets — only *-example versions are committed
+# Real configs and dedupe state live in workspaces outside the checkout
+# (issue #43); only agents/*/config.example.json is committed. These patterns
+# keep a stray pre-workspace copy from ever being committed.
+agents/*/config.json
 agents/*/config.yaml
-!agents/*/config.yaml-example
-
-# per-agent dedupe state written by SeenStore at run time
 agents/*/.seen-*.json

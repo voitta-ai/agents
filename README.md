@@ -29,10 +29,34 @@ stated default until an agent has a real reason to do something else.
 
 ## Layout
 
+The repo holds code and placeholder examples only:
+
 ```
-framework/          core: plugin interfaces, entrypoint contract, state/dedupe
-agents/<name>/       one dir per agent: its config + any agent-specific glue
+framework/                       core: plugin interfaces, entrypoint contract, state/dedupe
+agents/<name>/config.example.json one committed, placeholder-only example per agent
 ```
+
+A deployed agent lives in a **workspace**: one directory per agent, outside any
+git checkout, holding everything that agent owns at runtime. A merge to master
+is then not a deploy, and nothing an agent writes lands in the working tree.
+
+```
+<workspaces-root>/               $AGENT_WORKSPACES_ROOT, else ~/agent-workspaces
+  _shared/                       cross-agent files (reserved; nothing reads it yet)
+  <agent-name>/
+    config.json                  the agent's declaration; the only file a human edits
+    state/seen.json              SeenStore dedupe state (default; --state overrides)
+    logs/                        stdout/stderr when scheduled
+```
+
+```
+agent run --workspace <workspaces-root>/<agent-name>
+```
+
+`run` always takes the explicit workspace path; the root default is only for
+helpers that take an agent *name*. Config is JSON: copy an example in as
+`config.json` and fill in real values. A `"_comment"` key anywhere is ignored by
+the framework and by every plugin, and is where decisions worth keeping go.
 
 ## Agents
 
@@ -47,10 +71,10 @@ agents/<name>/       one dir per agent: its config + any agent-specific glue
 ### Secrets live in the environment, never in config
 
 Each destination names the env var holding its credential (`webhook_env`,
-`api_key_env`). Real per-agent `config.yaml` files are gitignored; only
-`config.yaml-example` is committed. The framework itself only ever reads
-`os.environ` when it builds a destination — how those variables get there is the
-deployment's business, not this repo's.
+`api_key_env`). Real per-agent `config.json` files live in workspaces outside
+the checkout; only `config.example.json` is committed. The framework itself only
+ever reads `os.environ` when it builds a destination — how those variables get
+there is the deployment's business, not this repo's.
 
 In our own launchd deployment the agents are invoked through `bash -lc`, so the
 login profile supplies the values and no credential is stored in a plist. If you
