@@ -3,6 +3,9 @@
 Single invocation, single pass, exits 0 (success) / nonzero (failure). Safe to
 double-run because the framework dedupes via SeenStore. No daemon, no loop:
 cron/launchd owns the clock.
+
+`agent approvals --workspace <dir>` is the second entrypoint (issue #21): same
+contract, its own clock, executes proposals a trusted human has replied to.
 """
 from __future__ import annotations
 
@@ -10,6 +13,7 @@ import argparse
 import sys
 from pathlib import Path
 
+from framework.approvals import load_approvals_config, run_approvals
 from framework.config import ConfigError, load_config
 from framework.plugins import PluginImportFailure
 from framework.registry import (
@@ -57,12 +61,25 @@ def _cmd_run(args: argparse.Namespace) -> int:
     _report_failed_plugins(load_plugins())
     source = build_source(cfg.source)
     scorer = build_scorer(cfg.scorer)
+    # The approval destination keeps its proposals store in the workspace, but
+    # the registry hands a factory only its own block (docs/PLUGIN-CONTRACT.md),
+    # so the path is injected here. `workspace` is the attribute #43 introduces;
+    # `dir` is the pre-workspace config directory.
+    workspace = getattr(cfg, "workspace", None) or cfg.dir
+    cfg.destination["_workspace"] = str(workspace)
     destination = build_destination(cfg.destination)
 
     state_path = Path(args.state) if args.state else _default_state_path(cfg.dir, cfg.agent)
     seen = SeenStore(state_path)
 
     retval = run(source, scorer, destination, seen, cfg.agent)
+    return retval
+
+
+def _cmd_approvals(args: argparse.Namespace) -> int:
+    cfg = load_approvals_config(args.workspace)
+    _report_failed_plugins(load_plugins())
+    retval = run_approvals(cfg)
     return retval
 
 
@@ -82,6 +99,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="Path to the dedupe state file (default: <config-dir>/.seen-<agent>.json).",
     )
     run_parser.set_defaults(func=_cmd_run)
+
+    approvals_parser = sub.add_parser(
+        "approvals",
+        help="Execute proposals a trusted user has replied 'do <id>' to, and exit.",
+    )
+    approvals_parser.add_argument(
+        "--workspace",
+        required=True,
+        help="The agent's workspace directory; <dir>/config.json and <dir>/state/proposals.json.",
+    )
+    approvals_parser.set_defaults(func=_cmd_approvals)
     return parser
 
 
