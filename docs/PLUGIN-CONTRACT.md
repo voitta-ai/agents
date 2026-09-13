@@ -4,7 +4,7 @@ This is the contract that issue #1 freezes. Wave 1 issues (#2 Reddit source,
 #3 Slack destination, #4 regex scorer) each implement one plugin against it,
 independently. Do not change the signatures below without re-syncing all three.
 
-## The three roles
+## The roles
 
 Defined as Protocols in `framework/interfaces.py`:
 
@@ -13,6 +13,17 @@ Defined as Protocols in `framework/interfaces.py`:
 | `Source`      | `fetch() -> list[Signal]`            | raw signals for one run |
 | `Scorer`      | `score(signal: Signal) -> ScoredSignal` | signal + int score   |
 | `Destination` | `send(scored: ScoredSignal) -> None` | delivery side effect    |
+| `Action`      | `execute(payload: dict, context: dict) -> dict` | results for later steps |
+
+`Action` is the fourth kind, added for approval-gated steps (issue #21). It is
+not part of the `agent run` loop: a destination records a proposal, and a
+separate `agent approvals` pass runs the proposal's action steps once a trusted
+human has replied `do <id>`. `payload` is the proposal content merged with the
+results of earlier steps; `context` carries run-level facts such as the
+workspace path and proposal id. The returned dict is merged into the payload
+the next step sees, so a step exposes values by name (`{url}`) to those after it.
+Register with `register_action(type_name)`; the CLI builds steps with
+`build_action(cfg)`, where `cfg` is one entry of an action's `steps` list.
 
 `Signal(id, text, url, source, meta)` — `id` is the dedupe key.
 `ScoredSignal(signal, score, reasons)`.
@@ -64,7 +75,7 @@ only `reddit` + `regex` + `slack` still runs on a venv missing `icalendar`.
 
 Tolerated is not silent. Every failed module is reported on stderr at startup,
 and if a config names a type that a failed module would have registered,
-`build_source` / `build_scorer` / `build_destination` raise `PluginImportError`
+`build_source` / `build_scorer` / `build_destination` / `build_action` raise `PluginImportError`
 immediately, quoting the original `ImportError`:
 
 ```
@@ -99,6 +110,7 @@ Signatures to register against:
 register_source(type_name: str)       # decorates  (cfg: dict) -> Source
 register_scorer(type_name: str)       # decorates  (cfg: dict) -> Scorer
 register_destination(type_name: str)  # decorates  (cfg: dict) -> Destination
+register_action(type_name: str)       # decorates  (cfg: dict) -> Action
 ```
 
 ## Rules for Wave 1
