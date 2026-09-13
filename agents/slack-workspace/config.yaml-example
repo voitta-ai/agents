@@ -9,11 +9,10 @@ schedule: "0 */6 * * *"
 
 source:
   type: slack-workspace
-  # Only 'agentmail' is implemented (issue #19). 'session' (xoxc token) is a
-  # real option with a working client in voitta-ai/skillz
-  # (slack-xoxc-session-client), but using it against a community workspace
-  # is an explicit authorization decision that has not been made yet -
-  # selecting it raises rather than silently doing something else.
+  # Two transports (issue #19, #45):
+  #   agentmail - the workspace's notification emails, forwarded to AgentMail.
+  #   session   - read the channels as the logged-in browser user. See the
+  #               second source block at the bottom of this file.
   transport: agentmail
 
   # Label only, for the Signal's source/meta fields — not a credential.
@@ -59,3 +58,37 @@ destination:
     - min_score: 10
       webhook_env: SLACK_WORKSPACE_DIGEST_WEBHOOK
       channel: "#<internal-digest-channel>"
+
+# ---------------------------------------------------------------------------
+# Alternative source block: transport 'session' (issue #45).
+#
+# Reads named channels as the user logged in to the workspace in a local
+# browser. Credentials are extracted per run from the browser cookie store
+# (pycookiecheat, `pip install '.[slack-session]'`) and the workspace page,
+# held in memory and dropped at exit; nothing is stored and nothing is
+# configured here. On macOS the cookie decryption reads the login keychain
+# and may prompt the first time.
+#
+# Read-only: the client refuses any Slack method outside a fixed allowlist
+# (auth.test, conversations.list/history/replies, chat.getPermalink,
+# users.info, users.list) before any HTTP. No config key widens it.
+#
+# source:
+#   type: slack-workspace
+#   transport: session
+#   workspace: "<workspace-label>"
+#   # The <subdomain> in <subdomain>.slack.com. Must be a workspace you are
+#   # logged in to in the browser named below.
+#   subdomain: "<workspace-subdomain>"
+#   # pycookiecheat browser name: chrome (default), chromium, brave, firefox, slack.
+#   browser: chrome
+#   # Channel names (no '#' needed). Resolved to ids per run; an unknown name
+#   # raises and lists what the workspace has.
+#   channels:
+#     - general
+#     - introductions
+#   # Lookback window for conversations.history. Signal ids are
+#   # <channel_id>:<ts>, so overlapping windows dedupe through the SeenStore.
+#   since_hours: 24
+#   # Fold thread replies into the parent message's text.
+#   include_threads: true

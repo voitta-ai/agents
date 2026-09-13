@@ -41,6 +41,12 @@ agents/<name>/       one dir per agent: its config + any agent-specific glue
 - `agents/slack-workspace/` — digests community Slack workspaces we
   participate in but don't administer, via their own notification emails
   forwarded to AgentMail. See issue #19.
+- `agents/slack-workspace/` with `transport: session` — reads named channels
+  of such a workspace as the logged-in browser user (`d` cookie decrypted
+  from the local browser store, `xoxc` token scraped per run, nothing stored).
+  Read-only by construction: the client refuses every Slack method outside a
+  fixed allowlist before any HTTP. Needs `pip install '.[slack-session]'`
+  (pycookiecheat). See issue #45.
 
 ## Operating notes
 

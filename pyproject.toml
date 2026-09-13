@@ -12,6 +12,10 @@ dependencies = [
     "tzdata>=2024.1",
 ]
 
+[project.optional-dependencies]
+# transport: session on the slack-workspace source (issue #45).
+slack-session = ["pycookiecheat>=0.6"]
+
 [project.scripts]
 agent = "framework.cli:main"
 
