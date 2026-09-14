@@ -5,7 +5,7 @@ Wraps another destination and, at `flush()`, records what that destination
 instead of letting it post. The rendered content goes to a Slack webhook with
 one line per proposed action:
 
-    Proposal p7: publish-post. Reply "do p7" or "skip p7".
+    Proposal p7-k3f: publish-post. Reply "do p7-k3f" or "skip p7-k3f".
 
 A separate `agent approvals` pass (see `framework/approvals.py`) reads the
 channel, finds those replies from trusted users, and runs the action's steps.

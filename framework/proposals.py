@@ -11,20 +11,32 @@ Shape on disk:
     {
       "next_id": 3,
       "proposals": [
-        {"id": "p1", "created": "...", "action": "publish-post",
+        {"id": "p1-k3f", "created": "...", "created_ts": 1757700000.0,
+         "action": "publish-post",
          "payload": {"title": "...", "body_md": "..."},
          "status": "done", "decided_by": "U0123456789", "decided_ts": "...",
-         "resolved": "...", "results": [{"step": 1, "type": "slack-post",
-         "status": "ok", "result": {}}]},
-        {"id": "p2", ..., "status": "pending"}
+         "claimed_at": "...", "claimed_pid": 4242, "resolved": "...",
+         "results": [{"step": 1, "type": "slack-post", "status": "ok", "result": {}}]},
+        {"id": "p2-x9q", ..., "status": "pending"}
       ]
     }
 
-Ids are short and monotonic per workspace: a base-36 counter with a `p`
-prefix, so `do p1` reads as a reply to a proposal and not as a number. Nothing
-is ever deleted; a resolved proposal stays as the audit trail of what was
-posted where, which is the record an operator asks for when a published post
-needs explaining.
+Ids are short, monotonic per workspace, and not guessable in advance: a
+base-36 counter with a `p` prefix, then a dash and three random base-36
+characters. The counter keeps them readable in order; the suffix means nobody
+can type `do p10` into the channel today and have it approve whatever becomes
+p10 next week. A reply has to quote the whole id. Nothing is ever deleted; a
+resolved proposal stays as the audit trail of what was posted where, which is
+the record an operator asks for when a published post needs explaining.
+
+Statuses: `pending` -> `running` -> `done` | `failed`, or `pending` ->
+`skipped`. `running` exists so that executing a proposal is an atomic claim:
+`transition()` compares the current status under the lock and refuses to
+change a proposal that is not in the expected state, so two approvals passes
+that both read the same pending proposal cannot both run its steps. The one
+whose claim fails sees None and moves on. A proposal still `running` when a
+pass starts means an earlier pass died mid-steps; it is reported, never
+re-run automatically (see `framework/approvals.py`).
 
 Two processes can touch the file within the same second (a run recording a
 proposal while the approvals pass flips another one), so every read-modify-
@@ -39,6 +51,7 @@ from __future__ import annotations
 import fcntl
 import json
 import os
+import secrets
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -48,12 +61,15 @@ STATE_DIRNAME = "state"
 PROPOSALS_FILENAME = "proposals.json"
 
 STATUS_PENDING = "pending"
+STATUS_RUNNING = "running"
 STATUS_DONE = "done"
 STATUS_SKIPPED = "skipped"
 STATUS_FAILED = "failed"
 
 _ID_PREFIX = "p"
 _DIGITS = "0123456789abcdefghijklmnopqrstuvwxyz"
+_SUFFIX_LEN = 3
+_TERMINAL = (STATUS_DONE, STATUS_SKIPPED, STATUS_FAILED)
 
 
 def _base36(n: int) -> str:
@@ -70,6 +86,21 @@ def _base36(n: int) -> str:
 
 def _now() -> str:
     retval = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    return retval
+
+
+def _suffix() -> str:
+    retval = "".join(secrets.choice(_DIGITS) for _ in range(_SUFFIX_LEN))
+    return retval
+
+
+def created_ts(proposal: dict[str, Any]) -> float:
+    """Epoch seconds the proposal was recorded, for comparing with Slack `ts`."""
+    raw = proposal.get("created_ts")
+    if raw is None:
+        retval = datetime.fromisoformat(proposal["created"]).timestamp()
+    else:
+        retval = float(raw)
     return retval
 
 
@@ -110,11 +141,13 @@ class ProposalStore:
 
     def record(self, action: str, payload: dict[str, Any]) -> dict[str, Any]:
         """Append a pending proposal and return it (with its new id)."""
+        now = datetime.now(timezone.utc)
         with self._locked():
             data = self._read()
             proposal = {
-                "id": f"{_ID_PREFIX}{_base36(int(data['next_id']))}",
-                "created": _now(),
+                "id": f"{_ID_PREFIX}{_base36(int(data['next_id']))}-{_suffix()}",
+                "created": now.isoformat(timespec="seconds"),
+                "created_ts": now.timestamp(),
                 "action": action,
                 "payload": payload,
                 "status": STATUS_PENDING,
@@ -125,19 +158,31 @@ class ProposalStore:
         retval = proposal
         return retval
 
-    def pending(self) -> list[dict[str, Any]]:
+    def with_status(self, status: str) -> list[dict[str, Any]]:
         with self._locked():
             data = self._read()
-        retval = [p for p in data["proposals"] if p.get("status") == STATUS_PENDING]
+        retval = [p for p in data["proposals"] if p.get("status") == status]
         return retval
 
-    def resolve(self, proposal_id: str, status: str, **fields: Any) -> dict[str, Any]:
-        """Flip a pending proposal to a terminal status, recording `fields`.
+    def pending(self) -> list[dict[str, Any]]:
+        retval = self.with_status(STATUS_PENDING)
+        return retval
 
-        Re-reads under the lock so a proposal recorded by a concurrent run in
-        the meantime is not lost, and refuses to touch a proposal that is no
-        longer pending: a second approvals pass racing the first must not
-        re-execute anything.
+    def running(self) -> list[dict[str, Any]]:
+        retval = self.with_status(STATUS_RUNNING)
+        return retval
+
+    def transition(
+        self, proposal_id: str, expect: str, status: str, **fields: Any
+    ) -> dict[str, Any] | None:
+        """Compare-and-set a proposal's status under the lock.
+
+        Returns the updated proposal, or None when its current status is not
+        `expect` -- which is how a second approvals pass learns that the first
+        one already claimed (or resolved) it and must not touch it. `expect ==
+        status` is allowed and just records `fields` (per-step progress while
+        running). A terminal status also stamps `resolved`. An unknown id is
+        an error: that is a corrupted store, not a race.
         """
         with self._locked():
             data = self._read()
@@ -146,12 +191,12 @@ class ProposalStore:
                     break
             else:
                 raise KeyError(f"no proposal {proposal_id!r} in {self.path}")
-            if proposal.get("status") != STATUS_PENDING:
-                raise ValueError(
-                    f"proposal {proposal_id!r} is already {proposal.get('status')!r}"
-                )
+            if proposal.get("status") != expect:
+                retval = None
+                return retval
             proposal["status"] = status
-            proposal["resolved"] = _now()
+            if status in _TERMINAL:
+                proposal["resolved"] = _now()
             proposal.update(fields)
             self._write(data)
         retval = proposal

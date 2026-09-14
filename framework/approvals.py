@@ -4,9 +4,10 @@ The second scheduled entrypoint. `agent run` ends by recording proposals (see
 `framework/plugins/approval_destination.py`); this pass, on its own launchd
 clock every few minutes, reads the approval channel's recent history, finds
 replies from trusted users, and runs the matching proposals' action steps.
-Run-and-exit, state on disk, safe to double-fire: a proposal is resolved under
-the store's lock exactly once, and a second pass racing the first finds it no
-longer pending.
+Run-and-exit, state on disk, safe to double-fire: before any step runs, the
+proposal is *claimed* (`pending` -> `running`, a compare-and-set under the
+store's lock), and a second pass racing the first fails its claim and does
+nothing. Only after the steps does it move to `done` or `failed`.
 
 Config, in the workspace's `config.json`:
 
@@ -31,12 +32,21 @@ a private channel, plus `chat:write` for the outcome message). `hours` bounds
 how far back history is read (default 24). The webhook that posted the
 proposal cannot read replies; a bot token can, which is why both exist.
 
-What counts as a reply: a message whose text is exactly `do <id>` or
-`skip <id>` (whitespace-trimmed, one id) from a user in `trusted_user_ids`.
-Anything else is ignored, including "do all", a reaction, or a `do` from
-anyone not on the list. No blanket approval exists. If a trusted user says
-both `do p7` and `skip p7` before the pass runs, the later message wins,
-which is the reading a human would give a change of mind.
+What counts as a reply: a top-level channel message whose text is exactly
+`do <id>` or `skip <id>` (whitespace-trimmed, the full id including its random
+suffix) from a user in `trusted_user_ids`, posted *after* the proposal was
+recorded. Anything else is ignored, including "do all", a reaction, a `do`
+from anyone not on the list, or a `do` that predates the proposal it names.
+No blanket approval exists, and nothing said before a proposal existed can
+approve it. If a trusted user says both `do p7-k3f` and `skip p7-k3f` before
+the pass runs, the later message wins, which is the reading a human would
+give a change of mind.
+
+Why a time bound rather than a thread: the proposal is announced through an
+incoming webhook, and webhooks do not return the message `ts`, so there is no
+thread to require replies in. `conversations.history` returns only top-level
+messages, so a reply typed *in a thread* under the announcement is never seen
+and the proposal stays pending. Reply in the channel, not in the thread.
 
 Executing `do`: the action's steps run in order. Each step is built through
 the registry from its own block, gets the proposal's payload merged with every
@@ -51,18 +61,29 @@ Whatever happened, one outcome message goes to the channel through
 shape the runner uses (issue #31): `agent=<name> approvals=N executed=N
 skipped=N failed=N`.
 
-Order inside a `do` matters: steps run, then the store is updated, then the
-channel is told. The store first, because the steps' side effects are already
-real and a crash between them and the status write would leave a `pending`
-proposal that the next pass would execute again. If posting the outcome fails,
-the status is already right and the error propagates.
+Order inside a `do` matters: claim, then steps (each recorded in the store as
+it completes), then the terminal status, then the channel is told. If posting
+the outcome fails, the status is already right and the error propagates.
+
+A proposal still `running` when a pass starts, whose claiming pid is gone (or
+whose claim is older than `hours`), is one an earlier pass claimed and never
+finished: the process died mid-steps. A live claiming pid is just an
+overlapping pass still at work and is left alone. A stuck one is never re-run
+automatically, because the steps it did complete (say, the publish) are real
+and re-running them is exactly the duplicate the claim exists to prevent.
+Every pass reports it on stderr and counts it in the summary line as
+`stuck=N`; the channel is told once, with the steps the store has recorded as
+done. Re-running it is a human decision: edit the store, set the proposal
+back to `pending` (or to `failed` to close it), and the next `do` proceeds.
 """
 from __future__ import annotations
 
 import json
 import os
 import re
+import sys
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -72,8 +93,11 @@ from framework.config import ConfigError
 from framework.proposals import (
     STATUS_DONE,
     STATUS_FAILED,
+    STATUS_PENDING,
+    STATUS_RUNNING,
     STATUS_SKIPPED,
     ProposalStore,
+    created_ts,
     proposals_path,
 )
 from framework.registry import build_action
@@ -177,6 +201,11 @@ def load_approvals_config(workspace: str | Path) -> ApprovalsConfig:
     return retval
 
 
+def _now_iso() -> str:
+    retval = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    return retval
+
+
 class SlackApiError(RuntimeError):
     """Slack answered, but with `ok: false`."""
 
@@ -241,12 +270,14 @@ def read_replies(cfg: ApprovalsConfig) -> dict[str, dict[str, str]]:
 
 
 def _run_steps(
-    cfg: ApprovalsConfig, proposal: dict[str, Any]
+    cfg: ApprovalsConfig, store: ProposalStore, proposal: dict[str, Any]
 ) -> tuple[list[dict[str, Any]], str | None]:
-    """Run the proposal's action steps in order; return (results, error).
+    """Run the claimed proposal's action steps in order; return (results, error).
 
     `error` is None when every step ran, else a message naming the step that
-    stopped the sequence. `results` holds one entry per step attempted.
+    stopped the sequence. `results` holds one entry per step attempted, and is
+    written to the store after each step so that a pass dying mid-sequence
+    leaves a record of what already happened.
     """
     name = proposal["action"]
     action = cfg.actions.get(name)
@@ -280,7 +311,81 @@ def _run_steps(
             return retval
         merged.update(result)
         results.append({"step": i, "type": step_type, "status": "ok", "result": result})
+        store.transition(proposal["id"], STATUS_RUNNING, STATUS_RUNNING, results=results)
     retval = (results, None)
+    return retval
+
+
+def _stuck_text(proposal: dict[str, Any]) -> str:
+    pid = proposal["id"]
+    done = ", ".join(
+        f"{r['type']} {r['status']}" for r in proposal.get("results") or []
+    ) or "none"
+    retval = (
+        f":warning: Proposal {pid} ({proposal['action']}) is stuck in 'running': an approvals "
+        f"pass claimed it at {proposal.get('claimed_at')} (pid {proposal.get('claimed_pid')}) "
+        f"and did not finish. Steps recorded as done: {done}. It will not be re-run; "
+        "an operator has to edit the proposals store to resolve it."
+    )
+    return retval
+
+
+def _pid_alive(pid: Any) -> bool:
+    try:
+        os.kill(int(pid), 0)
+    except (ProcessLookupError, TypeError, ValueError):
+        retval = False
+        return retval
+    except PermissionError:
+        retval = True
+        return retval
+    retval = True
+    return retval
+
+
+def _is_stuck(cfg: ApprovalsConfig, proposal: dict[str, Any]) -> bool:
+    """A `running` proposal whose claiming pass is gone, or too old to trust.
+
+    Two passes overlapping for a few seconds is normal and the second one must
+    not cry wolf about the first, so `running` alone is not stuck. The pass
+    that claimed it recorded its pid; on the single host these run on, a dead
+    pid means it died mid-steps. Pids get reused, so a claim older than the
+    `hours` window is stuck regardless of what that pid is doing now.
+    """
+    claimed_at = proposal.get("claimed_at")
+    too_old = True
+    if claimed_at:
+        age = time.time() - datetime.fromisoformat(claimed_at).timestamp()
+        too_old = age > cfg.hours * 3600
+    retval = too_old or not _pid_alive(proposal.get("claimed_pid"))
+    return retval
+
+
+def _report_stuck(cfg: ApprovalsConfig, store: ProposalStore) -> int:
+    """Say, every pass, which proposals an earlier pass left `running`.
+
+    stderr every time, the channel once per proposal. Nothing here changes a
+    proposal's status: leaving `running` is the operator's call.
+    """
+    stuck = [p for p in store.running() if _is_stuck(cfg, p)]
+    for proposal in stuck:
+        print(
+            f"agent: proposal {proposal['id']} ({proposal['action']}) is stuck in "
+            f"'running' since {proposal.get('claimed_at')} (pid {proposal.get('claimed_pid')}); "
+            "not re-run, edit state/proposals.json to resolve",
+            file=sys.stderr,
+        )
+        if proposal.get("stuck_reported"):
+            continue
+        _slack_call(
+            "chat.postMessage",
+            cfg.bot_token,
+            cfg.timeout,
+            channel=cfg.channel_id,
+            text=_stuck_text(proposal),
+        )
+        store.transition(proposal["id"], STATUS_RUNNING, STATUS_RUNNING, stuck_reported=True)
+    retval = len(stuck)
     return retval
 
 
@@ -305,30 +410,53 @@ def run_approvals(cfg: ApprovalsConfig) -> int:
     executed = 0
     skipped = 0
     failed = 0
+    stuck = 0
     status = "failed"
     try:
+        stuck = _report_stuck(cfg, store)
         proposals = store.pending()
         pending = len(proposals)
         replies = read_replies(cfg) if proposals else {}
 
         for proposal in proposals:
-            reply = replies.get(proposal["id"])
+            pid = proposal["id"]
+            reply = replies.get(pid)
             if reply is None:
+                continue
+            if float(reply["ts"]) <= created_ts(proposal):
+                print(
+                    f"agent: ignoring '{reply['verb']} {pid}' at ts {reply['ts']}: "
+                    f"it predates the proposal ({proposal['created']})",
+                    file=sys.stderr,
+                )
                 continue
             decided = {"decided_by": reply["user"], "decided_ts": reply["ts"]}
             if reply["verb"] == "skip":
-                store.resolve(proposal["id"], STATUS_SKIPPED, **decided)
+                if store.transition(pid, STATUS_PENDING, STATUS_SKIPPED, **decided) is None:
+                    continue
                 skipped += 1
                 text = _outcome_text(proposal, STATUS_SKIPPED, [], None)
             else:
-                results, error = _run_steps(cfg, proposal)
+                claimed = store.transition(
+                    pid,
+                    STATUS_PENDING,
+                    STATUS_RUNNING,
+                    claimed_at=_now_iso(),
+                    claimed_pid=os.getpid(),
+                    **decided,
+                )
+                if claimed is None:
+                    # Another pass got there first; whatever it does is its
+                    # to report.
+                    continue
+                results, error = _run_steps(cfg, store, proposal)
                 if error is None:
-                    store.resolve(proposal["id"], STATUS_DONE, results=results, **decided)
+                    store.transition(pid, STATUS_RUNNING, STATUS_DONE, results=results)
                     executed += 1
                     text = _outcome_text(proposal, STATUS_DONE, results, None)
                 else:
-                    store.resolve(
-                        proposal["id"], STATUS_FAILED, results=results, error=error, **decided
+                    store.transition(
+                        pid, STATUS_RUNNING, STATUS_FAILED, results=results, error=error
                     )
                     failed += 1
                     text = _outcome_text(proposal, STATUS_FAILED, results, error)
@@ -339,7 +467,7 @@ def run_approvals(cfg: ApprovalsConfig) -> int:
     finally:
         print(
             f"agent={cfg.agent} status={status} approvals={pending} "
-            f"executed={executed} skipped={skipped} failed={failed}"
+            f"executed={executed} skipped={skipped} failed={failed} stuck={stuck}"
         )
     retval = 0
     return retval

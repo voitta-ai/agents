@@ -71,9 +71,11 @@ publishing a post, sending an application. For those the destination is
 }
 ```
 
-The run posts the rendered content plus `Proposal p7: publish-post. Reply "do
-p7" or "skip p7".` and writes the proposal to `<workspace>/state/proposals.json`.
-The proposal is the delivery, so dedupe state is marked as usual.
+The run posts the rendered content plus `Proposal p7-k3f: publish-post. Reply
+"do p7-k3f" or "skip p7-k3f".` and writes the proposal to
+`<workspace>/state/proposals.json`. The proposal is the delivery, so dedupe
+state is marked as usual. Ids are a per-workspace counter plus a random suffix,
+so a reply cannot be typed before the proposal exists; the whole id is required.
 
 ```
 agent approvals --workspace <workspaces-root>/<agent-name>
@@ -81,13 +83,24 @@ agent approvals --workspace <workspaces-root>/<agent-name>
 
 is the second scheduled entrypoint (every few minutes). It reads the channel's
 last `hours` of history with the bot token, and for each pending proposal a
-user in `trusted_user_ids` has answered with exactly `do <id>` or `skip <id>`,
-runs the named action's `steps` in order or marks it skipped, posts one outcome
-message, and prints `agent=<name> status=ok approvals=N executed=N skipped=N
-failed=N`. A failing step stops the sequence, leaves the proposal `failed`
-naming the step, and nothing is retried. Anything that is not exactly `do`/
-`skip` from a trusted user is ignored. The bot token needs `channels:history`
-(or `groups:history` for a private channel) and `chat:write`.
+user in `trusted_user_ids` has answered with exactly `do <id>` or `skip <id>`
+**as a top-level channel message posted after the proposal was recorded**,
+claims it (`pending` -> `running`, atomically, so two overlapping passes cannot
+both execute it), runs the named action's `steps` in order or marks it
+skipped, posts one outcome message, and prints `agent=<name> status=ok
+approvals=N executed=N skipped=N failed=N stuck=N`. A failing step stops the
+sequence, leaves the proposal `failed` naming the step, and nothing is retried.
+Anything that is not exactly `do`/`skip` from a trusted user is ignored, and so
+is a reply older than the proposal it names. Replies typed *in a thread* are
+not seen (`conversations.history` returns top-level messages only); reply in
+the channel. The bot token needs `channels:history` (or `groups:history` for a
+private channel) and `chat:write`.
+
+A proposal left `running` by a pass that is no longer alive (or claimed more
+than `hours` ago) means that pass died mid-steps. It is never re-run on its own: every pass reports it on stderr and as `stuck=N`, and the channel is
+told once which steps the store recorded as done. To re-run it, edit
+`state/proposals.json` and set its `status` back to `"pending"` (a fresh `do`
+is then needed); to close it, set `"failed"`.
 
 Steps are **action** plugins, the fourth kind (`docs/PLUGIN-CONTRACT.md`).
 Later steps see earlier results by `{name}` templating over the proposal's
