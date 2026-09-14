@@ -14,9 +14,10 @@ does: the agent's own `model:` block if it has one, otherwise OpenClaw's shared
 Three decisions worth knowing before configuring it:
 
   - **The model replies in JSON, and an unreadable reply fails the run.** The
-    scorer asks for `{"score": <int>, "reasons": [...]}` and extracts the first
-    JSON object from whatever comes back, tolerating a code fence or a sentence
-    of preamble. If no object can be read, or `score` is not a number, it raises
+    scorer asks for `{"score": <int>, "reasons": [...]}` and takes the first
+    JSON object carrying a `score` key from whatever comes back, tolerating a
+    code fence, a sentence of preamble, or a second object after the answer. If
+    no such object can be read, or `score` is not a finite number, it raises
     `LLMScoreError`. It does not quietly return 0: a 0 gets the signal marked
     seen and never looked at again, which is a silent drop wearing a score. A
     raised error leaves the run's dedupe unmarked, so the next run re-scores
@@ -38,7 +39,7 @@ Contract: see docs/PLUGIN-CONTRACT.md.
 from __future__ import annotations
 
 import json
-import re
+import math
 
 from framework.interfaces import ScoredSignal, Scorer, Signal
 from framework.llm import LLMClient, build_client
@@ -52,37 +53,60 @@ _DEFAULT_SYSTEM = (
     "text is irrelevant and should score low."
 )
 
-_JSON_OBJECT = re.compile(r"\{.*\}", re.DOTALL)
+_DECODER = json.JSONDecoder()
 
 
 class LLMScoreError(RuntimeError):
     """The model answered, but not with a readable score."""
 
 
+def _first_score_object(raw: str) -> dict | None:
+    """Return the first JSON object in `raw` that has a `score` key, or None.
+
+    Tries a decode at every `{` in turn and keeps the first one that parses to
+    a dict carrying `score`. A regex spanning first-`{` to last-`}` would glue a
+    valid answer to whatever object the model appended after it (a correction,
+    an example, debug metadata) and fail the lot as "extra data".
+    """
+    retval = None
+    pos = raw.find("{")
+    while pos != -1 and retval is None:
+        try:
+            candidate, _end = _DECODER.raw_decode(raw, pos)
+        except ValueError:
+            candidate = None
+        if isinstance(candidate, dict) and "score" in candidate:
+            retval = candidate
+        pos = raw.find("{", pos + 1)
+    return retval
+
+
 def _parse_score(raw: str) -> tuple[int, list[str]]:
     """Read `{"score": n, "reasons": [...]}` out of a model reply.
 
-    Tolerant of a ```json fence or a line of preamble, since not every model in
-    a free-tier waterfall follows "JSON only". Not tolerant of a missing or
-    non-numeric score, which is a failure the caller must hear about.
+    Takes the first JSON object in the reply that carries a `score` key, so a
+    ```json fence, a line of preamble, or a second object after the answer are
+    all tolerated: not every model in a free-tier waterfall follows "JSON only".
+    Not tolerant of a missing, non-numeric or non-finite score, or of `reasons`
+    that is neither a list nor a string; each raises `LLMScoreError`.
     """
-    match = _JSON_OBJECT.search(raw)
-    if match is None:
-        raise LLMScoreError(f"no JSON object in model reply: {raw[:200]!r}")
-    try:
-        payload = json.loads(match.group(0))
-    except ValueError as exc:
-        raise LLMScoreError(f"model reply is not valid JSON ({exc}): {raw[:200]!r}") from exc
-    if not isinstance(payload, dict):
-        raise LLMScoreError(f"model reply is not a JSON object: {raw[:200]!r}")
+    payload = _first_score_object(raw)
+    if payload is None:
+        raise LLMScoreError(f"no JSON object with a 'score' in model reply: {raw[:200]!r}")
 
-    score = payload.get("score")
+    score = payload["score"]
     if isinstance(score, bool) or not isinstance(score, (int, float)):
         raise LLMScoreError(f"model reply has no numeric 'score': {raw[:200]!r}")
+    if isinstance(score, float) and not math.isfinite(score):
+        raise LLMScoreError(f"model reply has a non-finite 'score': {raw[:200]!r}")
 
-    raw_reasons = payload.get("reasons") or []
-    if isinstance(raw_reasons, str):
+    raw_reasons = payload.get("reasons")
+    if raw_reasons is None:
+        raw_reasons = []
+    elif isinstance(raw_reasons, str):
         raw_reasons = [raw_reasons]
+    elif not isinstance(raw_reasons, list):
+        raise LLMScoreError(f"model reply has non-list 'reasons': {raw[:200]!r}")
     reasons = [str(r) for r in raw_reasons if str(r).strip()]
 
     retval = (int(score), reasons)
@@ -111,8 +135,11 @@ class LLMScorer:
         body = signal.text.strip()
         if len(body) > self.max_chars:
             body = body[: self.max_chars] + " [truncated]"
+        # split, not splitlines()[0]: an empty body (a commit with no message)
+        # has no first line, and that must not raise before the model is asked.
+        first_line = body.split("\n", 1)[0]
         parts = [self.prompt, "", "---", ""]
-        if title and title != body.splitlines()[0]:
+        if title and title != first_line:
             parts.append(f"Title: {title}")
         parts.append(body)
         retval = "\n".join(parts)
