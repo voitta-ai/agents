@@ -60,8 +60,14 @@ module is shaped the way it is:
     Markdown to HTML, then wrap each top-level element in the block comment
     for its tag. The skill renders with pandoc (`--wrap=none`, because pandoc's
     default line wrapping is what put newlines in headings in the first place);
-    this port renders with Python-Markdown, which is a pip dependency rather
-    than a system binary and does not wrap output, so the trap does not apply.
+    this port renders with markdown-it-py, a CommonMark renderer that is a
+    pip dependency rather than a system binary and does not wrap output, so
+    the trap does not apply. CommonMark rather than Python-Markdown because
+    the body will usually be LLM output, which nests list items by two
+    spaces; Python-Markdown needs four and silently flattens two, while
+    CommonMark nests a `-` item's children at two or four. Under a numbered
+    item CommonMark wants children indented to the item's text (three spaces
+    for `1. `), so two spaces there still comes out flat.
     Heading levels are kept as written: the payload author owns the body, and
     the skill's default of shifting `#` down a level exists for pasting a
     standalone document under a post title, not for a body authored as a post.
@@ -83,8 +89,8 @@ import subprocess
 from html.parser import HTMLParser
 from typing import Any
 
-import markdown
 import requests
+from markdown_it import MarkdownIt
 
 from framework.interfaces import Action
 from framework.registry import register_action
@@ -94,6 +100,9 @@ _MODES = ("draft", "publish")
 _DEFAULT_TOKEN_ENV = "WORDPRESS_ACCESS_TOKEN"
 _KEYCHAIN_SERVICE = "wpcom_token"
 _SKILL = "wordpress-com-publish"
+# The "commonmark" preset passes raw HTML through, matching pandoc gfm in the
+# skill; tables are a GFM extension the preset leaves off.
+_MD = MarkdownIt("commonmark").enable("table")
 # WordPress.com reports a revoked token as HTTP 401 `authorization_required`
 # (the skill's finding) and a malformed or unknown one as HTTP 400
 # `invalid_token` (observed while verifying this action). Both mean the same
@@ -175,7 +184,7 @@ class _BlockSplitter(HTMLParser):
 
 def _markdown_to_blocks(body_md: str) -> str:
     """Markdown -> Gutenberg block markup, per the skill's `md2wp.py` rules."""
-    html = markdown.markdown(body_md, extensions=["fenced_code", "tables"])
+    html = _MD.render(body_md)
     splitter = _BlockSplitter()
     splitter.feed(html)
     splitter.close()
