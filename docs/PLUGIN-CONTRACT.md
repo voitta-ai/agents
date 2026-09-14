@@ -4,7 +4,7 @@ This is the contract that issue #1 freezes. Wave 1 issues (#2 Reddit source,
 #3 Slack destination, #4 regex scorer) each implement one plugin against it,
 independently. Do not change the signatures below without re-syncing all three.
 
-## The three roles
+## The roles
 
 Defined as Protocols in `framework/interfaces.py`:
 
@@ -13,6 +13,17 @@ Defined as Protocols in `framework/interfaces.py`:
 | `Source`      | `fetch() -> list[Signal]`            | raw signals for one run |
 | `Scorer`      | `score(signal: Signal) -> ScoredSignal` | signal + int score   |
 | `Destination` | `send(scored: ScoredSignal) -> None` | delivery side effect    |
+| `Action`      | `execute(payload: dict, context: dict) -> dict` | results for later steps |
+
+`Action` is the fourth kind, added for approval-gated steps (issue #21). It is
+not part of the `agent run` loop: a destination records a proposal, and a
+separate `agent approvals` pass runs the proposal's action steps once a trusted
+human has replied `do <id>`. `payload` is the proposal content merged with the
+results of earlier steps; `context` carries run-level facts such as the
+workspace path and proposal id. The returned dict is merged into the payload
+the next step sees, so a step exposes values by name (`{url}`) to those after it.
+Register with `register_action(type_name)`; the CLI builds steps with
+`build_action(cfg)`, where `cfg` is one entry of an action's `steps` list.
 
 `Signal(id, text, url, source, meta)` — `id` is the dedupe key.
 `ScoredSignal(signal, score, reasons)`.
@@ -21,7 +32,7 @@ Defined as Protocols in `framework/interfaces.py`:
 
 A plugin is a **factory** registered under a `type` name. The factory receives
 **that component's entire config block** — the mapping under `source:` /
-`scorer:` / `destination:` in the agent's `config.yaml`, including its own
+`scorer:` / `destination:` in the agent workspace's `config.json`, including its own
 `type` key — and returns an instance implementing the role's Protocol.
 
 ```python
@@ -64,7 +75,7 @@ only `reddit` + `regex` + `slack` still runs on a venv missing `icalendar`.
 
 Tolerated is not silent. Every failed module is reported on stderr at startup,
 and if a config names a type that a failed module would have registered,
-`build_source` / `build_scorer` / `build_destination` raise `PluginImportError`
+`build_source` / `build_scorer` / `build_destination` / `build_action` raise `PluginImportError`
 immediately, quoting the original `ImportError`:
 
 ```
@@ -99,6 +110,7 @@ Signatures to register against:
 register_source(type_name: str)       # decorates  (cfg: dict) -> Source
 register_scorer(type_name: str)       # decorates  (cfg: dict) -> Scorer
 register_destination(type_name: str)  # decorates  (cfg: dict) -> Destination
+register_action(type_name: str)       # decorates  (cfg: dict) -> Action
 ```
 
 ## Rules for Wave 1
@@ -122,22 +134,50 @@ register_destination(type_name: str)  # decorates  (cfg: dict) -> Destination
 signals = source.fetch()
 for s in signals:
     if seen.has(s.id): continue
-    destination.send(scorer.score(s))
-    seen.mark(s.id)
+    try:
+        scored = scorer.score(s)
+    except ScoreError:
+        unscored += 1          # not sent, not marked: retried next run
+        continue
+    destination.send(scored)
+    pending.append(s.id)
+destination.flush()            # only if the destination defines it
+for id in pending: seen.mark(id)
 seen.save()
-return 0
+return 1 if unscored else 0
 ```
 
 Single pass, exits. Safe to double-run: `SeenStore` dedupes by `Signal.id`.
+Every run prints one summary line,
+`agent=<name> status=<ok|partial|failed> fetched=N new=N sent=N unscored=N seen=N`.
+
+### Scorer errors: one signal, or the whole run
+
+A scorer that cannot score *this* signal, while others may still score fine,
+raises `framework.interfaces.ScoreError` (or a subclass, such as the LLM
+scorer's `LLMScoreError` for a reply it could not read even after a retry). The
+runner skips that signal: it is not sent and not marked seen, so the next run
+retries it, and one stderr line names its id and the error. The rest of the run
+is delivered and deduped normally, then the run reports `status=partial` and
+exits 1.
+
+Any other exception from `score()` aborts the run with `status=failed` and
+nothing marked seen. Raise something other than `ScoreError` when the failure
+would hit every signal alike: a missing credential, or every model in the chain
+being down (`framework.llm.LLMError`, deliberately not a `ScoreError`).
 Cadence is declarative (`schedule:` in config) and wired into cron/launchd
 externally — the framework runs no daemon.
 
 ## Invocation
 
 ```
-agent run --config agents/<name>/config.yaml
+agent run --workspace <workspaces-root>/<name>
 # or, without installing the console script:
-python -m framework run --config agents/<name>/config.yaml
+python -m framework run --workspace <workspaces-root>/<name>
 ```
+
+The workspace holds `config.json`; dedupe state defaults to
+`<workspace>/state/seen.json` (`--state` overrides). `--config` is gone and
+exits 2 naming `--workspace`.
 
 Unknown `type:` fails fast with exit code 2 and lists what is registered.

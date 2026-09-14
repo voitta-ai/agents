@@ -1,7 +1,8 @@
 """Plugin registry: resolve config `type:` strings to constructed plugins.
 
 This module freezes the plugin-construction contract that Wave 1 builds
-against (Reddit source #2, Slack destination #3, regex scorer #4). See
+against (Reddit source #2, Slack destination #3, regex scorer #4), plus the
+action kind added for approval-gated steps (issue #21). See
 docs/PLUGIN-CONTRACT.md for the prose version.
 
 The contract, in one sentence: a plugin registers a factory under a `type`
@@ -32,16 +33,18 @@ from __future__ import annotations
 
 from typing import Callable
 
-from framework.interfaces import Destination, Scorer, Source
+from framework.interfaces import Action, Destination, Scorer, Source
 from framework.plugins import PluginImportFailure, import_all
 
 SourceFactory = Callable[[dict], Source]
 ScorerFactory = Callable[[dict], Scorer]
 DestinationFactory = Callable[[dict], Destination]
+ActionFactory = Callable[[dict], Action]
 
 _sources: dict[str, SourceFactory] = {}
 _scorers: dict[str, ScorerFactory] = {}
 _destinations: dict[str, DestinationFactory] = {}
+_actions: dict[str, ActionFactory] = {}
 
 # `type:` name -> the plugin module whose import failed, populated by
 # load_plugins(). Empty until it runs, and empty afterwards on a complete venv.
@@ -91,6 +94,14 @@ def register_destination(type_name: str) -> Callable[[DestinationFactory], Desti
     return decorator
 
 
+def register_action(type_name: str) -> Callable[[ActionFactory], ActionFactory]:
+    def decorator(factory: ActionFactory) -> ActionFactory:
+        _actions[type_name] = factory
+        return factory
+
+    return decorator
+
+
 def _build(kind: str, registry: dict, cfg: dict):
     # A failed import outranks whatever is in the registry, and the order here
     # is the whole guarantee. Registration is a side effect on this module's
@@ -130,6 +141,11 @@ def build_scorer(cfg: dict) -> Scorer:
 
 def build_destination(cfg: dict) -> Destination:
     retval = _build("destination", _destinations, cfg)
+    return retval
+
+
+def build_action(cfg: dict) -> Action:
+    retval = _build("action", _actions, cfg)
     return retval
 
 

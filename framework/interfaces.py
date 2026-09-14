@@ -36,9 +36,21 @@ class Source(Protocol):
         ...
 
 
+class ScoreError(RuntimeError):
+    """This one signal could not be scored; others may be.
+
+    A scorer raises it (or a subclass) when the failure belongs to the signal,
+    not to the scorer: the model answered, but not with a readable score. The
+    runner skips that signal without sending or marking it, so the next run
+    retries it, and finishes the run for everything else with `status=partial`.
+    Anything else a scorer raises, such as every model in the chain being down,
+    still aborts the run, because it would fail every signal the same way.
+    """
+
+
 class Scorer(Protocol):
-    """Scores a Signal. Regex/keyword for v1; LLM-based waterfall is a
-    tracked future replacement (see issue: LLM-based scorer)."""
+    """Scores a Signal. Raises `ScoreError` for a failure specific to that
+    signal; any other exception aborts the run."""
 
     def score(self, signal: Signal) -> ScoredSignal:
         ...
@@ -55,4 +67,20 @@ class Destination(Protocol):
     """
 
     def send(self, scored: ScoredSignal) -> None:
+        ...
+
+
+class Action(Protocol):
+    """One step of an approved action (issue #21).
+
+    Actions are the fourth plugin kind, alongside Source / Scorer / Destination.
+    They never run inside `agent run`: a destination records a *proposal*, and a
+    separate `agent approvals` pass executes the proposal's steps only after a
+    trusted human has replied `do <id>`. `payload` is the proposal's content
+    merged with the results of earlier steps; `context` carries run-level facts
+    (workspace path, proposal id). The returned dict is merged into the payload
+    seen by later steps, so a step publishes values by name for the ones after it.
+    """
+
+    def execute(self, payload: dict[str, Any], context: dict[str, Any]) -> dict[str, Any]:
         ...
