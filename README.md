@@ -81,6 +81,25 @@ login profile supplies the values and no credential is stored in a plist. If you
 schedule them another way, whatever wraps them has to load the environment
 itself; nothing in this repo does it for you.
 
+### Migrating an existing agent into a workspace
+
+An agent that was running out of a checkout (`--config <dir>/config.yaml`, state
+in `<dir>/.seen-<agent>.json`) does not carry its dedupe state over on its own:
+the workspace default is `<workspace>/state/seen.json`, and an empty one means
+every signal the source still returns is new again. There is deliberately no
+fallback read of the legacy path; the cutover is one operator step, done while
+the scheduler is stopped:
+
+1. Unload the agent's scheduled job so nothing runs mid-move.
+2. Create the workspace and write `config.json` from the old YAML.
+3. Union the old `.seen-<agent>.json` with whatever `state/seen.json` already
+   holds (both are flat JSON arrays of ids) and write the result to
+   `state/seen.json`. If the workspace was hand-run before the cutover, the two
+   files have diverged and neither alone is complete.
+4. Re-point the scheduled job at `agent run --workspace <workspace>` and load it.
+5. Hand-run once and check the summary line: `new=` should be small (what
+   arrived during the move), not the size of the feed.
+
 ### Slack incoming webhooks do not survive the app being reinstalled
 
 **This will bite you, and the symptom is misleading.** Removing and re-adding a
