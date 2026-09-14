@@ -42,6 +42,21 @@ agents/<name>/       one dir per agent: its config + any agent-specific glue
   participate in but don't administer, via their own notification emails
   forwarded to AgentMail. See issue #19.
 
+## Actions
+
+Actions are the fourth plugin kind: steps that run only after a human approves
+a proposal (issue #21), never inside `agent run`. See `docs/PLUGIN-CONTRACT.md`.
+
+- `wordpress-publish` (`framework/plugins/wordpress_action.py`) — turns
+  `payload["title"]` + `payload["body_md"]` (Markdown) into a WordPress.com post
+  and returns `{"url", "post_id"}` for later steps. Config:
+  `{"type": "wordpress-publish", "site": "<site>.wordpress.com", "mode": "draft",
+  "token_env": "WORDPRESS_ACCESS_TOKEN", "categories": [], "tags": []}`.
+  `mode` is `draft` (safety valve; `url` is the preview) or `publish` (`url` is
+  the public permalink). The token comes from `token_env`, else the macOS
+  Keychain item `wpcom_token` the `wordpress-com-publish` skill writes; missing
+  or rejected tokens fail loud naming that skill as the fix. See issue #47.
+
 ## Operating notes
 
 ### Secrets live in the environment, never in config
