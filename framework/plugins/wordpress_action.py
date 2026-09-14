@@ -74,6 +74,9 @@ module is shaped the way it is:
   - **The POST response is rendered, not stored.** Its `content` has the block
     comments stripped, so verifying what WordPress kept means
     `GET .../posts/<ID>?context=edit`, not reading the response.
+  - **`posts/new` is not idempotent, and nothing here retries.** A timeout
+    after WordPress accepted the request can leave a post that this action
+    reports as failed, so check the site before re-running by hand.
 
 Not in scope, per the issue: updating an existing post, media upload, and a
 scheduled (`future`) publish date.
