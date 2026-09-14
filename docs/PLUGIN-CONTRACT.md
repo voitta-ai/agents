@@ -128,6 +128,22 @@ register_action(type_name: str)       # decorates  (cfg: dict) -> Action
 - **Fetch has no side effects beyond fetching.** Scoring is pure. Delivery is
   the only place external writes happen.
 
+## Optional hooks: `Destination.flush()` and `Source.commit()`
+
+Neither is part of its Protocol; the runner discovers both with `getattr`, so
+plugins that do not need them are unaffected.
+
+- `flush()` on a destination is called once after the last `send()` (issue
+  #26). Batching and digest destinations buffer in `send()` and deliver here.
+- `commit()` on a source is called once after `seen.save()` has succeeded
+  (issue #46). It is for a source whose fetch window is its own state — the
+  `github-releases` source keeps a `last_run` timestamp so that "what shipped
+  since we last looked" is an explicit question rather than an over-fetch that
+  SeenStore trims. Advance that window in `commit()`, never in `fetch()`: a run
+  that fetched and then failed to deliver never reaches `commit()`, so the next
+  run re-fetches the same window and SeenStore drops what did get through.
+  At-least-once, never a silent skip.
+
 ## The run loop (already implemented, `framework/runner.py`)
 
 ```
@@ -135,8 +151,11 @@ signals = source.fetch()
 for s in signals:
     if seen.has(s.id): continue
     destination.send(scorer.score(s))
-    seen.mark(s.id)
+    pending.append(s.id)
+destination.flush()      # if defined
+for id in pending: seen.mark(id)
 seen.save()
+source.commit()          # if defined
 return 0
 ```
 

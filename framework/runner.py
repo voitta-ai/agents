@@ -9,6 +9,17 @@ sees the whole run. That is `Destination.flush()`, called once after the loop
 `flush()` is optional. A streaming destination does not define it and is
 unaffected.
 
+The mirror image on the source side is `Source.commit()`, called once after
+`seen.save()` succeeds (issue #46). It exists for a source whose fetch window is
+its own state — the github-releases source keeps `last_run` so "what shipped
+since we last looked" is an explicit question rather than an over-fetch that
+SeenStore trims. Such a source must not advance that window inside `fetch()`:
+a run that fetched, then failed to deliver, would have moved the window past
+releases nobody saw. `commit()` runs only after delivery and the dedupe marks
+are durable, so a failure anywhere earlier leaves the window where it was and
+the next run re-fetches it. Optional and discovered with getattr, exactly like
+`flush()`; existing sources are unaffected.
+
 Dedupe is marked only after delivery has actually happened, which for a batching
 destination means after `flush()`, not after `send()`. Marking earlier would
 lose signals silently: `send()` merely buffers, so a `flush()` that throws would
@@ -89,6 +100,12 @@ def run(
         for signal_id in pending:
             seen.mark(signal_id)
         seen.save()
+
+        # A source that tracks its own fetch window advances it only here, once
+        # delivery and the dedupe marks are both durable (issue #46).
+        commit = getattr(source, "commit", None)
+        if callable(commit):
+            commit()
 
         status = "ok"
     finally:
