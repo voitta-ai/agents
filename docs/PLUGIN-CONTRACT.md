@@ -32,7 +32,7 @@ Register with `register_action(type_name)`; the CLI builds steps with
 
 A plugin is a **factory** registered under a `type` name. The factory receives
 **that component's entire config block** — the mapping under `source:` /
-`scorer:` / `destination:` in the agent's `config.yaml`, including its own
+`scorer:` / `destination:` in the agent workspace's `config.json`, including its own
 `type` key — and returns an instance implementing the role's Protocol.
 
 ```python
@@ -171,9 +171,13 @@ externally — the framework runs no daemon.
 ## Invocation
 
 ```
-agent run --config agents/<name>/config.yaml
+agent run --workspace <workspaces-root>/<name>
 # or, without installing the console script:
-python -m framework run --config agents/<name>/config.yaml
+python -m framework run --workspace <workspaces-root>/<name>
 ```
+
+The workspace holds `config.json`; dedupe state defaults to
+`<workspace>/state/seen.json` (`--state` overrides). `--config` is gone and
+exits 2 naming `--workspace`.
 
 Unknown `type:` fails fast with exit code 2 and lists what is registered.
