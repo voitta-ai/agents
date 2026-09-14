@@ -15,6 +15,7 @@ Later additions:
   - `digest` destination (issues #13, #20) - summarizes a run into one message
   - `slack-workspace` source (issue #19)
   - `ics` source         (issue #22)
+  - `llm` scorer         (issue #9)  - scores through the model waterfall
   - `approval` destination and `slack-post` action (issue #21)
 
 Why a table rather than eight import statements (issue #39). Importing every
@@ -66,6 +67,7 @@ _PLUGIN_MODULES: dict[str, tuple[str, ...]] = {
     "digest_destination": ("digest",),
     "github_org_source": ("github-org",),
     "ics_source": ("ics",),
+    "llm_scorer": ("llm",),
     "reddit_source": ("reddit",),
     "regex_scorer": ("regex",),
     "slack_destination": ("slack",),

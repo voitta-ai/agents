@@ -89,7 +89,7 @@ from typing import Any
 
 import requests
 
-from framework.config import ConfigError
+from framework.config import CONFIG_FILENAME, ConfigError
 from framework.proposals import (
     STATUS_DONE,
     STATUS_FAILED,
@@ -102,7 +102,6 @@ from framework.proposals import (
 )
 from framework.registry import build_action
 
-CONFIG_FILENAME = "config.json"
 _SLACK_API = "https://slack.com/api"
 _REPLY_RE = re.compile(r"^(do|skip)\s+(\S+)$")
 _DEFAULT_HOURS = 24
@@ -133,10 +132,12 @@ class ApprovalsConfig:
 def load_approvals_config(workspace: str | Path) -> ApprovalsConfig:
     """Read the `approvals` and `actions` blocks of `<workspace>/config.json`.
 
-    Deliberately reads only what this pass needs. The source/scorer/destination
-    blocks are `agent run`'s business (issue #43 owns the full loader), and
-    this pass must not fail because, say, a source plugin's dependency is
-    missing on the machine that only executes approvals.
+    Deliberately reads only what this pass needs, rather than going through
+    `framework.config.load_workspace`. That loader requires `source`, `scorer`
+    and `destination` to be objects with a `type`, none of which this pass
+    uses; a proposal already recorded should still be executable or skippable
+    while an operator has the source block half-edited. The file checks and
+    error wording match `load_workspace`'s.
     """
     workspace_path = Path(workspace).expanduser().resolve()
     if not workspace_path.is_dir():
