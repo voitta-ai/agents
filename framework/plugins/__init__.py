@@ -63,6 +63,7 @@ _PLUGIN_MODULES: dict[str, tuple[str, ...]] = {
     "agentmail_source": ("agentmail",),
     "digest_destination": ("digest",),
     "github_org_source": ("github-org",),
+    "github_releases_source": ("github-releases",),
     "ics_source": ("ics",),
     "reddit_source": ("reddit",),
     "regex_scorer": ("regex",),

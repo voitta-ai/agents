@@ -41,6 +41,11 @@ agents/<name>/       one dir per agent: its config + any agent-specific glue
 - `agents/slack-workspace/` — digests community Slack workspaces we
   participate in but don't administer, via their own notification emails
   forwarded to AgentMail. See issue #19.
+- `agents/release-notes/` — one signal per GitHub release across an org since
+  the last run, for the weekly release-notes digest. Uses the `github-releases`
+  source (issue #46), which keeps its own window in
+  `<state_dir>/github-releases.json` and advances it only after a run has
+  delivered (`Source.commit()`, see `docs/PLUGIN-CONTRACT.md`).
 
 ## Operating notes
 
