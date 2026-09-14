@@ -207,8 +207,20 @@ def _markdown_to_blocks(body_md: str) -> str:
             raw = re.sub(r"^<ul\b[^>]*>", '<ul class="wp-block-list">', raw, count=1)
             out.append(f"<!-- wp:list -->\n{raw}\n<!-- /wp:list -->")
         elif tag == "ol":
-            raw = re.sub(r"^<ol\b[^>]*>", '<ol class="wp-block-list">', raw, count=1)
-            out.append(f'<!-- wp:list {{"ordered":true}} -->\n{raw}\n<!-- /wp:list -->')
+            # The renderer writes start="N" for a list not beginning at 1; the
+            # block keeps it both on the tag and in its attributes, or a list
+            # starting at 3 would be renumbered from 1.
+            start = re.match(r'^<ol\b[^>]*\bstart="(\d+)"', raw)
+            if start:
+                n = int(start.group(1))
+                raw = re.sub(
+                    r"^<ol\b[^>]*>", f'<ol start="{n}" class="wp-block-list">', raw, count=1
+                )
+                attrs = f'{{"ordered":true,"start":{n}}}'
+            else:
+                raw = re.sub(r"^<ol\b[^>]*>", '<ol class="wp-block-list">', raw, count=1)
+                attrs = '{"ordered":true}'
+            out.append(f"<!-- wp:list {attrs} -->\n{raw}\n<!-- /wp:list -->")
         elif tag == "blockquote":
             out.append(f"<!-- wp:quote -->\n{raw}\n<!-- /wp:quote -->")
         else:
