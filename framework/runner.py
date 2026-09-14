@@ -82,7 +82,7 @@ model chain being down would fail every signal alike, and there is nothing to
 salvage by carrying on.
 
 The statuses, then: `ok` (exit 0), `partial` (exit 1, some signals unscored,
-everything else delivered, the source's window not advanced), `uncommitted`
+everything else delivered, the source's window not advanced), `commit_failed`
 (the exception from `commit()` propagates; everything was delivered and marked
 seen, only the source's window did not advance, so the next run re-fetches it
 and SeenStore drops it all), and `failed` (the exception propagates, nothing
@@ -156,7 +156,7 @@ def run(
             if callable(commit):
                 # Delivered and marked already: if commit() raises, the line
                 # must not say `failed`.
-                status = "uncommitted"
+                status = "commit_failed"
                 commit()
             status = "ok"
     finally:

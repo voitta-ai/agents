@@ -169,7 +169,7 @@ return 1 if unscored else 0
 
 Single pass, exits. Safe to double-run: `SeenStore` dedupes by `Signal.id`.
 Every run prints one summary line,
-`agent=<name> status=<ok|partial|uncommitted|failed> fetched=N new=N sent=N unscored=N seen=N`.
+`agent=<name> status=<ok|partial|commit_failed|failed> fetched=N new=N sent=N unscored=N seen=N`.
 
 ### Scorer errors: one signal, or the whole run
 
