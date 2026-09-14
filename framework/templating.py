@@ -12,7 +12,8 @@ the payload, which is how a client or response object's internals end up in a
 Slack post. So every field is parsed first with `string.Formatter().parse()`
 and anything that is not a bare key of the values map is rejected by name,
 before any formatting happens. Format specs (`{items:>4}`) are left alone; they
-format the value, they do not reach into it.
+format the value, they do not reach into it. A spec can nest a field of its
+own (`{items:>{width}}`), and that nested field goes through the same check.
 
 A placeholder with no value is an error naming the placeholder, never an empty
 string: an approved post that went out reading "Published: " is exactly the
@@ -28,13 +29,22 @@ class TemplateError(ValueError):
     """A template is malformed, reaches into a value, or names a missing one."""
 
 
-def _fields(template: str) -> list[str]:
+def _fields(template: str, text: str | None = None) -> list[str]:
+    """Plain field names in `text` (default: `template`), specs included.
+
+    A format spec may itself hold a replacement field (`{a:{width}}`), which
+    `format_map` resolves like any other, so the spec is parsed the same way:
+    `{a:{b.__class__}}` must be refused exactly as `{b.__class__}` is.
+    `template` is the whole string, for error messages.
+    """
+    if text is None:
+        text = template
     try:
-        parsed = list(string.Formatter().parse(template))
+        parsed = list(string.Formatter().parse(text))
     except ValueError as exc:
         raise TemplateError(f"template {template!r} is malformed: {exc}") from exc
     retval = []
-    for _literal, field_name, _spec, _conversion in parsed:
+    for _literal, field_name, spec, _conversion in parsed:
         if field_name is None:
             continue
         if field_name == "" or field_name.isdigit():
@@ -48,6 +58,8 @@ def _fields(template: str) -> list[str]:
                 "only plain names are allowed"
             )
         retval.append(field_name)
+        if spec:
+            retval.extend(_fields(template, spec))
     return retval
 
 
