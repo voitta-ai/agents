@@ -58,8 +58,8 @@ retry is a human decision made by reading the outcome message and the store.
 
 Whatever happened, one outcome message goes to the channel through
 `chat.postMessage`, and one summary line is printed, unconditionally, in the
-shape the runner uses (issue #31): `agent=<name> approvals=N executed=N
-skipped=N failed=N`.
+shape the runner uses (issue #31): `agent=<name> status=ok approvals=N
+executed=N skipped=N failed=N stuck=N`.
 
 Order inside a `do` matters: claim, then steps (each recorded in the store as
 it completes), then the terminal status, then the channel is told. If posting
