@@ -68,6 +68,7 @@ _PLUGIN_MODULES: dict[str, tuple[str, ...]] = {
     "regex_scorer": ("regex",),
     "slack_destination": ("slack",),
     "slack_workspace_source": ("slack-workspace",),
+    "wordpress_action": ("wordpress-publish",),
 }
 
 
