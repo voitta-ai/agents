@@ -122,10 +122,13 @@ the channel. The bot token needs `channels:history` (or `groups:history` for a
 private channel) and `chat:write`.
 
 A proposal left `running` by a pass that is no longer alive (or claimed more
-than `hours` ago) means that pass died mid-steps. It is never re-run on its own: every pass reports it on stderr and as `stuck=N`, and the channel is
-told once which steps the store recorded as done. To re-run it, edit
-`state/proposals.json` and set its `status` back to `"pending"` (a fresh `do`
-is then needed); to close it, set `"failed"`.
+than `hours` ago) means that pass died mid-steps. It is never re-run on its
+own: every pass reports it on stderr and as `stuck=N`, and the channel is told
+once which steps the store recorded as done. Re-running it is a manual edit of
+`state/proposals.json`: set its `status` back to `"pending"`, and the next pass
+runs all of its steps again, including any that already happened, if the
+original `do` is still inside the `hours` window (otherwise reply `do` again).
+To close it instead, set `"failed"`.
 
 Steps are **action** plugins, the fourth kind (`docs/PLUGIN-CONTRACT.md`).
 Later steps see earlier results by `{name}` templating over the proposal's

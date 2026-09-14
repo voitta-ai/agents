@@ -73,8 +73,11 @@ automatically, because the steps it did complete (say, the publish) are real
 and re-running them is exactly the duplicate the claim exists to prevent.
 Every pass reports it on stderr and counts it in the summary line as
 `stuck=N`; the channel is told once, with the steps the store has recorded as
-done. Re-running it is a human decision: edit the store, set the proposal
-back to `pending` (or to `failed` to close it), and the next `do` proceeds.
+done. Re-running it is a human decision: edit the store and set the proposal
+back to `pending` (or to `failed` to close it). The `do` that claimed it is
+still in the channel, so if it is inside the `hours` window the next pass runs
+every step again at once, including the ones that already happened; otherwise
+a fresh `do` is needed.
 """
 from __future__ import annotations
 
