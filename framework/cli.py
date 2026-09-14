@@ -3,6 +3,12 @@
 Single invocation, single pass, exits 0 (success) / nonzero (failure). Safe to
 double-run because the framework dedupes via SeenStore. No daemon, no loop:
 cron/launchd owns the clock.
+
+`agent run --workspace <dir>` is the whole interface (issue #43): the workspace
+holds `config.json`, and dedupe state defaults to `<dir>/state/seen.json`.
+`--config` is gone rather than deprecated. There is one caller per agent and it
+is a plist line, so a deprecation shim would only hide the plist that was never
+updated. Passing it exits 2 with a message that names `--workspace`.
 """
 from __future__ import annotations
 
@@ -10,7 +16,7 @@ import argparse
 import sys
 from pathlib import Path
 
-from framework.config import ConfigError, load_config
+from framework.config import ConfigError, load_workspace
 from framework.plugins import PluginImportFailure
 from framework.registry import (
     PluginImportError,
@@ -24,9 +30,14 @@ from framework.runner import run
 from framework.state import SeenStore
 
 
-def _default_state_path(config_dir: Path, agent: str) -> Path:
-    retval = config_dir / f".seen-{agent}.json"
-    return retval
+class _RemovedConfigOption(argparse.Action):
+    """Reject `--config` with a message that says what replaced it."""
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        parser.error(
+            "--config was removed; pass --workspace <dir> "
+            "and put the agent's config.json in that directory"
+        )
 
 
 def _report_failed_plugins(failures: dict[str, PluginImportFailure]) -> None:
@@ -52,14 +63,14 @@ def _report_failed_plugins(failures: dict[str, PluginImportFailure]) -> None:
 
 
 def _cmd_run(args: argparse.Namespace) -> int:
-    cfg = load_config(args.config)
+    cfg = load_workspace(args.workspace)
 
     _report_failed_plugins(load_plugins())
     source = build_source(cfg.source)
     scorer = build_scorer(cfg.scorer)
     destination = build_destination(cfg.destination)
 
-    state_path = Path(args.state) if args.state else _default_state_path(cfg.dir, cfg.agent)
+    state_path = Path(args.state) if args.state else cfg.default_state_path
     seen = SeenStore(state_path)
 
     retval = run(source, scorer, destination, seen, cfg.agent)
@@ -72,14 +83,15 @@ def build_parser() -> argparse.ArgumentParser:
 
     run_parser = sub.add_parser("run", help="Run one pass of an agent and exit.")
     run_parser.add_argument(
-        "--config",
-        default="config.yaml",
-        help="Path to the agent's config.yaml (default: ./config.yaml).",
+        "--workspace",
+        required=True,
+        help="The agent's workspace directory; <dir>/config.json is loaded.",
     )
+    run_parser.add_argument("--config", action=_RemovedConfigOption, help=argparse.SUPPRESS)
     run_parser.add_argument(
         "--state",
         default=None,
-        help="Path to the dedupe state file (default: <config-dir>/.seen-<agent>.json).",
+        help="Path to the dedupe state file (default: <workspace>/state/seen.json).",
     )
     run_parser.set_defaults(func=_cmd_run)
     return parser
