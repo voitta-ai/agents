@@ -1,0 +1,31 @@
+{
+  "_comment": "Copy into a workspace directory as config.json (outside any git checkout) and fill in real values. Secrets never live here: credentials are named by env var, not stored. 'schedule' is declarative only; launchd/cron owns the clock.",
+  "agent": "release-notes-example",
+  "schedule": "0 9 * * 1",
+  "source": {
+    "type": "github-releases",
+    "_comment": "visibility is 'public' (default), 'private' or 'all'; archived repos are always skipped. since 'state' starts the window at last_run in <workspace>/state/github-releases.json (agent run injects state_dir), or at first_run_since when there is no state yet; any ISO date instead of 'state' is used literally and leaves the state file alone (hand re-runs). max_commit_age_days skips a release whose tagged commit is older than the window start minus that many days (a backfilled old tag), logging each skip to stderr. exclude_repos: forks and mirrors whose releases are not ours to announce.",
+    "org": "<org>",
+    "visibility": "public",
+    "since": "state",
+    "first_run_since": "2026-01-01",
+    "max_commit_age_days": 30,
+    "include_prereleases": false,
+    "exclude_repos": [
+      "<fork-we-do-not-own>"
+    ]
+  },
+  "scorer": {
+    "type": "regex",
+    "ignore_case": true,
+    "match": "presence",
+    "floor": 0,
+    "rules": []
+  },
+  "destination": {
+    "type": "digest",
+    "webhook_env": "SOME_WEBHOOK",
+    "title": "Release notes",
+    "prompt": "Write this week's release notes from the releases below. Group by repo, keep each project's own wording where it is good, and skip version bumps with no user-visible change."
+  }
+}

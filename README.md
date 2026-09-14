@@ -69,7 +69,7 @@ the framework and by every plugin, and is where decisions worth keeping go.
 - `agents/release-notes/` — one signal per GitHub release across an org since
   the last run, for the weekly release-notes digest. Uses the `github-releases`
   source (issue #46), which keeps its own window in
-  `<state_dir>/github-releases.json` and advances it only after a run has
+  `<workspace>/state/github-releases.json` and advances it only after a run has
   delivered (`Source.commit()`, see `docs/PLUGIN-CONTRACT.md`).
 
 ## Operating notes

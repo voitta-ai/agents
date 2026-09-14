@@ -16,7 +16,7 @@ import argparse
 import sys
 from pathlib import Path
 
-from framework.config import ConfigError, load_workspace
+from framework.config import STATE_DIRNAME, ConfigError, load_workspace
 from framework.plugins import PluginImportFailure
 from framework.registry import (
     PluginImportError,
@@ -66,6 +66,10 @@ def _cmd_run(args: argparse.Namespace) -> int:
     cfg = load_workspace(args.workspace)
 
     _report_failed_plugins(load_plugins())
+    # A source that keeps its own state (github-releases' fetch window) keeps
+    # it beside the dedupe state, so configs need not name the directory. The
+    # registry hands a factory only its own block, hence the injection.
+    cfg.source.setdefault("state_dir", str(cfg.workspace / STATE_DIRNAME))
     source = build_source(cfg.source)
     scorer = build_scorer(cfg.scorer)
     destination = build_destination(cfg.destination)
