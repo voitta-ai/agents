@@ -42,6 +42,21 @@ agents/<name>/       one dir per agent: its config + any agent-specific glue
   participate in but don't administer, via their own notification emails
   forwarded to AgentMail. See issue #19.
 
+## Actions
+
+Approval-gated steps (see `Action` in `framework/interfaces.py`). Each runs
+only after a trusted human approves the proposal it belongs to.
+
+- `twitter-post` — tweets `text` (a `{payload}` template) through the X API v2
+  with OAuth 1.0a user context; credentials from `TWITTER_API_KEY`,
+  `TWITTER_API_SECRET`, `TWITTER_ACCESS_TOKEN`, `TWITTER_ACCESS_SECRET`
+  (names overridable via `*_env` keys). Over 280 characters is an error before
+  any request. Needs `pip install '.[twitter]'`. Returns `tweet_url`. Issue #48.
+- `linkedin-post` — shares `text` on the operator's profile through the LinkedIn
+  Posts API; token from `LINKEDIN_ACCESS_TOKEN` (`access_token_env`), which
+  needs the `w_member_social` and `openid` scopes. Unset token raises a
+  "not configured" error naming both. Returns `post_urn`. Issue #48.
+
 ## Operating notes
 
 ### Secrets live in the environment, never in config

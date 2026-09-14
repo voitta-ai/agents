@@ -64,10 +64,12 @@ _PLUGIN_MODULES: dict[str, tuple[str, ...]] = {
     "digest_destination": ("digest",),
     "github_org_source": ("github-org",),
     "ics_source": ("ics",),
+    "linkedin_action": ("linkedin-post",),
     "reddit_source": ("reddit",),
     "regex_scorer": ("regex",),
     "slack_destination": ("slack",),
     "slack_workspace_source": ("slack-workspace",),
+    "twitter_action": ("twitter-post",),
 }
 
 
