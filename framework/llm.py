@@ -243,3 +243,50 @@ class LLMClient:
             return retval
 
         raise LLMError("all models failed — " + "; ".join(failures))
+
+
+def build_client(
+    cfg: dict,
+    default_max_tokens: int = 2000,
+    default_temperature: float = 0.3,
+    what: str = "llm",
+) -> LLMClient:
+    """Build an `LLMClient` from a plugin's config block.
+
+    Every LLM-backed plugin resolves its chain the same way, and this is that
+    way, written once: an explicit `model.primary` / `model.fallbacks` in the
+    agent's own config wins; absent one, OpenClaw's shared chain is used so
+    there is a single waterfall to maintain rather than one copy per agent.
+
+    Only OpenRouter entries need a key. A chain whose entries are all `codex/...`
+    runs on the ChatGPT subscription with no API key at all, which is the main
+    reason that transport exists -- so requiring the key up front would defeat
+    it. A missing key becomes a per-model failure at the point an OpenRouter
+    entry is actually attempted (see `LLMClient.complete`).
+
+    `what` names the calling plugin in error messages.
+    """
+    model_cfg = cfg.get("model") or {}
+    primary = model_cfg.get("primary")
+    fallbacks = model_cfg.get("fallbacks")
+    if not primary:
+        shared = load_openclaw_chain()
+        if shared is None:
+            raise RuntimeError(
+                f"{what} needs 'model.primary', or an OpenClaw config at "
+                f"{_OPENCLAW_CONFIG} providing agents.defaults.model"
+            )
+        primary, fallbacks = shared
+
+    key_env = cfg.get("api_key_env", "OPENROUTER_API_KEY")
+    api_key = os.environ.get(key_env)
+
+    retval = LLMClient(
+        api_key=api_key,
+        primary=primary,
+        fallbacks=fallbacks,
+        timeout=int(cfg.get("llm_timeout", 120)),
+        max_tokens=int(cfg.get("max_tokens", default_max_tokens)),
+        temperature=float(cfg.get("temperature", default_temperature)),
+    )
+    return retval

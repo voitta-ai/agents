@@ -134,13 +134,37 @@ register_action(type_name: str)       # decorates  (cfg: dict) -> Action
 signals = source.fetch()
 for s in signals:
     if seen.has(s.id): continue
-    destination.send(scorer.score(s))
-    seen.mark(s.id)
+    try:
+        scored = scorer.score(s)
+    except ScoreError:
+        unscored += 1          # not sent, not marked: retried next run
+        continue
+    destination.send(scored)
+    pending.append(s.id)
+destination.flush()            # only if the destination defines it
+for id in pending: seen.mark(id)
 seen.save()
-return 0
+return 1 if unscored else 0
 ```
 
 Single pass, exits. Safe to double-run: `SeenStore` dedupes by `Signal.id`.
+Every run prints one summary line,
+`agent=<name> status=<ok|partial|failed> fetched=N new=N sent=N unscored=N seen=N`.
+
+### Scorer errors: one signal, or the whole run
+
+A scorer that cannot score *this* signal, while others may still score fine,
+raises `framework.interfaces.ScoreError` (or a subclass, such as the LLM
+scorer's `LLMScoreError` for a reply it could not read even after a retry). The
+runner skips that signal: it is not sent and not marked seen, so the next run
+retries it, and one stderr line names its id and the error. The rest of the run
+is delivered and deduped normally, then the run reports `status=partial` and
+exits 1.
+
+Any other exception from `score()` aborts the run with `status=failed` and
+nothing marked seen. Raise something other than `ScoreError` when the failure
+would hit every signal alike: a missing credential, or every model in the chain
+being down (`framework.llm.LLMError`, deliberately not a `ScoreError`).
 Cadence is declarative (`schedule:` in config) and wired into cron/launchd
 externally — the framework runs no daemon.
 
