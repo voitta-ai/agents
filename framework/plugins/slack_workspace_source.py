@@ -87,6 +87,13 @@ a guarantee that can be switched off in a config file is not one.
     and retry that call. A run that still cannot complete raises; it never
     returns the messages it managed to get as though that were everything,
     because the SeenStore would then mark the window done.
+  - A page with `has_more: true` and no `next_cursor` raises. That is the
+    shape Slack returns when a free-tier workspace's history visibility cap
+    cuts the window short, and it is the common case for the community
+    workspaces this transport targets. Following it with time-based
+    pagination would not help (the older messages are not visible to this
+    user), and returning what came back would present a capped window as a
+    complete one.
 
 Config keys (session transport):
 
@@ -310,7 +317,12 @@ class _SessionClient:
         return retval
 
     def paginate(self, method: str, key: str, **params: Any) -> list[dict[str, Any]]:
-        """Follow `response_metadata.next_cursor` and concatenate `key`."""
+        """Follow `response_metadata.next_cursor` and concatenate `key`.
+
+        Raises when a page says `has_more` but gives no cursor to continue
+        with: Slack's history-visibility cap, where a partial result must not
+        pass for a complete one.
+        """
         items: list[dict[str, Any]] = []
         cursor = ""
         while True:
@@ -321,6 +333,16 @@ class _SessionClient:
             items.extend(page.get(key) or [])
             cursor = (page.get("response_metadata") or {}).get("next_cursor") or ""
             if not cursor:
+                if page.get("has_more"):
+                    channel = params.get("channel")
+                    where = f" for channel {channel}" if channel else ""
+                    raise RuntimeError(
+                        f"slack-workspace session: {method}{where} reported has_more "
+                        "with no next_cursor after "
+                        f"{len(items)} items: history is capped (Slack's free-tier "
+                        "history visibility limit), so the rest of the window cannot "
+                        "be read; refusing to return a partial result"
+                    )
                 break
         retval = items
         return retval
