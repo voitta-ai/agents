@@ -22,6 +22,11 @@ Two defaults chosen deliberately:
 as a draft for review. Actually publishing anywhere other than Slack is a
 separate destination; this one only ever posts to a webhook.
 
+`render()` (issue #21) is the same digest handed back as parts instead of
+posted, so the `approval` destination can wrap this one and turn the digest
+into a proposal. `flush()` is `render()` plus the post, and behaves exactly as
+before when this destination is used on its own.
+
 Contract: see docs/PLUGIN-CONTRACT.md.
 """
 from __future__ import annotations
@@ -94,29 +99,63 @@ class DigestDestination:
         )
         resp.raise_for_status()
 
+    def render(self) -> dict:
+        """Write the digest without posting it (issue #21).
+
+        This is the hook the `approval` destination uses to turn a digest into
+        a proposal: the same LLM call `flush()` makes, returned as parts rather
+        than sent. `title` and `body_md` are the contract; `footer` carries the
+        item count and the model that answered; `empty` is True when nothing
+        came through this run, so a wrapper can tell a quiet run from a digest
+        worth proposing. An LLM failure raises `LLMError`; the caller decides
+        where to surface it. Does not clear the buffer, so it can be called more
+        than once per run.
+        """
+        if not self._buffered:
+            retval = {
+                "title": self.title,
+                "body_md": self.empty_message,
+                "footer": "",
+                "empty": True,
+                "items": 0,
+            }
+            return retval
+
+        dropped = max(0, len(self._buffered) - self.max_signals)
+        user = f"{self.prompt}\n\n---\n\n{self._render_items()}"
+        summary = self.llm.complete(self.system, user)
+
+        footer = f"_{len(self._buffered)} item(s) · {self.llm.model_used}_"
+        if dropped:
+            footer += f" · _{dropped} item(s) omitted past max_signals_"
+        retval = {
+            "title": self.title,
+            "body_md": summary,
+            "footer": footer,
+            "empty": False,
+            "items": len(self._buffered),
+            "model": self.llm.model_used,
+        }
+        return retval
+
     def flush(self) -> None:
         header = f"*{self.title}*"
         if self.gate:
             header += "  _(draft — review before publishing)_"
 
-        if not self._buffered:
-            self._post(f"{header}\n\n{self.empty_message}")
-            return
-
-        dropped = max(0, len(self._buffered) - self.max_signals)
-        user = f"{self.prompt}\n\n---\n\n{self._render_items()}"
         try:
-            summary = self.llm.complete(self.system, user)
+            rendered = self.render()
         except LLMError as exc:
             # Surface the failure into the channel. Staying silent here would
             # look exactly like a quiet week.
             self._post(f"{header}\n\n:warning: digest not generated — {exc}")
             raise
 
-        footer = f"_{len(self._buffered)} item(s) · {self.llm.model_used}_"
-        if dropped:
-            footer += f" · _{dropped} item(s) omitted past max_signals_"
-        self._post(f"{header}\n\n{summary}\n\n{footer}")
+        if rendered["empty"]:
+            self._post(f"{header}\n\n{rendered['body_md']}")
+            return
+
+        self._post(f"{header}\n\n{rendered['body_md']}\n\n{rendered['footer']}")
         self._buffered.clear()
 
 
