@@ -13,15 +13,24 @@ does: the agent's own `model:` block if it has one, otherwise OpenClaw's shared
 
 Three decisions worth knowing before configuring it:
 
-  - **The model replies in JSON, and an unreadable reply fails the run.** The
-    scorer asks for `{"score": <int>, "reasons": [...]}` and takes the first
-    JSON object carrying a `score` key from whatever comes back, tolerating a
-    code fence, a sentence of preamble, or a second object after the answer. If
-    no such object can be read, or `score` is not a finite number, it raises
-    `LLMScoreError`. It does not quietly return 0: a 0 gets the signal marked
-    seen and never looked at again, which is a silent drop wearing a score. A
-    raised error leaves the run's dedupe unmarked, so the next run re-scores
-    (issue #26's at-least-once bias). Loud beats lossy.
+  - **The model replies in JSON, and an unreadable reply skips that signal,
+    loudly.** The scorer asks for `{"score": <int>, "reasons": [...]}` and
+    takes the first JSON object carrying a `score` key from whatever comes
+    back, tolerating a code fence, a sentence of preamble, or a second object
+    after the answer. If no such object can be read, or `score` is not a finite
+    number, it asks once more with the format restated, and if that reply is
+    unreadable too it raises `LLMScoreError`. It does not quietly return 0: a 0
+    gets the signal marked seen and never looked at again, which is a silent
+    drop wearing a score.
+
+    `LLMScoreError` is a `ScoreError`, which the runner handles per signal:
+    that signal is neither sent nor marked seen, everything else in the run is
+    delivered and deduped, the summary line counts it under `unscored=`, and
+    the run exits 1 with `status=partial`. So one signal the model will not
+    answer in JSON cannot silence the agent, and it is retried every run until
+    it scores or leaves the feed. A dead chain is different: `LLMError` (every
+    model failed) is not a `ScoreError` and still aborts the run, since it
+    would fail every signal the same way.
   - **Text is truncated to `max_chars` before it is sent.** Reddit posts run to
     thousands of words; scoring needs the first few hundred. The default keeps
     each call small and predictable on metered fallbacks.
@@ -41,7 +50,7 @@ from __future__ import annotations
 import json
 import math
 
-from framework.interfaces import ScoredSignal, Scorer, Signal
+from framework.interfaces import ScoredSignal, ScoreError, Scorer, Signal
 from framework.llm import LLMClient, build_client
 from framework.registry import register_scorer
 
@@ -56,8 +65,20 @@ _DEFAULT_SYSTEM = (
 _DECODER = json.JSONDecoder()
 
 
-class LLMScoreError(RuntimeError):
-    """The model answered, but not with a readable score."""
+_RETRY_REMINDER = (
+    "\n\n---\n\nYour previous reply could not be read. Reply with a single JSON "
+    'object and nothing else: {"score": <integer 0-100>, "reasons": [<one or '
+    "two short strings>]}."
+)
+
+
+class LLMScoreError(ScoreError):
+    """The model answered, but not with a readable score.
+
+    A `ScoreError`, so the runner skips this signal and carries on. `LLMError`
+    from `framework.llm` (every model in the chain failed) deliberately is not:
+    a dead chain fails every signal alike and must still abort the run.
+    """
 
 
 def _first_score_object(raw: str) -> dict | None:
@@ -146,8 +167,21 @@ class LLMScorer:
         return retval
 
     def score(self, signal: Signal) -> ScoredSignal:
-        reply = self.llm.complete(self.system, self._render(signal))
-        score, reasons = _parse_score(reply)
+        user = self._render(signal)
+        reply = self.llm.complete(self.system, user)
+        try:
+            score, reasons = _parse_score(reply)
+        except LLMScoreError as first:
+            # One retry, with the format restated. A model that drifted into
+            # prose once often answers cleanly when told so; a second miss is
+            # this signal's problem and goes to the runner as a ScoreError.
+            reply = self.llm.complete(self.system, user + _RETRY_REMINDER)
+            try:
+                score, reasons = _parse_score(reply)
+            except LLMScoreError as second:
+                raise LLMScoreError(
+                    f"unreadable reply after one retry; first: {first}; retry: {second}"
+                ) from second
         score = max(self.floor, min(self.ceiling, score))
         reasons.append(f"model={self.llm.model_used}")
         retval = ScoredSignal(signal=signal, score=score, reasons=reasons)
