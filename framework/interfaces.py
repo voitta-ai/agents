@@ -33,10 +33,11 @@ class Source(Protocol):
     """Produces raw Signals for one run. No side effects beyond fetching.
 
     A source may also define `commit()`, called once by the runner after
-    `seen.save()` has succeeded. It is for a source that tracks its own fetch
-    window (the github-releases source's `last_run`): the window advances in
-    `commit()`, never in `fetch()`, so a run that fails to deliver does not move
-    it. Like `Destination.flush()` it is discovered with getattr and is
+    `seen.save()` has succeeded, and only on a `status=ok` run (never on a
+    `partial` one, whose unscored signals must stay inside the next window). It
+    is for a source that tracks its own fetch window (the github-releases
+    source's `last_run`): the window advances in `commit()`, never in `fetch()`,
+    so a run that fails to deliver does not move it. Like `Destination.flush()` it is discovered with getattr and is
     deliberately not part of this Protocol (issue #46).
     """
 
@@ -44,9 +45,21 @@ class Source(Protocol):
         ...
 
 
+class ScoreError(RuntimeError):
+    """This one signal could not be scored; others may be.
+
+    A scorer raises it (or a subclass) when the failure belongs to the signal,
+    not to the scorer: the model answered, but not with a readable score. The
+    runner skips that signal without sending or marking it, so the next run
+    retries it, and finishes the run for everything else with `status=partial`.
+    Anything else a scorer raises, such as every model in the chain being down,
+    still aborts the run, because it would fail every signal the same way.
+    """
+
+
 class Scorer(Protocol):
-    """Scores a Signal. Regex/keyword for v1; LLM-based waterfall is a
-    tracked future replacement (see issue: LLM-based scorer)."""
+    """Scores a Signal. Raises `ScoreError` for a failure specific to that
+    signal; any other exception aborts the run."""
 
     def score(self, signal: Signal) -> ScoredSignal:
         ...

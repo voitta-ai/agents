@@ -32,7 +32,7 @@ Register with `register_action(type_name)`; the CLI builds steps with
 
 A plugin is a **factory** registered under a `type` name. The factory receives
 **that component's entire config block** — the mapping under `source:` /
-`scorer:` / `destination:` in the agent's `config.yaml`, including its own
+`scorer:` / `destination:` in the agent workspace's `config.json`, including its own
 `type` key — and returns an instance implementing the role's Protocol.
 
 ```python
@@ -142,7 +142,9 @@ plugins that do not need them are unaffected.
   SeenStore trims. Advance that window in `commit()`, never in `fetch()`: a run
   that fetched and then failed to deliver never reaches `commit()`, so the next
   run re-fetches the same window and SeenStore drops what did get through.
-  At-least-once, never a silent skip.
+  At-least-once, never a silent skip. It is not called on a `partial` run
+  either: an unscored signal is left unmarked so the next run retries it, and
+  that only works if the next run's window still contains it.
 
 ## The run loop (already implemented, `framework/runner.py`)
 
@@ -150,25 +152,52 @@ plugins that do not need them are unaffected.
 signals = source.fetch()
 for s in signals:
     if seen.has(s.id): continue
-    destination.send(scorer.score(s))
+    try:
+        scored = scorer.score(s)
+    except ScoreError:
+        unscored += 1          # not sent, not marked: retried next run
+        continue
+    destination.send(scored)
     pending.append(s.id)
-destination.flush()      # if defined
+destination.flush()            # only if the destination defines it
 for id in pending: seen.mark(id)
 seen.save()
-source.commit()          # if defined
-return 0
+if not unscored:
+    source.commit()            # only if the source defines it; never on partial
+return 1 if unscored else 0
 ```
 
 Single pass, exits. Safe to double-run: `SeenStore` dedupes by `Signal.id`.
+Every run prints one summary line,
+`agent=<name> status=<ok|partial|uncommitted|failed> fetched=N new=N sent=N unscored=N seen=N`.
+
+### Scorer errors: one signal, or the whole run
+
+A scorer that cannot score *this* signal, while others may still score fine,
+raises `framework.interfaces.ScoreError` (or a subclass, such as the LLM
+scorer's `LLMScoreError` for a reply it could not read even after a retry). The
+runner skips that signal: it is not sent and not marked seen, so the next run
+retries it, and one stderr line names its id and the error. The rest of the run
+is delivered and deduped normally, then the run reports `status=partial` and
+exits 1.
+
+Any other exception from `score()` aborts the run with `status=failed` and
+nothing marked seen. Raise something other than `ScoreError` when the failure
+would hit every signal alike: a missing credential, or every model in the chain
+being down (`framework.llm.LLMError`, deliberately not a `ScoreError`).
 Cadence is declarative (`schedule:` in config) and wired into cron/launchd
 externally — the framework runs no daemon.
 
 ## Invocation
 
 ```
-agent run --config agents/<name>/config.yaml
+agent run --workspace <workspaces-root>/<name>
 # or, without installing the console script:
-python -m framework run --config agents/<name>/config.yaml
+python -m framework run --workspace <workspaces-root>/<name>
 ```
+
+The workspace holds `config.json`; dedupe state defaults to
+`<workspace>/state/seen.json` (`--state` overrides). `--config` is gone and
+exits 2 naming `--workspace`.
 
 Unknown `type:` fails fast with exit code 2 and lists what is registered.

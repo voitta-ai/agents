@@ -1,0 +1,39 @@
+{
+  "_comment": "Copy into a workspace directory as config.json (outside any git checkout) and fill in real values. Secrets never live here: credentials are named by env var, not stored. One agent per community workspace: give each its own workspace directory and 'agent' name so their dedupe state does not collide.",
+  "agent": "slack-workspace-example",
+  "schedule": "0 */6 * * *",
+  "source": {
+    "type": "slack-workspace",
+    "_comment": "Only the 'agentmail' transport is implemented (issue #19); 'session' (xoxc token) has a working client elsewhere but using it against a community workspace is an authorization decision not yet made, so selecting it raises. 'workspace' is a label for the Signal's source/meta fields, not a credential. Setup: turn on the workspace's own notification/digest emails and forward them to the AgentMail inbox; 'inbox' falls back to AGENTMAIL_EMAIL when omitted. 'from_contains' scopes a shared inbox to this workspace's notification sender so unrelated mail is never scored. 'channels' is a coarse substring match against subject+body (AgentMail has no structured channel field); omit for everything the digests cover. 'limit' bounds recent inbox messages per run; it is not a time window.",
+    "transport": "agentmail",
+    "workspace": "<workspace-label>",
+    "inbox": "<agent-inbox>@<agentmail-domain>",
+    "api_key_env": "AGENTMAIL_API_KEY",
+    "from_contains": [
+      "<notification-sender-domain>"
+    ],
+    "channels": [
+      "#<channel-name>"
+    ],
+    "limit": 50
+  },
+  "scorer": {
+    "type": "regex",
+    "ignore_case": true,
+    "match": "presence",
+    "floor": 0,
+    "rules": [
+      {"pattern": "<keyword-worth-flagging>", "points": 10}
+    ]
+  },
+  "destination": {
+    "type": "slack",
+    "routes": [
+      {
+        "min_score": 10,
+        "webhook_env": "SLACK_WORKSPACE_DIGEST_WEBHOOK",
+        "channel": "#<internal-digest-channel>"
+      }
+    ]
+  }
+}
