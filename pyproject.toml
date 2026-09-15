@@ -9,6 +9,7 @@ dependencies = [
     "icalendar>=6.0",
     "python-dateutil>=2.9",
     "tzdata>=2024.1",
+    "markdown-it-py>=3.0",
 ]
 
 [project.optional-dependencies]
