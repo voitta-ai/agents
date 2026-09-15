@@ -97,12 +97,12 @@ def _cmd_approvals(args: argparse.Namespace) -> int:
 
 
 def _cmd_install_schedule(args: argparse.Namespace) -> int:
-    retval = install_schedule(args.workspace, args.label, args.venv, args.dry_run)
+    retval = install_schedule(args.workspace, args.label, args.venv, args.force, args.dry_run)
     return retval
 
 
 def _cmd_uninstall_schedule(args: argparse.Namespace) -> int:
-    retval = uninstall_schedule(args.workspace, args.label)
+    retval = uninstall_schedule(args.workspace, args.label, args.force)
     return retval
 
 
@@ -155,6 +155,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Venv whose bin/agent the job runs (default: the venv running this command).",
     )
     install_parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Replace a job at the label that this workspace's install-schedule did not write.",
+    )
+    install_parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Print the plist(s) and do nothing else.",
@@ -174,6 +179,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--label",
         default=None,
         help="launchd label the install used (default: com.agents.<agent>).",
+    )
+    uninstall_parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Remove a job at the label that this workspace's install-schedule did not write.",
     )
     uninstall_parser.set_defaults(func=_cmd_uninstall_schedule)
     return parser
