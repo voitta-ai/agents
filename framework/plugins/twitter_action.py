@@ -3,13 +3,14 @@
 One step of an approval-gated sequence: after a post has been published, announce
 it with a tweet. Configured as a `steps` entry of an action:
 
-    steps:
-      - type: twitter-post
-        text: "{blurb_twitter} {url}"
+    {"type": "twitter-post", "text": "{blurb_twitter} {url}"}
 
-`text` is a template rendered with `str.format_map` over the step's payload, so
-values produced by earlier steps (`{url}` from the publishing step, say) and the
-proposal's own fields are available by name. A template that names a key the
+`text` is rendered with `framework.templating.render_template` against the
+step's payload, so values produced by earlier steps (`{url}` from the publishing
+step, say) and the proposal's own fields are available by name. Only plain
+names are accepted: a field that reaches into a value (`{url.__class__}`,
+`{result[0]}`) is refused before anything is sent, so a template cannot pull an
+object's internals into a public tweet. A template that names a key the
 payload does not carry is an error naming that key, not an empty substitution:
 a tweet announcing "None" is worse than no tweet.
 
@@ -56,6 +57,7 @@ from requests_oauthlib import OAuth1
 
 from framework.interfaces import Action
 from framework.registry import register_action
+from framework.templating import render_template
 
 TWEETS_URL = "https://api.x.com/2/tweets"
 TWEET_MAX_CHARS = 280
@@ -66,25 +68,6 @@ _DEFAULT_ENV = {
     "access_token_env": "TWITTER_ACCESS_TOKEN",
     "access_secret_env": "TWITTER_ACCESS_SECRET",
 }
-
-
-class _Payload(dict):
-    """Payload view for `str.format_map` that names a missing key.
-
-    `dict.__missing__` is what `format_map` reaches on a lookup miss, so raising
-    here is what turns `{typo}` into a message that says `typo`, rather than a
-    bare `KeyError: 'typo'` whose repr quoting garbles the CLI line.
-    """
-
-    def __missing__(self, key: str):
-        raise ValueError(
-            f"twitter-post: text template references {key!r}, which is not in the payload"
-        )
-
-
-def _render(template: str, payload: dict[str, Any]) -> str:
-    retval = template.format_map(_Payload(payload))
-    return retval
 
 
 def _require_env(name: str) -> str:
@@ -128,7 +111,7 @@ class TwitterPostAction:
         return retval
 
     def execute(self, payload: dict[str, Any], context: dict[str, Any]) -> dict[str, Any]:
-        text = _render(self._text, payload)
+        text = render_template(self._text, payload)
         if len(text) > TWEET_MAX_CHARS:
             raise ValueError(
                 f"twitter-post: rendered text is {len(text)} characters, "
