@@ -147,15 +147,19 @@ payload merged with each step's returned dict. Shipped:
 
 - `command` (`framework/plugins/command_action.py`) — runs an existing tool:
   `{"type": "command", "argv": ["/abs/path/tool", "--text", "{blurb} {url}"],
-  "result_format": "json"}`. Each `argv` element is templated; no shell, so
-  quotes and `$(...)` in post text reach the tool as one literal argument.
-  Optional `cwd`, `timeout` (default 120). At most one of `result_pattern`
-  (regex with named groups, searched in stdout; groups become results) or
-  `result_format: "json"` (last non-empty stdout line is a JSON object; keys
-  become results); neither means no results. A nonzero exit fails the step
+  "result_format": "json"}`. `argv[0]` must be a literal path (a `{` or `}`
+  in it is a config error: the program never comes from proposal data); every
+  later element is templated. No shell, so quotes and `$(...)` in post text
+  reach the tool as one literal argument. Optional `cwd`, `timeout` (default
+  120). At most one of `result_pattern` (regex with named groups, searched in
+  stdout; groups become results) or `result_format: "json"` (last non-empty
+  stdout line is a JSON object; keys become results); neither means no results. A nonzero exit fails the step
   with the exit code and the last 20 stderr lines, which the outcome message
   posts to the channel; exit 0 with stdout that does not parse as configured
-  fails too. Messages name only `argv[0]`. See issue #48.
+  fails too. Output goes to temporary files, not memory: at most the last
+  64 KiB of stderr and the first 1 MiB of stdout are read, and more stdout
+  than that with a result mode set fails as too large. Messages name only
+  `argv[0]`. See issue #48.
 - `slack-post` (`webhook_env`, `text`).
 - `twitter-post` (`framework/plugins/twitter_action.py`) — tweets `text` (a
   template) through the X API v2 with OAuth 1.0a user context; credentials
