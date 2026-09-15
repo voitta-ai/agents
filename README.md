@@ -66,11 +66,97 @@ the framework and by every plugin, and is where decisions worth keeping go.
 - `agents/slack-workspace/` — digests community Slack workspaces we
   participate in but don't administer, via their own notification emails
   forwarded to AgentMail. See issue #19.
+- `agents/slack-workspace/` with `transport: session` — reads named channels
+  of such a workspace as the logged-in browser user (`d` cookie decrypted
+  from the local browser store, `xoxc` token scraped per run, nothing stored).
+  Read-only by construction: the client refuses every Slack method outside a
+  fixed allowlist before any HTTP. Needs `pip install '.[slack-session]'`
+  (pycookiecheat). See issue #45.
 - `agents/release-notes/` — one signal per GitHub release across an org since
   the last run, for the weekly release-notes digest. Uses the `github-releases`
   source (issue #46), which keeps its own window in
   `<workspace>/state/github-releases.json` and advances it only after a run has
   delivered (`Source.commit()`, see `docs/PLUGIN-CONTRACT.md`).
+
+## Approval-gated actions
+
+Some agents end in something that should not happen without a human saying so:
+publishing a post, sending an application. For those the destination is
+`approval`, which wraps the destination that writes the content and records a
+**proposal** instead of posting it (issue #21):
+
+```json
+"destination": {
+  "type": "approval",
+  "webhook_env": "SOME_WEBHOOK",
+  "wrap": {"type": "digest", "webhook_env": "SOME_WEBHOOK", "prompt": "..."},
+  "actions": ["publish-post"]
+},
+"approvals": {
+  "channel_id": "C0123456789",
+  "bot_token_env": "SOME_BOT_TOKEN",
+  "trusted_user_ids": ["U0123456789"],
+  "hours": 24
+},
+"actions": {
+  "publish-post": {
+    "steps": [
+      {"type": "slack-post", "webhook_env": "SOME_WEBHOOK", "text": "Published: {url}"}
+    ]
+  }
+}
+```
+
+The run posts the rendered content plus `Proposal p7-k3f: publish-post. Reply
+"do p7-k3f" or "skip p7-k3f".` and writes the proposal to
+`<workspace>/state/proposals.json`. The proposal is the delivery, so dedupe
+state is marked as usual. Ids are a per-workspace counter plus a random suffix,
+so a reply cannot be typed before the proposal exists; the whole id is required.
+
+```
+agent approvals --workspace <workspaces-root>/<agent-name>
+```
+
+is the second scheduled entrypoint (every few minutes). It reads the channel's
+last `hours` of history with the bot token, and for each pending proposal a
+user in `trusted_user_ids` has answered with exactly `do <id>` or `skip <id>`
+**as a top-level channel message posted after the proposal was recorded**,
+claims it (`pending` -> `running`, atomically, so two overlapping passes cannot
+both execute it), runs the named action's `steps` in order or marks it
+skipped, posts one outcome message, and prints `agent=<name> status=ok
+approvals=N executed=N skipped=N failed=N stuck=N`. A failing step stops the
+sequence, leaves the proposal `failed` naming the step, and nothing is retried.
+Anything that is not exactly `do`/`skip` from a trusted user is ignored, and so
+is a reply older than the proposal it names. Replies typed *in a thread* are
+not seen (`conversations.history` returns top-level messages only); reply in
+the channel. The bot token needs `channels:history` (or `groups:history` for a
+private channel) and `chat:write`.
+
+A proposal left `running` by a pass that is no longer alive (or claimed more
+than `hours` ago) means that pass died mid-steps. It is never re-run on its
+own: every pass reports it on stderr and as `stuck=N`, and the channel is told
+once which steps the store recorded as done. Re-running it is a manual edit of
+`state/proposals.json`: set its `status` back to `"pending"`, and the next pass
+runs all of its steps again, including any that already happened, if the
+original `do` is still inside the `hours` window (otherwise reply `do` again).
+To close it instead, set `"failed"`.
+
+Steps are **action** plugins, the fourth kind (`docs/PLUGIN-CONTRACT.md`).
+Later steps see earlier results by `{name}` templating over the proposal's
+payload merged with each step's returned dict. Shipped:
+
+- `slack-post` (`webhook_env`, `text`).
+- `wordpress-publish` (`framework/plugins/wordpress_action.py`) — turns
+  `payload["title"]` + `payload["body_md"]` (Markdown) into a WordPress.com post
+  and returns `{"url", "post_id"}` for later steps. Config:
+  `{"type": "wordpress-publish", "site": "<site>.wordpress.com", "mode": "draft",
+  "token_env": "WORDPRESS_ACCESS_TOKEN", "categories": [], "tags": []}`.
+  `mode` is `draft` (safety valve; `url` is the preview) or `publish` (`url` is
+  the public permalink). The token comes from `token_env`, else the macOS
+  Keychain item `wpcom_token` the `wordpress-com-publish` skill writes; missing
+  or rejected tokens fail loud naming that skill as the fix. See issue #47.
+
+`twitter-post` and `linkedin-post` are their own issues.
 
 ## Operating notes
 

@@ -37,8 +37,9 @@ class Source(Protocol):
     `partial` one, whose unscored signals must stay inside the next window). It
     is for a source that tracks its own fetch window (the github-releases
     source's `last_run`): the window advances in `commit()`, never in `fetch()`,
-    so a run that fails to deliver does not move it. Like `Destination.flush()` it is discovered with getattr and is
-    deliberately not part of this Protocol (issue #46).
+    so a run that fails to deliver does not move it. Like `Destination.flush()`
+    it is discovered with getattr and is deliberately not part of this Protocol
+    (issue #46).
     """
 
     def fetch(self) -> list[Signal]:

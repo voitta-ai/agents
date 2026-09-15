@@ -9,3 +9,7 @@ __pycache__/
 agents/*/config.json
 agents/*/config.yaml
 agents/*/.seen-*.json
+
+# proposals store written by the approval destination (issue #21) when the
+# config dir doubles as the workspace; workspaces proper live outside the checkout
+agents/*/state/
