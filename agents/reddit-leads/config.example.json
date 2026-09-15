@@ -1,5 +1,5 @@
 {
-  "_comment": "Copy into a workspace directory as config.json (outside any git checkout) and fill in real values. Secrets never live here: each route names an env var holding its webhook URL. 'schedule' is declarative only; launchd/cron owns the clock.",
+  "_comment": "Copy into a workspace directory as config.json (outside any git checkout) and fill in real values. Secrets never live here: each route names an env var holding its webhook URL. 'schedule' is what `agent install-schedule` turns into the launchd job: a five-field cron string fires on the clock (00:00, 04:00, ...), 'every 4h' fires every four hours from when the job loaded.",
   "agent": "reddit-leads",
   "schedule": "0 */4 * * *",
   "source": {

@@ -18,10 +18,9 @@ as short-lived, cron/launchd-invoked processes (not daemons).
 
 ## What this framework does *not* own
 
-No scheduler daemon. Each agent is invoked run-and-exit (cron/launchd owns the
-clock); the agent declares its intended cadence in its own config as
-documentation, nothing enforces it yet (see tracked future issue for an
-`agent install-schedule` helper).
+No scheduler daemon. Each agent is invoked run-and-exit (launchd owns the
+clock); the agent declares its cadence as `schedule` in its config, and
+`agent install-schedule` turns that into the launchd job (see Scheduling).
 
 No built-in interactivity/HITL loop. [Shmobster](https://github.com/voitta-ai/shmobster)
 is the preferred/default pattern for human-in-the-loop Slack interactivity
@@ -47,7 +46,7 @@ is then not a deploy, and nothing an agent writes lands in the working tree.
   <agent-name>/
     config.json                  the agent's declaration; the only file a human edits
     state/seen.json              SeenStore dedupe state (default; --state overrides)
-    logs/                        stdout/stderr when scheduled
+    logs/                        run.log / run.error.log (and approvals.*) when scheduled
 ```
 
 ```
@@ -58,6 +57,41 @@ agent run --workspace <workspaces-root>/<agent-name>
 helpers that take an agent *name*. Config is JSON: copy an example in as
 `config.json` and fill in real values. A `"_comment"` key anywhere is ignored by
 the framework and by every plugin, and is where decisions worth keeping go.
+
+## Scheduling
+
+```
+agent install-schedule --workspace <dir> [--label <label>] [--venv <path>] [--dry-run]
+agent uninstall-schedule --workspace <dir> [--label <label>]
+```
+
+`install-schedule` (macOS) writes `~/Library/LaunchAgents/<label>.plist` from
+the workspace's `config.json` and loads it with `launchctl bootstrap`, booting
+out the loaded job first, so re-running it is how a changed schedule is
+deployed. The label defaults to `com.agents.<agent>`; pass `--label` to keep an
+existing deployment's name, and pass the same `--label` to uninstall. The job
+runs `/bin/bash -lc "exec <venv>/bin/agent run --workspace <dir>"` (the login
+profile supplies credentials), from the workspace, logging to `<dir>/logs/`.
+`--venv` defaults to the venv of the `agent` you ran. `--dry-run` prints the
+plist(s) and does nothing else.
+
+- `schedule` (required): `"every 30m"` / `"every 4h"` becomes `StartInterval`,
+  counted from when the job loaded. A five-field cron string becomes
+  `StartCalendarInterval`, aligned to the clock: `"0 */4 * * *"` fires at
+  00:00, 04:00, ... 20:00, `"0 14 * * 3"` Wednesdays at 14:00, `"0 17 * * 0"`
+  (or `7`) Sundays at 17:00. Fields take numbers, `A-B` ranges and comma lists;
+  minute and hour also take `*/N`. Names, `@daily`, stepped ranges, `*/N` in
+  the date fields, and restricting both day-of-month and day-of-week are
+  rejected. A bad schedule fails before anything is written.
+- `approvals.schedule` (default `"every 5m"`): when the config has an
+  `approvals` block, a second job `<label>.approvals` runs `agent approvals`
+  on this schedule, logging to `logs/approvals.log`. Removing the block and
+  re-installing removes that job; uninstall removes both.
+
+Re-installing boots out a job that is mid-pass, which terminates it. For
+`agent run` that costs nothing (undelivered signals are not marked seen), but
+an `agent approvals` pass killed mid-steps leaves its proposal stuck (see
+Approval-gated actions), so avoid re-installing while one is executing.
 
 ## Agents
 
@@ -88,6 +122,7 @@ publishing a post, sending an application. For those the destination is
   "actions": ["publish-post"]
 },
 "approvals": {
+  "schedule": "every 5m",
   "channel_id": "C0123456789",
   "bot_token_env": "SOME_BOT_TOKEN",
   "trusted_user_ids": ["U0123456789"],
@@ -112,7 +147,8 @@ so a reply cannot be typed before the proposal exists; the whole id is required.
 agent approvals --workspace <workspaces-root>/<agent-name>
 ```
 
-is the second scheduled entrypoint (every few minutes). It reads the channel's
+is the second scheduled entrypoint (`approvals.schedule`, every 5 minutes by
+default, installed as its own job by `install-schedule`). It reads the channel's
 last `hours` of history with the bot token, and for each pending proposal a
 user in `trusted_user_ids` has answered with exactly `do <id>` or `skip <id>`
 **as a top-level channel message posted after the proposal was recorded**,
@@ -172,7 +208,8 @@ the scheduler is stopped:
    holds (both are flat JSON arrays of ids) and write the result to
    `state/seen.json`. If the workspace was hand-run before the cutover, the two
    files have diverged and neither alone is complete.
-4. Re-point the scheduled job at `agent run --workspace <workspace>` and load it.
+4. Re-point the scheduled job at `agent run --workspace <workspace>` and load it
+   (`agent install-schedule --workspace <workspace> --label <existing-label>`).
 5. Hand-run once and check the summary line: `new=` should be small (what
    arrived during the move), not the size of the feed.
 
