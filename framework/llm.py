@@ -52,8 +52,9 @@ that prompted shmobster's version. So a failure whose status is 400/402/403 and
 whose message names a spend problem (`_BUDGET_MARKERS`) parks that vendor: its
 expiry goes into `<workspace>/state/llm-parked.json`, and the Router is rebuilt
 without it until then. The expiry is the vendor's own "regain access on
-YYYY-MM-DD" when it states one and the date is in the future, else
-`budget_park_sec` from now. The file is pruned on read, which is what brings a
+YYYY-MM-DD" when it states one and the date is in the future (clamped to 31
+days, with the park line saying so), else `budget_park_sec` from now. The file
+is pruned on read, which is what brings a
 vendor back: no timer, the first call after the window simply stops seeing it.
 A fully parked chain is tried in full anyway, since refusing to answer is worse
 than one wasted call.
@@ -67,6 +68,10 @@ about a fallback says when it does not. Deployments carry a per-client id, so a
 failure is attributed to exactly the vendor row that raised it, even with two
 clients (scorer and digest) alive in one process.
 
+litellm is imported lazily, by the first `build_client`, not by importing this
+module: every agent imports this module through the plugin table, and only the
+ones with an LLM plugin should pay for litellm (see `_load_litellm`).
+
 Logging. LiteLLM's own loggers are capped at WARNING and verbose mode is off
 before any Router exists, because at DEBUG they print raw request params,
 api_key included. This module prints its own events to stderr, as the rest of
@@ -76,7 +81,8 @@ configured key value redacted, since `LLMError` can end up in a Slack channel.
 
 `LLMClient.complete(system, user) -> str` and `model_used` keep their contract.
 `LLMError` still means no rung produced an answer, now with per-vendor reasons;
-an empty completion counts as that rung failing, as it did before.
+an empty completion counts as that rung failing and the call moves on to the
+next live rung, as it did before (see `LLMClient.complete`).
 """
 from __future__ import annotations
 
@@ -91,26 +97,11 @@ import uuid
 import weakref
 from dataclasses import dataclass, field
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
-import litellm
-
-# Before anything else touches litellm: never let it log raw request params,
-# which carry api_key. Verbose mode off AND all three loggers capped, because
-# litellm's debug switch flips every one of them to DEBUG and it is
-# "LiteLLM Router", not "LiteLLM", that services the Router used here.
-litellm.set_verbose = False
-litellm.suppress_debug_info = True
-for _logger_name in ("LiteLLM", "LiteLLM Router", "LiteLLM Proxy"):
-    logging.getLogger(_logger_name).setLevel(logging.WARNING)
-
-import openai  # noqa: E402  (litellm's own dependency; the base of its exceptions)
-from litellm import Router  # noqa: E402
-from litellm.integrations.custom_logger import CustomLogger  # noqa: E402
-from litellm.types.router import RouterRateLimitError  # noqa: E402
-
-from framework import codex_llm  # noqa: E402
-from framework.config import CONFIG_FILENAME, STATE_DIRNAME, ConfigError  # noqa: E402
+from framework.config import CONFIG_FILENAME, STATE_DIRNAME, ConfigError
+from framework.registry import PluginImportError
 
 SHARED_DIRNAME = "_shared"
 SHARED_FILENAME = "llm.json"
@@ -118,7 +109,17 @@ PARKED_FILENAME = "llm-parked.json"
 
 _DEFAULT_BUDGET_PARK_SEC = 3600
 _DEFAULT_TIMEOUT = 120
-_CODEX_MODEL_PREFIX = f"{codex_llm.PROVIDER}/{codex_llm.MODEL_PREFIX}"
+
+# A vendor-stated regain date further out than this is clamped to it. The date
+# comes from an error body, and a far-future one (a proxy's, or a typo'd year)
+# would otherwise take the rung out until someone hand-edits the state file.
+_MAX_PARK_SEC = 31 * 24 * 3600
+
+# The same strings as `codex_llm.PROVIDER` / `codex_llm.MODEL_PREFIX`, spelled
+# out here because importing codex_llm imports litellm, which this module only
+# does when a client is built (see `_load_litellm`).
+_CODEX_PROVIDER_PREFIX = "codex/"
+_CODEX_MODEL_PREFIX = "codex/chatgpt/"
 
 # Budget exhaustion, by status plus message shape. Status alone is too broad --
 # a 400 is also a malformed request, and parking a vendor for an hour over a bad
@@ -191,6 +192,7 @@ def _park_until(message: str, window: int) -> tuple[float, str]:
     """When the vendor says it will be back, honour that; otherwise use the
     configured window. A date we cannot parse falls back to the window rather
     than being trusted -- a mis-parse could park a vendor for a year."""
+    now = time.time()
     match = _REGAIN_DATE.search(message or "")
     if match:
         try:
@@ -198,27 +200,100 @@ def _park_until(message: str, window: int) -> tuple[float, str]:
                 int(match.group(1)), int(match.group(2)), int(match.group(3)),
                 tzinfo=datetime.timezone.utc,
             ).timestamp()
-            if when > time.time():
-                retval = (when, f"until {match.group(0).split('on ')[1]}")
+            date = match.group(0).split("on ")[1]
+            if when > now + _MAX_PARK_SEC:
+                retval = (
+                    now + _MAX_PARK_SEC,
+                    f"for {_MAX_PARK_SEC // 86400} days (the vendor said until {date}, "
+                    f"past the {_MAX_PARK_SEC // 86400}-day cap)",
+                )
+                return retval
+            if when > now:
+                retval = (when, f"until {date}")
                 return retval
         except ValueError:
             _say("unparseable regain date; using the default park window")
-    retval = (time.time() + window, f"for {window}s")
+    retval = (now + window, f"for {window}s")
     return retval
 
 
-class _ChainWatch(CustomLogger):
-    """LiteLLM's per-deployment failure callback.
+# litellm and everything built on it, once `_load_litellm` has run.
+_LITELLM: SimpleNamespace | None = None
 
-    The only hook that sees a failure a fallback went on to cover, which is the
-    parking case: the call still gets answered, so nothing raises, yet the
-    exhausted vendor must not be dialled again."""
 
-    def log_failure_event(self, kwargs, response_obj, start_time, end_time):
-        _on_failure(kwargs)
+def _load_litellm(what: str) -> SimpleNamespace:
+    """Import litellm on first use, never at module import.
 
-    async def async_log_failure_event(self, kwargs, response_obj, start_time, end_time):
-        _on_failure(kwargs)
+    Every agent imports this module (the plugin table imports the llm scorer and
+    the digest destination unconditionally), and `import litellm` costs over a
+    second and a half. Deferring it to the first `build_client` means an agent
+    that uses neither plugin never pays it, and a venv without litellm fails
+    only the agents that need it, at build time, naming the package.
+
+    Three things happen here, in this order, before any Router can exist:
+      - `LITELLM_LOCAL_MODEL_COST_MAP` defaults to True, because otherwise
+        `import litellm` fetches its model price map from GitHub, retrying for
+        seconds when the network is down. The bundled copy is enough: nothing
+        here reads prices.
+      - Verbose mode off and all three LiteLLM loggers capped at WARNING, so
+        raw request params, api_key included, are never logged. Capped after
+        the import, because litellm sets the levels itself when it loads
+        (from `LITELLM_LOG`), and all three because its debug switch flips every
+        one and it is "LiteLLM Router" that services the Router used here.
+      - The failure callback and the `codex/` provider are registered, once;
+        both lists are litellm globals.
+    """
+    global _LITELLM
+    if _LITELLM is not None:
+        return _LITELLM
+
+    os.environ.setdefault("LITELLM_LOCAL_MODEL_COST_MAP", "True")
+    try:
+        import litellm
+    except ImportError as exc:
+        raise PluginImportError(
+            f"{what} needs the 'litellm' package, which failed to import: "
+            f"{type(exc).__name__}: {exc}"
+        ) from exc
+    litellm.set_verbose = False
+    litellm.suppress_debug_info = True
+    for logger_name in ("LiteLLM", "LiteLLM Router", "LiteLLM Proxy"):
+        logging.getLogger(logger_name).setLevel(logging.WARNING)
+
+    import openai  # litellm's own dependency; the base of its exceptions
+    from litellm import Router
+    from litellm.integrations.custom_logger import CustomLogger
+    from litellm.types.router import RouterRateLimitError
+
+    from framework import codex_llm
+
+    class _ChainWatch(CustomLogger):
+        """LiteLLM's per-deployment failure callback.
+
+        The only hook that sees a failure a fallback went on to cover, which is
+        the parking case: the call still gets answered, so nothing raises, yet
+        the exhausted vendor must not be dialled again."""
+
+        def log_failure_event(self, kwargs, response_obj, start_time, end_time):
+            _on_failure(kwargs)
+
+        async def async_log_failure_event(self, kwargs, response_obj, start_time, end_time):
+            _on_failure(kwargs)
+
+    litellm.callbacks = list(litellm.callbacks) + [_ChainWatch()]
+    # Before the Router is built: litellm resolves every deployment's provider
+    # at construction, and must know `codex/` by then.
+    codex_llm.register()
+
+    _LITELLM = SimpleNamespace(
+        Router=Router,
+        # What a dead chain raises: the primary's litellm exception (all are
+        # openai.OpenAIError subclasses) or, when every rung is still cooling
+        # from an earlier failure, RouterRateLimitError (a ValueError).
+        chain_errors=(openai.OpenAIError, RouterRateLimitError),
+    )
+    retval = _LITELLM
+    return retval
 
 
 def _on_failure(kwargs: dict) -> None:
@@ -232,16 +307,6 @@ def _on_failure(kwargs: dict) -> None:
     if client is None:
         return
     client._record_failure(name, exc)
-
-
-_WATCH = _ChainWatch()
-
-
-def _watch() -> None:
-    """Register the failure callback once. `litellm.callbacks` is global, and a
-    duplicate registration would record (and park) twice per failure."""
-    if not any(isinstance(cb, _ChainWatch) for cb in litellm.callbacks):
-        litellm.callbacks = list(litellm.callbacks) + [_WATCH]
 
 
 class LLMClient:
@@ -265,7 +330,7 @@ class LLMClient:
         # Which rung actually answered, for the caller to report.
         self.model_used: str | None = None
         self._token = uuid.uuid4().hex[:12]
-        self._router: Router | None = None
+        self._router: Any = None
         self._router_vendors: tuple[str, ...] | None = None
         # Vendor name -> reason, for the call in progress.
         self._failures: dict[str, str] = {}
@@ -393,17 +458,14 @@ class LLMClient:
         }
         return retval
 
-    def _build(self, live: list[_Vendor]) -> Router:
-        _watch()
-        # Registered before the Router is built: litellm resolves every
-        # deployment's provider at construction, and must know `codex/` by then.
-        codex_llm.register()
+    def _build(self, live: list[_Vendor]) -> Any:
+        lite = _load_litellm("the LLM client")
         model_list = [self._deployment("primary", live[0])]
         rest = live[1:]
         for i, vendor in enumerate(rest):
             model_list.append(self._deployment(f"fb{i}", vendor))
         fallbacks = [{"primary": [f"fb{i}" for i in range(len(rest))]}] if rest else []
-        retval = Router(
+        retval = lite.Router(
             model_list=model_list,
             fallbacks=fallbacks,
             num_retries=1,
@@ -415,7 +477,7 @@ class LLMClient:
         )
         return retval
 
-    def _ensure(self) -> tuple[Router, list[_Vendor]]:
+    def _ensure(self) -> tuple[Any, list[_Vendor]]:
         """Build the Router, or rebuild it when the set of usable vendors
         changed -- a park added one, or a park expired and gave one back."""
         live = self._live()
@@ -442,34 +504,55 @@ class LLMClient:
         No budget handling here on purpose: when a fallback covers a failure
         nothing is raised, so parking lives in the failure callback. An
         exception reaching this point means every rung failed (or, later in a
-        run, that every rung is still cooling from an earlier failure)."""
+        run, that every rung is still cooling from an earlier failure).
+
+        An empty answer is that rung failing, but to the Router a 200 is a
+        success, so it never falls through on one. That part of the walk is
+        done here: the call is repeated on a one-off Router over the live rows
+        after the one that answered empty, until a rung answers with text or
+        none is left. The one-off Router starts with no cooldowns, which only
+        matters on this rare path, and only for rungs that failed in an earlier
+        call of the same run."""
+        chain_errors = _load_litellm("the LLM client").chain_errors
         router, live = self._ensure()
         self._failures = {}
         messages = [
             {"role": "system", "content": system},
             {"role": "user", "content": user},
         ]
-        try:
-            resp = router.completion(
-                model="primary",
-                messages=messages,
-                max_tokens=self.max_tokens,
-                temperature=self.temperature,
-                # Rungs differ in which sampling params they accept (current
-                # Claude models refuse any temperature but 1, and litellm raises
-                # before sending). Dropping what a rung cannot take keeps it in
-                # the chain instead of failing it on every call.
-                drop_params=True,
-            )
-        except (openai.OpenAIError, RouterRateLimitError) as exc:
-            raise LLMError("all models failed — " + self._summary(live)) from exc
+        remaining = live
+        while True:
+            try:
+                resp = router.completion(
+                    model="primary",
+                    messages=messages,
+                    max_tokens=self.max_tokens,
+                    temperature=self.temperature,
+                    # Rungs differ in which sampling params they accept
+                    # (current Claude models refuse any temperature but 1, and
+                    # litellm raises before sending). Dropping what a rung
+                    # cannot take keeps it in the chain instead of failing it
+                    # on every call.
+                    drop_params=True,
+                )
+            except chain_errors as exc:
+                raise LLMError("all models failed — " + self._summary(live)) from exc
 
-        vendor = self._answered_by(resp)
-        label = f"{vendor.name} ({vendor.model})" if vendor else str(resp.model)
-        content = (resp.choices[0].message.content or "").strip()
-        if not content:
+            vendor = self._answered_by(resp)
+            label = f"{vendor.name} ({vendor.model})" if vendor else str(resp.model)
+            content = (resp.choices[0].message.content or "").strip()
+            if content:
+                break
             self._failures[vendor.name if vendor else label] = "empty completion"
-            raise LLMError("all models failed — " + self._summary(live))
+            # Without knowing which row answered, the rest of the chain has no
+            # starting point, so this ends the walk.
+            pos = next(
+                (i for i, v in enumerate(remaining) if vendor and v.name == vendor.name), None
+            )
+            remaining = remaining[pos + 1:] if pos is not None else []
+            if not remaining:
+                raise LLMError("all models failed — " + self._summary(live))
+            router = self._build(remaining)
 
         if self._failures:
             reasons = "; ".join(f"{name}: {reason}" for name, reason in self._failures.items())
@@ -497,7 +580,7 @@ def _parse_row(row: Any, where: str) -> _Vendor:
 
     key_env = row.get("api_key_env")
     api_key = None
-    if model.startswith(f"{codex_llm.PROVIDER}/"):
+    if model.startswith(_CODEX_PROVIDER_PREFIX):
         if not model.startswith(_CODEX_MODEL_PREFIX):
             # See codex_llm.MODEL_PREFIX: without the segment litellm routes
             # the bare model id to OpenAI and bills a platform key instead.
@@ -605,8 +688,13 @@ def build_client(
     default 120, overridden per row by `timeout_sec`), `max_tokens` and
     `temperature` (defaults supplied by the calling plugin).
 
+    This is where litellm is first imported (`_load_litellm`), so a venv
+    without it fails here, naming the package, and only for agents that use an
+    LLM plugin.
+
     `what` names the calling plugin in error messages.
     """
+    _load_litellm(what)
     if "model" in cfg:
         raise LLMConfigError(
             f"{what}: the 'model' block was replaced by 'llm' "

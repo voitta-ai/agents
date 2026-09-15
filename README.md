@@ -71,7 +71,8 @@ Copy `docs/llm.example.json` to start. Each row names the env var holding its
 key (`api_key_env`), never the key; a `codex/chatgpt/<model>` row runs on the
 ChatGPT subscription with no key, reading the codex CLI's `~/.codex/auth.json`
 (`codex login` when it expires). A vendor that answers with a budget-exhaustion
-error is parked for `budget_park_sec` (or until the date it names) in
+error is parked for `budget_park_sec` (or until the date it names, at most 31
+days out) in
 `<workspace>/state/llm-parked.json`; delete an entry to un-park it early.
 Fallbacks and parks print one `llm:` line each on stderr.
 
