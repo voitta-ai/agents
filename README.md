@@ -61,8 +61,8 @@ the framework and by every plugin, and is where decisions worth keeping go.
 ## Scheduling
 
 ```
-agent install-schedule --workspace <dir> [--label <label>] [--venv <path>] [--dry-run]
-agent uninstall-schedule --workspace <dir> [--label <label>]
+agent install-schedule --workspace <dir> [--label <label>] [--venv <path>] [--force] [--dry-run]
+agent uninstall-schedule --workspace <dir> [--label <label>] [--force]
 ```
 
 `install-schedule` (macOS) writes `~/Library/LaunchAgents/<label>.plist` from
@@ -74,6 +74,13 @@ runs `/bin/bash -lc "exec <venv>/bin/agent run --workspace <dir>"` (the login
 profile supplies credentials), from the workspace, logging to `<dir>/logs/`.
 `--venv` defaults to the venv of the `agent` you ran. `--dry-run` prints the
 plist(s) and does nothing else.
+
+Every generated plist is marked with `AgentsFrameworkManaged` and
+`AgentsFrameworkWorkspace` (the workspace path). Install and uninstall refuse
+to touch a label whose plist lacks the marker, belongs to another workspace, or
+is loaded from somewhere else, and print what it runs; `--force` takes it
+over. If bootstrapping an updated plist fails, the previous plist is put back
+and reloaded, and the error says whether that worked.
 
 - `schedule` (required): `"every 30m"` / `"every 4h"` becomes `StartInterval`,
   counted from when the job loaded. A five-field cron string becomes
@@ -209,7 +216,11 @@ the scheduler is stopped:
    `state/seen.json`. If the workspace was hand-run before the cutover, the two
    files have diverged and neither alone is complete.
 4. Re-point the scheduled job at `agent run --workspace <workspace>` and load it
-   (`agent install-schedule --workspace <workspace> --label <existing-label>`).
+   (`agent install-schedule --workspace <workspace> --label <existing-label> --force`).
+   `--force` is needed once: a hand-written plist has no install-schedule
+   marker, so without it the install refuses and prints what the job runs.
+   Check that output names the job you meant to replace before re-running with
+   `--force`.
 5. Hand-run once and check the summary line: `new=` should be small (what
    arrived during the move), not the size of the feed.
 
