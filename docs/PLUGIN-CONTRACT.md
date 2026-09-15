@@ -128,6 +128,24 @@ register_action(type_name: str)       # decorates  (cfg: dict) -> Action
 - **Fetch has no side effects beyond fetching.** Scoring is pure. Delivery is
   the only place external writes happen.
 
+## Optional hooks: `Destination.flush()` and `Source.commit()`
+
+Neither is part of its Protocol; the runner discovers both with `getattr`, so
+plugins that do not need them are unaffected.
+
+- `flush()` on a destination is called once after the last `send()` (issue
+  #26). Batching and digest destinations buffer in `send()` and deliver here.
+- `commit()` on a source is called once after `seen.save()` has succeeded
+  (issue #46). It is for a source whose fetch window is its own state — the
+  `github-releases` source keeps a `last_run` timestamp so that "what shipped
+  since we last looked" is an explicit question rather than an over-fetch that
+  SeenStore trims. Advance that window in `commit()`, never in `fetch()`: a run
+  that fetched and then failed to deliver never reaches `commit()`, so the next
+  run re-fetches the same window and SeenStore drops what did get through.
+  At-least-once, never a silent skip. It is not called on a `partial` run
+  either: an unscored signal is left unmarked so the next run retries it, and
+  that only works if the next run's window still contains it.
+
 ## The run loop (already implemented, `framework/runner.py`)
 
 ```
@@ -144,12 +162,14 @@ for s in signals:
 destination.flush()            # only if the destination defines it
 for id in pending: seen.mark(id)
 seen.save()
+if not unscored:
+    source.commit()            # only if the source defines it; never on partial
 return 1 if unscored else 0
 ```
 
 Single pass, exits. Safe to double-run: `SeenStore` dedupes by `Signal.id`.
 Every run prints one summary line,
-`agent=<name> status=<ok|partial|failed> fetched=N new=N sent=N unscored=N seen=N`.
+`agent=<name> status=<ok|partial|commit_failed|failed> fetched=N new=N sent=N unscored=N seen=N`.
 
 ### Scorer errors: one signal, or the whole run
 
