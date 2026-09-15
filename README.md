@@ -138,9 +138,20 @@ To close it instead, set `"failed"`.
 
 Steps are **action** plugins, the fourth kind (`docs/PLUGIN-CONTRACT.md`).
 Later steps see earlier results by `{name}` templating over the proposal's
-payload merged with each step's returned dict. Shipped: `slack-post`
-(`webhook_env`, `text`). `wordpress-publish`, `twitter-post`, `linkedin-post`
-are their own issues.
+payload merged with each step's returned dict. Shipped:
+
+- `slack-post` (`webhook_env`, `text`).
+- `wordpress-publish` (`framework/plugins/wordpress_action.py`) — turns
+  `payload["title"]` + `payload["body_md"]` (Markdown) into a WordPress.com post
+  and returns `{"url", "post_id"}` for later steps. Config:
+  `{"type": "wordpress-publish", "site": "<site>.wordpress.com", "mode": "draft",
+  "token_env": "WORDPRESS_ACCESS_TOKEN", "categories": [], "tags": []}`.
+  `mode` is `draft` (safety valve; `url` is the preview) or `publish` (`url` is
+  the public permalink). The token comes from `token_env`, else the macOS
+  Keychain item `wpcom_token` the `wordpress-com-publish` skill writes; missing
+  or rejected tokens fail loud naming that skill as the fix. See issue #47.
+
+`twitter-post` and `linkedin-post` are their own issues.
 
 ## Operating notes
 

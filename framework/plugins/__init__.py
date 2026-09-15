@@ -73,6 +73,7 @@ _PLUGIN_MODULES: dict[str, tuple[str, ...]] = {
     "slack_destination": ("slack",),
     "slack_post_action": ("slack-post",),
     "slack_workspace_source": ("slack-workspace",),
+    "wordpress_action": ("wordpress-publish",),
 }
 
 
