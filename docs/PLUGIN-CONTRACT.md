@@ -189,8 +189,8 @@ Any other exception from `score()` aborts the run with `status=failed` and
 nothing marked seen. Raise something other than `ScoreError` when the failure
 would hit every signal alike: a missing credential, or every model in the chain
 being down (`framework.llm.LLMError`, deliberately not a `ScoreError`).
-Cadence is declarative (`schedule:` in config) and wired into cron/launchd
-externally — the framework runs no daemon.
+Cadence is declared by `schedule` in config and turned into a launchd job by
+`agent install-schedule` (README, "Scheduling") — the framework runs no daemon.
 
 ## Invocation
 

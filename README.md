@@ -18,10 +18,9 @@ as short-lived, cron/launchd-invoked processes (not daemons).
 
 ## What this framework does *not* own
 
-No scheduler daemon. Each agent is invoked run-and-exit (cron/launchd owns the
-clock); the agent declares its intended cadence in its own config as
-documentation, nothing enforces it yet (see tracked future issue for an
-`agent install-schedule` helper).
+No scheduler daemon. Each agent is invoked run-and-exit (launchd owns the
+clock); the agent declares its cadence as `schedule` in its config, and
+`agent install-schedule` turns that into the launchd job (see Scheduling).
 
 No built-in interactivity/HITL loop. [Shmobster](https://github.com/voitta-ai/shmobster)
 is the preferred/default pattern for human-in-the-loop Slack interactivity
@@ -49,7 +48,7 @@ is then not a deploy, and nothing an agent writes lands in the working tree.
     config.json                  the agent's declaration; the only file a human edits
     state/seen.json              SeenStore dedupe state (default; --state overrides)
     state/llm-parked.json        vendors parked for budget exhaustion, with expiries
-    logs/                        stdout/stderr when scheduled
+    logs/                        run.log / run.error.log (and approvals.*) when scheduled
 ```
 
 ```
@@ -75,6 +74,48 @@ error is parked for `budget_park_sec` (or until the date it names, at most 31
 days out) in
 `<workspace>/state/llm-parked.json`; delete an entry to un-park it early.
 Fallbacks and parks print one `llm:` line each on stderr.
+
+## Scheduling
+
+```
+agent install-schedule --workspace <dir> [--label <label>] [--venv <path>] [--force] [--dry-run]
+agent uninstall-schedule --workspace <dir> [--label <label>] [--force]
+```
+
+`install-schedule` (macOS) writes `~/Library/LaunchAgents/<label>.plist` from
+the workspace's `config.json` and loads it with `launchctl bootstrap`, booting
+out the loaded job first, so re-running it is how a changed schedule is
+deployed. The label defaults to `com.agents.<agent>`; pass `--label` to keep an
+existing deployment's name, and pass the same `--label` to uninstall. The job
+runs `/bin/bash -lc "exec <venv>/bin/agent run --workspace <dir>"` (the login
+profile supplies credentials), from the workspace, logging to `<dir>/logs/`.
+`--venv` defaults to the venv of the `agent` you ran. `--dry-run` prints the
+plist(s) and does nothing else.
+
+Every generated plist is marked with `AgentsFrameworkManaged` and
+`AgentsFrameworkWorkspace` (the workspace path). Install and uninstall refuse
+to touch a label whose plist lacks the marker, belongs to another workspace, or
+is loaded from somewhere else, and print what it runs; `--force` takes it
+over. If bootstrapping an updated plist fails, the previous plist is put back
+and reloaded, and the error says whether that worked.
+
+- `schedule` (required): `"every 30m"` / `"every 4h"` becomes `StartInterval`,
+  counted from when the job loaded. A five-field cron string becomes
+  `StartCalendarInterval`, aligned to the clock: `"0 */4 * * *"` fires at
+  00:00, 04:00, ... 20:00, `"0 14 * * 3"` Wednesdays at 14:00, `"0 17 * * 0"`
+  (or `7`) Sundays at 17:00. Fields take numbers, `A-B` ranges and comma lists;
+  minute and hour also take `*/N`. Names, `@daily`, stepped ranges, `*/N` in
+  the date fields, and restricting both day-of-month and day-of-week are
+  rejected. A bad schedule fails before anything is written.
+- `approvals.schedule` (default `"every 5m"`): when the config has an
+  `approvals` block, a second job `<label>.approvals` runs `agent approvals`
+  on this schedule, logging to `logs/approvals.log`. Removing the block and
+  re-installing removes that job; uninstall removes both.
+
+Re-installing boots out a job that is mid-pass, which terminates it. For
+`agent run` that costs nothing (undelivered signals are not marked seen), but
+an `agent approvals` pass killed mid-steps leaves its proposal stuck (see
+Approval-gated actions), so avoid re-installing while one is executing.
 
 ## Agents
 
@@ -110,6 +151,7 @@ publishing a post, sending an application. For those the destination is
   "actions": ["publish-post"]
 },
 "approvals": {
+  "schedule": "every 5m",
   "channel_id": "C0123456789",
   "bot_token_env": "SOME_BOT_TOKEN",
   "trusted_user_ids": ["U0123456789"],
@@ -134,7 +176,8 @@ so a reply cannot be typed before the proposal exists; the whole id is required.
 agent approvals --workspace <workspaces-root>/<agent-name>
 ```
 
-is the second scheduled entrypoint (every few minutes). It reads the channel's
+is the second scheduled entrypoint (`approvals.schedule`, every 5 minutes by
+default, installed as its own job by `install-schedule`). It reads the channel's
 last `hours` of history with the bot token, and for each pending proposal a
 user in `trusted_user_ids` has answered with exactly `do <id>` or `skip <id>`
 **as a top-level channel message posted after the proposal was recorded**,
@@ -162,7 +205,32 @@ Steps are **action** plugins, the fourth kind (`docs/PLUGIN-CONTRACT.md`).
 Later steps see earlier results by `{name}` templating over the proposal's
 payload merged with each step's returned dict. Shipped:
 
+- `command` (`framework/plugins/command_action.py`) — runs an existing tool:
+  `{"type": "command", "argv": ["/abs/path/tool", "--text", "{blurb} {url}"],
+  "result_format": "json"}`. `argv[0]` must be a literal path (a `{` or `}`
+  in it is a config error: the program never comes from proposal data); every
+  later element is templated. No shell, so quotes and `$(...)` in post text
+  reach the tool as one literal argument. Optional `cwd`, `timeout` (default
+  120). At most one of `result_pattern` (regex with named groups, searched in
+  stdout; groups become results) or `result_format: "json"` (last non-empty
+  stdout line is a JSON object; keys become results); neither means no results. A nonzero exit fails the step
+  with the exit code and the last 20 stderr lines, which the outcome message
+  posts to the channel; exit 0 with stdout that does not parse as configured
+  fails too. Output goes to temporary files, not memory: at most the last
+  64 KiB of stderr and the first 1 MiB of stdout are read, and more stdout
+  than that with a result mode set fails as too large. Messages name only
+  `argv[0]`. See issue #48.
 - `slack-post` (`webhook_env`, `text`).
+- `twitter-post` (`framework/plugins/twitter_action.py`) — tweets `text` (a
+  template) through the X API v2 with OAuth 1.0a user context; credentials
+  from `TWITTER_API_KEY`, `TWITTER_API_SECRET`, `TWITTER_ACCESS_TOKEN`,
+  `TWITTER_ACCESS_SECRET` (names overridable via `api_key_env`,
+  `api_secret_env`, `access_token_env`, `access_secret_env`), read when the
+  step runs. Over 280 characters is an error before any request. Needs
+  `pip install '.[twitter]'`. Returns `tweet_url`. A 2xx never fails the step
+  (a body without the id returns `tweet_url: ""` and a stderr notice); a
+  failed step may still have posted, so check the account before re-running
+  by hand. See issue #48.
 - `wordpress-publish` (`framework/plugins/wordpress_action.py`) — turns
   `payload["title"]` + `payload["body_md"]` (Markdown) into a WordPress.com post
   and returns `{"url", "post_id"}` for later steps. Config:
@@ -172,8 +240,6 @@ payload merged with each step's returned dict. Shipped:
   the public permalink). The token comes from `token_env`, else the macOS
   Keychain item `wpcom_token` the `wordpress-com-publish` skill writes; missing
   or rejected tokens fail loud naming that skill as the fix. See issue #47.
-
-`twitter-post` and `linkedin-post` are their own issues.
 
 ## Operating notes
 
@@ -205,7 +271,12 @@ the scheduler is stopped:
    holds (both are flat JSON arrays of ids) and write the result to
    `state/seen.json`. If the workspace was hand-run before the cutover, the two
    files have diverged and neither alone is complete.
-4. Re-point the scheduled job at `agent run --workspace <workspace>` and load it.
+4. Re-point the scheduled job at `agent run --workspace <workspace>` and load it
+   (`agent install-schedule --workspace <workspace> --label <existing-label> --force`).
+   `--force` is needed once: a hand-written plist has no install-schedule
+   marker, so without it the install refuses and prints what the job runs.
+   Check that output names the job you meant to replace before re-running with
+   `--force`.
 5. Hand-run once and check the summary line: `new=` should be small (what
    arrived during the move), not the size of the feed.
 

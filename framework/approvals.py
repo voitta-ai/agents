@@ -12,6 +12,7 @@ nothing. Only after the steps does it move to `done` or `failed`.
 Config, in the workspace's `config.json`:
 
     "approvals": {
+      "schedule": "every 5m",
       "channel_id": "C0123456789",
       "bot_token_env": "SOME_BOT_TOKEN",
       "trusted_user_ids": ["U0123456789"],
@@ -28,7 +29,8 @@ Config, in the workspace's `config.json`:
 
 `channel_id` is the channel the proposals were posted to, read with the bot
 token in `bot_token_env` (scopes: `channels:history` or `groups:history` for
-a private channel, plus `chat:write` for the outcome message). `hours` bounds
+a private channel, plus `chat:write` for the outcome message). `schedule` is
+read only by `agent install-schedule` (framework/schedule.py). `hours` bounds
 how far back history is read (default 24). The webhook that posted the
 proposal cannot read replies; a bot token can, which is why both exist.
 
