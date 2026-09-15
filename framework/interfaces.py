@@ -30,7 +30,17 @@ class ScoredSignal:
 
 
 class Source(Protocol):
-    """Produces raw Signals for one run. No side effects beyond fetching."""
+    """Produces raw Signals for one run. No side effects beyond fetching.
+
+    A source may also define `commit()`, called once by the runner after
+    `seen.save()` has succeeded, and only on a `status=ok` run (never on a
+    `partial` one, whose unscored signals must stay inside the next window). It
+    is for a source that tracks its own fetch window (the github-releases
+    source's `last_run`): the window advances in `commit()`, never in `fetch()`,
+    so a run that fails to deliver does not move it. Like `Destination.flush()`
+    it is discovered with getattr and is deliberately not part of this Protocol
+    (issue #46).
+    """
 
     def fetch(self) -> list[Signal]:
         ...

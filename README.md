@@ -89,6 +89,11 @@ Fallbacks and parks print one `llm:` line each on stderr.
   Read-only by construction: the client refuses every Slack method outside a
   fixed allowlist before any HTTP. Needs `pip install '.[slack-session]'`
   (pycookiecheat). See issue #45.
+- `agents/release-notes/` — one signal per GitHub release across an org since
+  the last run, for the weekly release-notes digest. Uses the `github-releases`
+  source (issue #46), which keeps its own window in
+  `<workspace>/state/github-releases.json` and advances it only after a run has
+  delivered (`Source.commit()`, see `docs/PLUGIN-CONTRACT.md`).
 
 ## Approval-gated actions
 

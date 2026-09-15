@@ -9,6 +9,25 @@ sees the whole run. That is `Destination.flush()`, called once after the loop
 `flush()` is optional. A streaming destination does not define it and is
 unaffected.
 
+The mirror image on the source side is `Source.commit()`, called once after
+`seen.save()` succeeds (issue #46). It exists for a source whose fetch window is
+its own state — the github-releases source keeps `last_run` so "what shipped
+since we last looked" is an explicit question rather than an over-fetch that
+SeenStore trims. Such a source must not advance that window inside `fetch()`:
+a run that fetched, then failed to deliver, would have moved the window past
+releases nobody saw. `commit()` runs only after delivery and the dedupe marks
+are durable, so a failure anywhere earlier leaves the window where it was and
+the next run re-fetches it. Optional and discovered with getattr, exactly like
+`flush()`; existing sources are unaffected.
+
+`commit()` runs only on an `ok` run, never on a `partial` one. An unscored
+signal is deliberately left unmarked so the next run retries it, and for a
+windowed source that retry exists only if the next run's window still contains
+the signal. Advancing the window past it would turn "retried next run" into
+"never fetched again": the silent skip `commit()` exists to prevent. So a
+partial run leaves the window where it was, the next run re-fetches it, and
+SeenStore drops everything that did get through.
+
 Dedupe is marked only after delivery has actually happened, which for a batching
 destination means after `flush()`, not after `send()`. Marking earlier would
 lose signals silently: `send()` merely buffers, so a `flush()` that throws would
@@ -62,9 +81,12 @@ exception from `score()` still aborts the run with `status=failed`; a whole
 model chain being down would fail every signal alike, and there is nothing to
 salvage by carrying on.
 
-The three statuses, then: `ok` (exit 0), `partial` (exit 1, some signals
-unscored, everything else delivered), and `failed` (the exception propagates,
-nothing from this run is marked seen).
+The statuses, then: `ok` (exit 0), `partial` (exit 1, some signals unscored,
+everything else delivered, the source's window not advanced), `commit_failed`
+(the exception from `commit()` propagates; everything was delivered and marked
+seen, only the source's window did not advance, so the next run re-fetches it
+and SeenStore drops it all), and `failed` (the exception propagates, nothing
+from this run is marked seen).
 """
 from __future__ import annotations
 
@@ -123,7 +145,20 @@ def run(
             seen.mark(signal_id)
         seen.save()
 
-        status = "partial" if unscored else "ok"
+        if unscored:
+            status = "partial"
+        else:
+            # A source that tracks its own fetch window advances it only here,
+            # once delivery and the dedupe marks are both durable, and never on
+            # a partial run: an unscored signal must still be inside the next
+            # run's window to be retried (issue #46).
+            commit = getattr(source, "commit", None)
+            if callable(commit):
+                # Delivered and marked already: if commit() raises, the line
+                # must not say `failed`.
+                status = "commit_failed"
+                commit()
+            status = "ok"
     finally:
         print(
             f"agent={agent_name} status={status} fetched={fetched} "
