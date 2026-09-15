@@ -38,7 +38,8 @@ one approved and the other skipped.
 The workspace path is not part of the config block a human writes. The CLI
 injects it as `_workspace` before building, because the registry hands a
 factory only its own block (docs/PLUGIN-CONTRACT.md) and the proposals store
-lives beside the dedupe state, not beside the config.
+lives beside the dedupe state, not beside the config. It passes `_workspace`
+and `_root` on to the `wrap` block it builds, since the CLI never sees that one.
 
 Two behaviours worth knowing:
 
@@ -160,6 +161,13 @@ def build(cfg: dict) -> Destination:
             "approval destination needs the workspace path; the CLI injects it as "
             "'_workspace' (this destination cannot be built outside `agent run`)"
         )
+
+    # The wrapped destination is built here, not by the CLI, so it gets the
+    # run-level paths from this block: a wrapped `digest` needs both for its
+    # LLM waterfall (see framework/llm.py).
+    wrap["_workspace"] = workspace
+    if cfg.get("_root"):
+        wrap["_root"] = cfg["_root"]
 
     retval = ApprovalDestination(
         wrapped=build_destination(wrap),

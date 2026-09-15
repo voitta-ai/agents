@@ -8,8 +8,8 @@ scale the regex rules produce, so the Slack destination's `min_score` routes and
 every other consumer keep working unchanged.
 
 The model chain comes from `framework.llm`, exactly as the digest destination's
-does: the agent's own `model:` block if it has one, otherwise OpenClaw's shared
-`agents.defaults.model`. There is one waterfall in this repo, not two.
+does: this block's own `llm` waterfall if it has one, otherwise the deployment's
+`<workspaces-root>/_shared/llm.json`. There is one waterfall in this repo, not two.
 
 Three decisions worth knowing before configuring it:
 
@@ -37,11 +37,10 @@ Three decisions worth knowing before configuring it:
   - **Temperature defaults to 0.** Scoring wants the same number for the same
     text; creativity is the digest's job.
 
-Cost and latency: one model call per new signal. On the `codex/` subscription
-transport that is a CLI process per signal, several seconds each, which is fine
-at the fetch sizes and schedules the deployed agents run at (25 signals every
-few hours) and would not be for a firehose. Nothing here batches signals into
-one call; that is a deliberate non-feature until an agent needs it.
+Cost and latency: one model call per new signal, which is fine at the fetch
+sizes and schedules the deployed agents run at (25 signals every few hours) and
+would not be for a firehose. Nothing here batches signals into one call; that is
+a deliberate non-feature until an agent needs it.
 
 Contract: see docs/PLUGIN-CONTRACT.md.
 """

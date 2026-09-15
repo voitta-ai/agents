@@ -1,0 +1,9 @@
+{
+  "_comment": "Copy to <workspaces-root>/_shared/llm.json, or put the same object under an 'llm' key in an LLM plugin's config block. Rows are tried in order; api_key_env names the variable holding the key, never the key. codex rows need no key: they read the codex CLI's ~/.codex/auth.json. See framework/llm.py.",
+  "waterfall": [
+    {"name": "anthropic", "model": "anthropic/<model>", "api_key_env": "ANTHROPIC_API_KEY"},
+    {"name": "codex", "model": "codex/chatgpt/<model>"},
+    {"name": "openrouter", "model": "openrouter/<vendor>/<model>:free", "api_key_env": "OPENROUTER_API_KEY"}
+  ],
+  "budget_park_sec": 3600
+}

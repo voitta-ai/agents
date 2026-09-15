@@ -79,11 +79,15 @@ def _cmd_run(args: argparse.Namespace) -> int:
     # registry hands a factory only its own block, hence the injection.
     cfg.source.setdefault("state_dir", str(cfg.workspace / STATE_DIRNAME))
     source = build_source(cfg.source)
+    # The registry hands a factory only its own block (docs/PLUGIN-CONTRACT.md),
+    # so run-level paths are injected here: the approval destination keeps its
+    # proposals store in the workspace, and anything built on `framework.llm`
+    # needs the workspace (parked-vendor state) and the workspaces root (the
+    # shared `_shared/llm.json` waterfall).
+    for block in (cfg.scorer, cfg.destination):
+        block["_workspace"] = str(cfg.workspace)
+        block["_root"] = str(cfg.root)
     scorer = build_scorer(cfg.scorer)
-    # The approval destination keeps its proposals store in the workspace, but
-    # the registry hands a factory only its own block (docs/PLUGIN-CONTRACT.md),
-    # so the path is injected here.
-    cfg.destination["_workspace"] = str(cfg.workspace)
     destination = build_destination(cfg.destination)
 
     state_path = Path(args.state) if args.state else cfg.default_state_path

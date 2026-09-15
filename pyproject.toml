@@ -6,7 +6,9 @@ requires-python = ">=3.10"
 dependencies = [
     "requests>=2.31",
     "feedparser>=6.0",
+    "httpx>=0.28",
     "icalendar>=6.0",
+    "litellm>=1.83",
     "python-dateutil>=2.9",
     "tzdata>=2024.1",
     "markdown-it-py>=3.0",
