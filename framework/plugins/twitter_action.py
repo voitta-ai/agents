@@ -46,10 +46,22 @@ token at any level. `timeout` (seconds, default 30) bounds the request.
 `execute` returns `{"tweet_url": "https://x.com/i/status/<id>"}`. The `/i/status/`
 form resolves without knowing the account's handle, which the create response
 does not include.
+
+A 2xx from X means the tweet exists, so nothing after one fails the step. A
+2xx body that cannot be read or carries no tweet id still returns, with
+`{"tweet_url": ""}` and one notice on stderr: failing there would report an
+announcement that went out as one that did not, and the approvals re-run
+procedure (set the proposal back to `pending`) would post it a second time.
+
+  - **`POST /2/tweets` is not idempotent, and nothing here retries.** A timeout
+    or dropped connection after X accepted the request can leave a tweet that
+    this action reports as failed, so check the account before re-running by
+    hand.
 """
 from __future__ import annotations
 
 import os
+import sys
 from typing import Any
 
 import requests
@@ -95,6 +107,19 @@ def _error_detail(resp: requests.Response) -> str:
     return retval
 
 
+def _tweet_id(resp: requests.Response) -> str:
+    """`data.id` from a create response, or "" if the body has no readable id."""
+    retval = ""
+    try:
+        body = resp.json()
+    except ValueError:
+        body = None
+    data = body.get("data") if isinstance(body, dict) else None
+    if isinstance(data, dict) and data.get("id"):
+        retval = str(data["id"])
+    return retval
+
+
 class TwitterPostAction:
     def __init__(self, text: str, env_names: dict[str, str], timeout: int = 30):
         self._text = text
@@ -123,14 +148,20 @@ class TwitterPostAction:
             auth=self._auth(),
             timeout=self._timeout,
         )
-        if resp.status_code != 201:
+        if not 200 <= resp.status_code < 300:
             raise RuntimeError(
                 f"twitter-post: POST /2/tweets returned {resp.status_code}{_error_detail(resp)}"
             )
-        tweet_id = resp.json().get("data", {}).get("id")
-        if not tweet_id:
-            raise RuntimeError("twitter-post: POST /2/tweets returned 201 without a tweet id")
-        retval = {"tweet_url": f"https://x.com/i/status/{tweet_id}"}
+        tweet_id = _tweet_id(resp)
+        if tweet_id:
+            retval = {"tweet_url": f"https://x.com/i/status/{tweet_id}"}
+        else:
+            print(
+                f"agent: twitter-post: POST /2/tweets returned {resp.status_code}, so the tweet "
+                "was posted, but the response carried no tweet id; tweet_url is empty",
+                file=sys.stderr,
+            )
+            retval = {"tweet_url": ""}
         return retval
 
 

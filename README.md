@@ -167,7 +167,10 @@ payload merged with each step's returned dict. Shipped:
   `TWITTER_ACCESS_SECRET` (names overridable via `api_key_env`,
   `api_secret_env`, `access_token_env`, `access_secret_env`), read when the
   step runs. Over 280 characters is an error before any request. Needs
-  `pip install '.[twitter]'`. Returns `tweet_url`. See issue #48.
+  `pip install '.[twitter]'`. Returns `tweet_url`. A 2xx never fails the step
+  (a body without the id returns `tweet_url: ""` and a stderr notice); a
+  failed step may still have posted, so check the account before re-running
+  by hand. See issue #48.
 - `wordpress-publish` (`framework/plugins/wordpress_action.py`) — turns
   `payload["title"]` + `payload["body_md"]` (Markdown) into a WordPress.com post
   and returns `{"url", "post_id"}` for later steps. Config:
