@@ -36,9 +36,21 @@ class Source(Protocol):
         ...
 
 
+class ScoreError(RuntimeError):
+    """This one signal could not be scored; others may be.
+
+    A scorer raises it (or a subclass) when the failure belongs to the signal,
+    not to the scorer: the model answered, but not with a readable score. The
+    runner skips that signal without sending or marking it, so the next run
+    retries it, and finishes the run for everything else with `status=partial`.
+    Anything else a scorer raises, such as every model in the chain being down,
+    still aborts the run, because it would fail every signal the same way.
+    """
+
+
 class Scorer(Protocol):
-    """Scores a Signal. Regex/keyword for v1; LLM-based waterfall is a
-    tracked future replacement (see issue: LLM-based scorer)."""
+    """Scores a Signal. Raises `ScoreError` for a failure specific to that
+    signal; any other exception aborts the run."""
 
     def score(self, signal: Signal) -> ScoredSignal:
         ...

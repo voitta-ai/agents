@@ -1,0 +1,53 @@
+{
+  "_comment": "Copy into a workspace directory as config.json (outside any git checkout) and fill in real values. Secrets never live here: credentials are named by env var, not stored. One agent per community workspace: give each its own workspace directory and 'agent' name so their dedupe state does not collide.",
+  "agent": "slack-workspace-example",
+  "schedule": "0 */6 * * *",
+  "source": {
+    "type": "slack-workspace",
+    "_comment": "Two transports (issues #19, #45). 'agentmail' reads the workspace's own notification emails forwarded to AgentMail; 'session' reads channels as the logged-in browser user, see '_session_source_example' below. 'workspace' is a label for the Signal's source/meta fields, not a credential. Setup: turn on the workspace's own notification/digest emails and forward them to the AgentMail inbox; 'inbox' falls back to AGENTMAIL_EMAIL when omitted. 'from_contains' scopes a shared inbox to this workspace's notification sender so unrelated mail is never scored. 'channels' is a coarse substring match against subject+body (AgentMail has no structured channel field); omit for everything the digests cover. 'limit' bounds recent inbox messages per run; it is not a time window.",
+    "transport": "agentmail",
+    "workspace": "<workspace-label>",
+    "inbox": "<agent-inbox>@<agentmail-domain>",
+    "api_key_env": "AGENTMAIL_API_KEY",
+    "from_contains": [
+      "<notification-sender-domain>"
+    ],
+    "channels": [
+      "#<channel-name>"
+    ],
+    "limit": 50
+  },
+  "_session_source_example": {
+    "_comment": "Alternative 'source' block for transport 'session' (issue #45). The framework ignores this top-level key; to use the session transport, make this object the value of 'source' in place of the agentmail block above. Reads named channels as the user logged in to the workspace in a local browser. Credentials are extracted per run from the browser cookie store (pycookiecheat, pip install '.[slack-session]') and the workspace page, held in memory and dropped at exit; nothing is stored and nothing is configured here. On macOS the cookie decryption reads the login keychain and may prompt the first time. Read-only: the client refuses any Slack method outside a fixed allowlist (auth.test, conversations.list/history/replies, chat.getPermalink, users.info, users.list) before any HTTP; no config key widens it. 'subdomain' is the <subdomain> in <subdomain>.slack.com and must be a workspace you are logged in to in 'browser' (pycookiecheat name: chrome (default), chromium, brave, firefox, slack). 'channels' are names without '#', resolved to ids per run; an unknown name raises and lists what the workspace has. 'since_hours' is the conversations.history lookback; Signal ids are <channel_id>:<ts>, so overlapping windows dedupe through the SeenStore. 'include_threads' folds thread replies into the parent message's text. A channel whose history is capped by the workspace's plan (Slack's free-tier visibility limit) raises rather than returning a partial window.",
+    "type": "slack-workspace",
+    "transport": "session",
+    "workspace": "<workspace-label>",
+    "subdomain": "<workspace-subdomain>",
+    "browser": "chrome",
+    "channels": [
+      "<channel-name>",
+      "<another-channel-name>"
+    ],
+    "since_hours": 24,
+    "include_threads": true
+  },
+  "scorer": {
+    "type": "regex",
+    "ignore_case": true,
+    "match": "presence",
+    "floor": 0,
+    "rules": [
+      {"pattern": "<keyword-worth-flagging>", "points": 10}
+    ]
+  },
+  "destination": {
+    "type": "slack",
+    "routes": [
+      {
+        "min_score": 10,
+        "webhook_env": "SLACK_WORKSPACE_DIGEST_WEBHOOK",
+        "channel": "#<internal-digest-channel>"
+      }
+    ]
+  }
+}

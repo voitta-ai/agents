@@ -7,8 +7,9 @@ as short-lived, cron/launchd-invoked processes (not daemons).
 
 - **Source** — where signals come from (e.g. Reddit RSS). Plugin interface,
   one implementation per source. See `framework/interfaces.py`.
-- **Scorer** — turns raw signals into a score (regex/keyword for v1; LLM-based
-  waterfall scorer is a tracked future issue, not v1).
+- **Scorer** — turns raw signals into a score. `regex` is presence-based keyword
+  matching; `llm` asks a model through the waterfall in `framework/llm.py` and is
+  configured by a prompt rather than rules (issue #9).
 - **Destination** — where scored signals get sent (Slack first; email later).
   Two-tier routing (hot / firehose) is a Slack-destination concern, not a
   framework concern.
@@ -29,10 +30,34 @@ stated default until an agent has a real reason to do something else.
 
 ## Layout
 
+The repo holds code and placeholder examples only:
+
 ```
-framework/          core: plugin interfaces, entrypoint contract, state/dedupe
-agents/<name>/       one dir per agent: its config + any agent-specific glue
+framework/                       core: plugin interfaces, entrypoint contract, state/dedupe
+agents/<name>/config.example.json one committed, placeholder-only example per agent
 ```
+
+A deployed agent lives in a **workspace**: one directory per agent, outside any
+git checkout, holding everything that agent owns at runtime. A merge to master
+is then not a deploy, and nothing an agent writes lands in the working tree.
+
+```
+<workspaces-root>/               $AGENT_WORKSPACES_ROOT, else ~/agent-workspaces
+  _shared/                       cross-agent files (reserved; nothing reads it yet)
+  <agent-name>/
+    config.json                  the agent's declaration; the only file a human edits
+    state/seen.json              SeenStore dedupe state (default; --state overrides)
+    logs/                        stdout/stderr when scheduled
+```
+
+```
+agent run --workspace <workspaces-root>/<agent-name>
+```
+
+`run` always takes the explicit workspace path; the root default is only for
+helpers that take an agent *name*. Config is JSON: copy an example in as
+`config.json` and fill in real values. A `"_comment"` key anywhere is ignored by
+the framework and by every plugin, and is where decisions worth keeping go.
 
 ## Agents
 
@@ -41,6 +66,81 @@ agents/<name>/       one dir per agent: its config + any agent-specific glue
 - `agents/slack-workspace/` — digests community Slack workspaces we
   participate in but don't administer, via their own notification emails
   forwarded to AgentMail. See issue #19.
+- `agents/slack-workspace/` with `transport: session` — reads named channels
+  of such a workspace as the logged-in browser user (`d` cookie decrypted
+  from the local browser store, `xoxc` token scraped per run, nothing stored).
+  Read-only by construction: the client refuses every Slack method outside a
+  fixed allowlist before any HTTP. Needs `pip install '.[slack-session]'`
+  (pycookiecheat). See issue #45.
+
+## Approval-gated actions
+
+Some agents end in something that should not happen without a human saying so:
+publishing a post, sending an application. For those the destination is
+`approval`, which wraps the destination that writes the content and records a
+**proposal** instead of posting it (issue #21):
+
+```json
+"destination": {
+  "type": "approval",
+  "webhook_env": "SOME_WEBHOOK",
+  "wrap": {"type": "digest", "webhook_env": "SOME_WEBHOOK", "prompt": "..."},
+  "actions": ["publish-post"]
+},
+"approvals": {
+  "channel_id": "C0123456789",
+  "bot_token_env": "SOME_BOT_TOKEN",
+  "trusted_user_ids": ["U0123456789"],
+  "hours": 24
+},
+"actions": {
+  "publish-post": {
+    "steps": [
+      {"type": "slack-post", "webhook_env": "SOME_WEBHOOK", "text": "Published: {url}"}
+    ]
+  }
+}
+```
+
+The run posts the rendered content plus `Proposal p7-k3f: publish-post. Reply
+"do p7-k3f" or "skip p7-k3f".` and writes the proposal to
+`<workspace>/state/proposals.json`. The proposal is the delivery, so dedupe
+state is marked as usual. Ids are a per-workspace counter plus a random suffix,
+so a reply cannot be typed before the proposal exists; the whole id is required.
+
+```
+agent approvals --workspace <workspaces-root>/<agent-name>
+```
+
+is the second scheduled entrypoint (every few minutes). It reads the channel's
+last `hours` of history with the bot token, and for each pending proposal a
+user in `trusted_user_ids` has answered with exactly `do <id>` or `skip <id>`
+**as a top-level channel message posted after the proposal was recorded**,
+claims it (`pending` -> `running`, atomically, so two overlapping passes cannot
+both execute it), runs the named action's `steps` in order or marks it
+skipped, posts one outcome message, and prints `agent=<name> status=ok
+approvals=N executed=N skipped=N failed=N stuck=N`. A failing step stops the
+sequence, leaves the proposal `failed` naming the step, and nothing is retried.
+Anything that is not exactly `do`/`skip` from a trusted user is ignored, and so
+is a reply older than the proposal it names. Replies typed *in a thread* are
+not seen (`conversations.history` returns top-level messages only); reply in
+the channel. The bot token needs `channels:history` (or `groups:history` for a
+private channel) and `chat:write`.
+
+A proposal left `running` by a pass that is no longer alive (or claimed more
+than `hours` ago) means that pass died mid-steps. It is never re-run on its
+own: every pass reports it on stderr and as `stuck=N`, and the channel is told
+once which steps the store recorded as done. Re-running it is a manual edit of
+`state/proposals.json`: set its `status` back to `"pending"`, and the next pass
+runs all of its steps again, including any that already happened, if the
+original `do` is still inside the `hours` window (otherwise reply `do` again).
+To close it instead, set `"failed"`.
+
+Steps are **action** plugins, the fourth kind (`docs/PLUGIN-CONTRACT.md`).
+Later steps see earlier results by `{name}` templating over the proposal's
+payload merged with each step's returned dict. Shipped: `slack-post`
+(`webhook_env`, `text`). `wordpress-publish`, `twitter-post`, `linkedin-post`
+are their own issues.
 
 ## Actions
 
@@ -62,15 +162,34 @@ only after a trusted human approves the proposal it belongs to.
 ### Secrets live in the environment, never in config
 
 Each destination names the env var holding its credential (`webhook_env`,
-`api_key_env`). Real per-agent `config.yaml` files are gitignored; only
-`config.yaml-example` is committed. The framework itself only ever reads
-`os.environ` when it builds a destination — how those variables get there is the
-deployment's business, not this repo's.
+`api_key_env`). Real per-agent `config.json` files live in workspaces outside
+the checkout; only `config.example.json` is committed. The framework itself only
+ever reads `os.environ` when it builds a destination — how those variables get
+there is the deployment's business, not this repo's.
 
 In our own launchd deployment the agents are invoked through `bash -lc`, so the
 login profile supplies the values and no credential is stored in a plist. If you
 schedule them another way, whatever wraps them has to load the environment
 itself; nothing in this repo does it for you.
+
+### Migrating an existing agent into a workspace
+
+An agent that was running out of a checkout (`--config <dir>/config.yaml`, state
+in `<dir>/.seen-<agent>.json`) does not carry its dedupe state over on its own:
+the workspace default is `<workspace>/state/seen.json`, and an empty one means
+every signal the source still returns is new again. There is deliberately no
+fallback read of the legacy path; the cutover is one operator step, done while
+the scheduler is stopped:
+
+1. Unload the agent's scheduled job so nothing runs mid-move.
+2. Create the workspace and write `config.json` from the old YAML.
+3. Union the old `.seen-<agent>.json` with whatever `state/seen.json` already
+   holds (both are flat JSON arrays of ids) and write the result to
+   `state/seen.json`. If the workspace was hand-run before the cutover, the two
+   files have diverged and neither alone is complete.
+4. Re-point the scheduled job at `agent run --workspace <workspace>` and load it.
+5. Hand-run once and check the summary line: `new=` should be small (what
+   arrived during the move), not the size of the feed.
 
 ### Slack incoming webhooks do not survive the app being reinstalled
 

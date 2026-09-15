@@ -4,7 +4,6 @@ version = "0.1.0"
 description = "Framework for small, single-purpose pain-signal / lead-finding agents."
 requires-python = ">=3.10"
 dependencies = [
-    "PyYAML>=6.0",
     "requests>=2.31",
     "feedparser>=6.0",
     "icalendar>=6.0",
@@ -13,6 +12,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# transport: session on the slack-workspace source (issue #45).
+slack-session = ["pycookiecheat>=0.6"]
+# twitter-post action (issue #48).
 twitter = ["requests-oauthlib>=1.3"]
 
 [project.scripts]
