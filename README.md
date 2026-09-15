@@ -145,7 +145,32 @@ Steps are **action** plugins, the fourth kind (`docs/PLUGIN-CONTRACT.md`).
 Later steps see earlier results by `{name}` templating over the proposal's
 payload merged with each step's returned dict. Shipped:
 
+- `command` (`framework/plugins/command_action.py`) — runs an existing tool:
+  `{"type": "command", "argv": ["/abs/path/tool", "--text", "{blurb} {url}"],
+  "result_format": "json"}`. `argv[0]` must be a literal path (a `{` or `}`
+  in it is a config error: the program never comes from proposal data); every
+  later element is templated. No shell, so quotes and `$(...)` in post text
+  reach the tool as one literal argument. Optional `cwd`, `timeout` (default
+  120). At most one of `result_pattern` (regex with named groups, searched in
+  stdout; groups become results) or `result_format: "json"` (last non-empty
+  stdout line is a JSON object; keys become results); neither means no results. A nonzero exit fails the step
+  with the exit code and the last 20 stderr lines, which the outcome message
+  posts to the channel; exit 0 with stdout that does not parse as configured
+  fails too. Output goes to temporary files, not memory: at most the last
+  64 KiB of stderr and the first 1 MiB of stdout are read, and more stdout
+  than that with a result mode set fails as too large. Messages name only
+  `argv[0]`. See issue #48.
 - `slack-post` (`webhook_env`, `text`).
+- `twitter-post` (`framework/plugins/twitter_action.py`) — tweets `text` (a
+  template) through the X API v2 with OAuth 1.0a user context; credentials
+  from `TWITTER_API_KEY`, `TWITTER_API_SECRET`, `TWITTER_ACCESS_TOKEN`,
+  `TWITTER_ACCESS_SECRET` (names overridable via `api_key_env`,
+  `api_secret_env`, `access_token_env`, `access_secret_env`), read when the
+  step runs. Over 280 characters is an error before any request. Needs
+  `pip install '.[twitter]'`. Returns `tweet_url`. A 2xx never fails the step
+  (a body without the id returns `tweet_url: ""` and a stderr notice); a
+  failed step may still have posted, so check the account before re-running
+  by hand. See issue #48.
 - `wordpress-publish` (`framework/plugins/wordpress_action.py`) — turns
   `payload["title"]` + `payload["body_md"]` (Markdown) into a WordPress.com post
   and returns `{"url", "post_id"}` for later steps. Config:
@@ -155,8 +180,6 @@ payload merged with each step's returned dict. Shipped:
   the public permalink). The token comes from `token_env`, else the macOS
   Keychain item `wpcom_token` the `wordpress-com-publish` skill writes; missing
   or rejected tokens fail loud naming that skill as the fix. See issue #47.
-
-`twitter-post` and `linkedin-post` are their own issues.
 
 ## Operating notes
 

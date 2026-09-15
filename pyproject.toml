@@ -15,6 +15,8 @@ dependencies = [
 [project.optional-dependencies]
 # transport: session on the slack-workspace source (issue #45).
 slack-session = ["pycookiecheat>=0.6"]
+# twitter-post action (issue #48).
+twitter = ["requests-oauthlib>=1.3"]
 
 [project.scripts]
 agent = "framework.cli:main"
