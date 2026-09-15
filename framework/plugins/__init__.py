@@ -67,7 +67,6 @@ _PLUGIN_MODULES: dict[str, tuple[str, ...]] = {
     "digest_destination": ("digest",),
     "github_org_source": ("github-org",),
     "ics_source": ("ics",),
-    "linkedin_action": ("linkedin-post",),
     "llm_scorer": ("llm",),
     "reddit_source": ("reddit",),
     "regex_scorer": ("regex",),

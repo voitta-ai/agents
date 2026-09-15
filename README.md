@@ -139,8 +139,8 @@ To close it instead, set `"failed"`.
 Steps are **action** plugins, the fourth kind (`docs/PLUGIN-CONTRACT.md`).
 Later steps see earlier results by `{name}` templating over the proposal's
 payload merged with each step's returned dict. Shipped: `slack-post`
-(`webhook_env`, `text`). `wordpress-publish`, `twitter-post`, `linkedin-post`
-are their own issues.
+(`webhook_env`, `text`). `wordpress-publish`, `twitter-post` are their own
+issues.
 
 ## Actions
 
@@ -152,10 +152,6 @@ only after a trusted human approves the proposal it belongs to.
   `TWITTER_API_SECRET`, `TWITTER_ACCESS_TOKEN`, `TWITTER_ACCESS_SECRET`
   (names overridable via `*_env` keys). Over 280 characters is an error before
   any request. Needs `pip install '.[twitter]'`. Returns `tweet_url`. Issue #48.
-- `linkedin-post` — shares `text` on the operator's profile through the LinkedIn
-  Posts API; token from `LINKEDIN_ACCESS_TOKEN` (`access_token_env`), which
-  needs the `w_member_social` and `openid` scopes. Unset token raises a
-  "not configured" error naming both. Returns `post_urn`. Issue #48.
 
 ## Operating notes
 
