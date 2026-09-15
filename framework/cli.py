@@ -12,6 +12,9 @@ updated. Passing it exits 2 with a message that names `--workspace`.
 
 `agent approvals --workspace <dir>` is the second entrypoint (issue #21): same
 contract, its own clock, executes proposals a trusted human has replied to.
+
+`agent install-schedule` / `uninstall-schedule` (issue #10) write and remove the
+launchd jobs that invoke those two; see `framework/schedule.py`.
 """
 from __future__ import annotations
 
@@ -31,6 +34,7 @@ from framework.registry import (
     load_plugins,
 )
 from framework.runner import run
+from framework.schedule import ScheduleError, install_schedule, uninstall_schedule
 from framework.state import SeenStore
 
 
@@ -96,6 +100,16 @@ def _cmd_approvals(args: argparse.Namespace) -> int:
     return retval
 
 
+def _cmd_install_schedule(args: argparse.Namespace) -> int:
+    retval = install_schedule(args.workspace, args.label, args.venv, args.force, args.dry_run)
+    return retval
+
+
+def _cmd_uninstall_schedule(args: argparse.Namespace) -> int:
+    retval = uninstall_schedule(args.workspace, args.label, args.force)
+    return retval
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="agent", description="Run a single-purpose signal agent.")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -124,6 +138,58 @@ def build_parser() -> argparse.ArgumentParser:
         help="The agent's workspace directory; <dir>/config.json and <dir>/state/proposals.json.",
     )
     approvals_parser.set_defaults(func=_cmd_approvals)
+
+    install_parser = sub.add_parser(
+        "install-schedule",
+        help="Write and load the workspace's launchd plist(s) (macOS).",
+    )
+    install_parser.add_argument(
+        "--workspace",
+        required=True,
+        help="The agent's workspace directory; its config.json supplies 'agent' and 'schedule'.",
+    )
+    install_parser.add_argument(
+        "--label",
+        default=None,
+        help="launchd label (default: com.agents.<agent>); the approvals job is <label>.approvals.",
+    )
+    install_parser.add_argument(
+        "--venv",
+        default=None,
+        help="Venv whose bin/agent the job runs (default: the venv running this command).",
+    )
+    install_parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Replace a job at the label that this workspace's install-schedule did not write.",
+    )
+    install_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Print the plist(s) and do nothing else.",
+    )
+    install_parser.set_defaults(func=_cmd_install_schedule)
+
+    uninstall_parser = sub.add_parser(
+        "uninstall-schedule",
+        help="Unload and delete the workspace's launchd plist(s) (macOS).",
+    )
+    uninstall_parser.add_argument(
+        "--workspace",
+        required=True,
+        help="The agent's workspace directory; config.json is read only for the default label.",
+    )
+    uninstall_parser.add_argument(
+        "--label",
+        default=None,
+        help="launchd label the install used (default: com.agents.<agent>).",
+    )
+    uninstall_parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Remove a job at the label that this workspace's install-schedule did not write.",
+    )
+    uninstall_parser.set_defaults(func=_cmd_uninstall_schedule)
     return parser
 
 
@@ -135,6 +201,9 @@ def main(argv: list[str] | None = None) -> int:
     except (ConfigError, UnknownPluginError, PluginImportError) as exc:
         print(f"agent: {exc}", file=sys.stderr)
         return 2
+    except ScheduleError as exc:
+        print(f"agent: {exc}", file=sys.stderr)
+        retval = 1
     return retval
 
 
