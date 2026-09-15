@@ -41,7 +41,7 @@ They are read in `execute`, not at construction, so a sequence whose earlier
 steps do not need Twitter is built and started regardless, and the approval
 runner reports *this* step as the one waiting on credentials. A missing variable
 raises naming it. Nothing in this module logs a header, a request body or a
-token at any level.
+token at any level. `timeout` (seconds, default 30) bounds the request.
 
 `execute` returns `{"tweet_url": "https://x.com/i/status/<id>"}`. The `/i/status/`
 form resolves without knowing the account's handle, which the create response

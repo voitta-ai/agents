@@ -138,20 +138,29 @@ To close it instead, set `"failed"`.
 
 Steps are **action** plugins, the fourth kind (`docs/PLUGIN-CONTRACT.md`).
 Later steps see earlier results by `{name}` templating over the proposal's
-payload merged with each step's returned dict. Shipped: `slack-post`
-(`webhook_env`, `text`). `wordpress-publish`, `twitter-post` are their own
-issues.
+payload merged with each step's returned dict. Shipped:
 
-## Actions
+- `command` (`framework/plugins/command_action.py`) — runs an existing tool:
+  `{"type": "command", "argv": ["/abs/path/tool", "--text", "{blurb} {url}"],
+  "result_format": "json"}`. Each `argv` element is templated; no shell, so
+  quotes and `$(...)` in post text reach the tool as one literal argument.
+  Optional `cwd`, `timeout` (default 120). At most one of `result_pattern`
+  (regex with named groups, searched in stdout; groups become results) or
+  `result_format: "json"` (last non-empty stdout line is a JSON object; keys
+  become results); neither means no results. A nonzero exit fails the step
+  with the exit code and the last 20 stderr lines, which the outcome message
+  posts to the channel; exit 0 with stdout that does not parse as configured
+  fails too. Messages name only `argv[0]`. See issue #48.
+- `slack-post` (`webhook_env`, `text`).
+- `twitter-post` (`framework/plugins/twitter_action.py`) — tweets `text` (a
+  template) through the X API v2 with OAuth 1.0a user context; credentials
+  from `TWITTER_API_KEY`, `TWITTER_API_SECRET`, `TWITTER_ACCESS_TOKEN`,
+  `TWITTER_ACCESS_SECRET` (names overridable via `api_key_env`,
+  `api_secret_env`, `access_token_env`, `access_secret_env`), read when the
+  step runs. Over 280 characters is an error before any request. Needs
+  `pip install '.[twitter]'`. Returns `tweet_url`. See issue #48.
 
-Approval-gated steps (see `Action` in `framework/interfaces.py`). Each runs
-only after a trusted human approves the proposal it belongs to.
-
-- `twitter-post` — tweets `text` (a `{payload}` template) through the X API v2
-  with OAuth 1.0a user context; credentials from `TWITTER_API_KEY`,
-  `TWITTER_API_SECRET`, `TWITTER_ACCESS_TOKEN`, `TWITTER_ACCESS_SECRET`
-  (names overridable via `*_env` keys). Over 280 characters is an error before
-  any request. Needs `pip install '.[twitter]'`. Returns `tweet_url`. Issue #48.
+`wordpress-publish` is its own issue.
 
 ## Operating notes
 
