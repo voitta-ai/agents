@@ -117,7 +117,11 @@ register_action(type_name: str)       # decorates  (cfg: dict) -> Action
 
 - **Read only your own block.** The factory gets its component's dict and
   nothing else. Cross-component fields do not exist at construction time; if a
-  plugin needs a value, it lives in that plugin's own config block.
+  plugin needs a value, it lives in that plugin's own config block. The one
+  exception is run-level paths, which `agent run` injects into the scorer and
+  destination blocks: `_workspace` (the agent's workspace) and `_root` (the
+  workspaces root, where `_shared/llm.json` lives). `framework.llm.build_client`
+  reads both.
 - **No shared schema.** Each plugin owns the keys under its block. `subreddits`
   is the Reddit source's business; `routes`/`workspace` are the Slack
   destination's; there is deliberately no central schema to coordinate on.

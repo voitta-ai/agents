@@ -4,7 +4,7 @@ An agent is declared by a *workspace*: one directory per deployed agent, outside
 any git checkout, holding everything the agent owns at runtime (issue #43):
 
     <root>/
-      _shared/            cross-agent files (not read by the framework itself)
+      _shared/            cross-agent files; llm.json is the LLM waterfall (framework/llm.py)
       <agent-name>/       the workspace
         config.json       the agent's declaration; the only file a human edits
         state/            SeenStore and any other per-agent state
