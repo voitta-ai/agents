@@ -132,6 +132,9 @@ Approval-gated actions), so avoid re-installing while one is executing.
   `channels` takes names or conversation ids (`C...`/`G...`, and `D...` for a
   direct message, which has no name to resolve), and `from_users` keeps only
   the authors named, so a bot's DM reads without your own replies (issue #61).
+  On an Enterprise Grid org a user session cannot list channels or ask for
+  permalinks, so names raise with ids named as the remedy and links are
+  constructed (`meta.permalink_source`); ids work there unchanged (issue #69).
   Read-only by construction: the client refuses every Slack method outside a
   fixed allowlist before any HTTP. Needs `pip install '.[slack-session]'`
   (pycookiecheat). See issue #45.

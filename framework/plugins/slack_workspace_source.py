@@ -93,8 +93,10 @@ a guarantee that can be switched off in a config file is not one.
     sees the whole exchange as one item.
   - One Signal per top-level message. `id` is `<channel_id>:<ts>`, which is
     stable across runs and is what the SeenStore dedupes on. `url` is the
-    permalink from `chat.getPermalink`. `meta` carries `workspace`,
-    `channel` (the name), `user` (display name), `reply_count` and
+    permalink from `chat.getPermalink`, or a constructed archive link where
+    that method is refused (see below). `meta` carries `workspace`,
+    `channel` (the name), `user` (display name), `reply_count`,
+    `permalink_source` (`"api"` or `"constructed"`) and
     `transport: "session"`.
   - User ids are rendered to display names through `users.info`, cached for
     the run.
@@ -109,6 +111,30 @@ a guarantee that can be switched off in a config file is not one.
     pagination would not help (the older messages are not visible to this
     user), and returning what came back would present a capped window as a
     complete one.
+
+## Session transport on an Enterprise Grid org
+
+Which methods a user session may call is a property of the *workspace*, not of
+this config. An Enterprise Grid org refuses several of them outright with
+`enterprise_is_restricted`, and a lead agent hit both of these live (issue
+#69). Everything needed to actually read messages still works there:
+`auth.test`, `conversations.info` (including a DM, by id),
+`conversations.history`, `conversations.replies`, `users.info` and `team.info`.
+Two things do not:
+
+  - **`chat.getPermalink` is refused.** A link is a convenience and the message
+    is the signal, so a refusal is not worth a failed run: the archive URL is
+    built instead, `https://<subdomain>.slack.com/archives/<channel_id>/p<ts
+    without its dot>`, which is the link the Slack client itself produces.
+    `meta["permalink_source"]` records `"constructed"` rather than `"api"`, and
+    the first fallback in a run prints one line on stderr, so nobody has to
+    guess whether a link was confirmed by Slack or assembled here.
+  - **`conversations.list` is refused, so channel *names* cannot be resolved
+    at all.** A config naming channels fails on such a workspace, and no
+    amount of retrying changes that; the run raises before anything else with
+    a message saying the org restricts listing and that channels must be given
+    as ids. A config of ids only never calls `conversations.list`, so it works
+    on a Grid org unchanged — which makes ids the portable way to write one.
 
 Config keys (session transport):
 
@@ -144,6 +170,7 @@ from __future__ import annotations
 
 import os
 import re
+import sys
 import time
 from typing import Any, Callable
 
@@ -205,9 +232,28 @@ _READ_METHODS: frozenset[str] = frozenset(
 # DM has no name to resolve, which is the case that made this necessary.
 _CHANNEL_ID = re.compile(r"^[CDG][A-Z0-9]{8,}$")
 
+# What an Enterprise Grid org answers a user session for the methods it does
+# not allow it (issue #69). It is a property of the workspace, not of the call.
+_RESTRICTED = "enterprise_is_restricted"
+
 _USER_AGENT = "Mozilla/5.0"
 _PAGE_LIMIT = 200
 _MAX_RATE_LIMIT_RETRIES = 5
+
+
+class SlackAPIError(RuntimeError):
+    """A Slack method answered `ok: false`; `code` is Slack's error string.
+
+    A `RuntimeError` like everything else this module raises, so callers that
+    only want a failed run need no change. `code` exists because two of these
+    are a property of the *workspace* rather than a bug: an Enterprise Grid org
+    refuses some methods to a user session with `enterprise_is_restricted`, and
+    the transport reacts differently depending on which method that was.
+    """
+
+    def __init__(self, message: str, code: str):
+        super().__init__(message)
+        self.code = code
 
 
 class _SessionClient:
@@ -337,11 +383,22 @@ class _SessionClient:
                     f"re-extracting it; log in to that workspace again in the browser"
                 )
         if not result.get("ok"):
-            raise RuntimeError(
+            code = str(result.get("error") or "unknown error")
+            raise SlackAPIError(
                 f"slack-workspace source (transport: session): {method} on "
-                f"{self.subdomain} failed: {result.get('error', 'unknown error')}"
+                f"{self.subdomain} failed: {code}",
+                code=code,
             )
         retval = result
+        return retval
+
+    def archive_url(self, channel_id: str, ts: str) -> str:
+        """The archive link for a message, built rather than asked for.
+
+        Same shape the Slack client produces: the message timestamp with its
+        dot removed, prefixed `p`. Used when `chat.getPermalink` is refused.
+        """
+        retval = f"{self._base}/archives/{channel_id}/p{str(ts).replace('.', '')}"
         return retval
 
     def paginate(self, method: str, key: str, **params: Any) -> list[dict[str, Any]]:
@@ -395,6 +452,7 @@ class _SessionTransport:
         self._include_threads = include_threads
         self._from_users = set(from_users or [])
         self._user_names: dict[str, str] = {}
+        self._permalink_warned = False
 
     def _resolve_channels(self) -> list[tuple[str, str]]:
         """Configured entries as (label, id) pairs, in configured order.
@@ -406,12 +464,25 @@ class _SessionTransport:
         names = [c.lstrip("#") for c in self._channels if not _CHANNEL_ID.match(c)]
         by_name: dict[str, str] = {}
         if names:
-            listed = self._client.paginate(
-                "conversations.list",
-                "channels",
-                types="public_channel,private_channel",
-                exclude_archived="true",
-            )
+            try:
+                listed = self._client.paginate(
+                    "conversations.list",
+                    "channels",
+                    types="public_channel,private_channel",
+                    exclude_archived="true",
+                )
+            except SlackAPIError as exc:
+                if exc.code != _RESTRICTED:
+                    raise
+                raise RuntimeError(
+                    f"slack-workspace source (transport: session): this workspace "
+                    f"restricts channel listing for user sessions "
+                    f"({_RESTRICTED}), so the name(s) {', '.join(names)} cannot be "
+                    f"resolved. Give those channels as conversation ids instead: "
+                    f"open the channel in Slack, 'Copy link', and take the id from "
+                    f"the end of the URL (.../archives/<id>). Reading by id needs "
+                    f"no listing and works on this workspace; a DM id starts with D."
+                ) from exc
             by_name = {c["name"]: c["id"] for c in listed if c.get("name") and c.get("id")}
             missing = [n for n in names if n not in by_name]
             if missing:
@@ -517,15 +588,55 @@ class _SessionTransport:
         retval = lines
         return retval
 
+    def _permalink(self, channel_id: str, ts: str) -> tuple[str, str]:
+        """The message's link, and where it came from.
+
+        `chat.getPermalink` is refused outright on an Enterprise Grid org
+        (issue #69), and the link is a convenience while the message is the
+        signal, so *that* refusal builds the archive URL instead of failing the
+        run. `meta["permalink_source"]` says which happened, and the first
+        fallback of a run says so once on stderr: constructed links are correct
+        but unverified, and an operator should not have to guess which they
+        have.
+
+        Only `enterprise_is_restricted` is treated that way. Any other Slack
+        error propagates, because a constructed link looks exactly the same
+        whether the org restricts the method or the call was wrong, and a run
+        that quietly builds links over a real fault would never be noticed.
+        """
+        link = ""
+        try:
+            link = self._client.call(
+                "chat.getPermalink", channel=channel_id, message_ts=ts
+            ).get("permalink", "")
+        except SlackAPIError as exc:
+            # Only the org-wide restriction is survivable. channel_not_found,
+            # message_not_found, missing_scope or a transient fatal_error say
+            # something is wrong with this call, and constructing a link would
+            # bury that under a URL indistinguishable from a healthy Grid run.
+            if exc.code != _RESTRICTED:
+                raise
+            if not self._permalink_warned:
+                self._permalink_warned = True
+                print(
+                    f"slack-workspace source (transport: session): chat.getPermalink "
+                    f"unavailable ({exc.code}); building archive links instead, see "
+                    f"meta.permalink_source",
+                    file=sys.stderr,
+                )
+        if link:
+            retval = (link, "api")
+        else:
+            retval = (self._client.archive_url(channel_id, ts), "constructed")
+        return retval
+
     def _signal(self, channel_name: str, channel_id: str, message: dict[str, Any]) -> Signal:
         ts = message["ts"]
         reply_count = int(message.get("reply_count") or 0)
         lines = [message.get("text", "")]
         if self._include_threads and reply_count > 0:
             lines.extend(self._replies_text(channel_id, ts))
-        permalink = self._client.call(
-            "chat.getPermalink", channel=channel_id, message_ts=ts
-        ).get("permalink", "")
+        permalink, permalink_source = self._permalink(channel_id, ts)
         retval = Signal(
             id=f"{channel_id}:{ts}",
             text="\n".join(lines),
@@ -536,6 +647,7 @@ class _SessionTransport:
                 "channel": channel_name,
                 "user": self._user_name(message),
                 "reply_count": reply_count,
+                "permalink_source": permalink_source,
                 "transport": "session",
             },
         )
@@ -543,6 +655,7 @@ class _SessionTransport:
 
     def fetch(self) -> list[Signal]:
         self._user_names = {}
+        self._permalink_warned = False
         oldest = time.time() - self._since_hours * 3600
         signals: list[Signal] = []
         for channel_name, channel_id in self._resolve_channels():
