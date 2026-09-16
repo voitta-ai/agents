@@ -34,6 +34,30 @@ genuinely enough.
 AgentMail exposes no permalink field, so `Signal.url` is empty; consumers should
 render `meta.subject` and `meta.from` instead of relying on a link.
 
+## Trashed messages are hidden by default
+
+The list endpoint omits anything labelled `trash` unless `include_trash=true` is
+passed. That label can be applied by something outside this repo — another
+client on the same inbox, a provider-side rule — so an inbox can look empty
+while holding everything an agent wants. Measured on a live inbox: the default
+listing returned 1 message and `include_trash: true` returned 50, 49 of them
+labelled `trash`.
+
+`include_trash` (default `false`) is therefore a config key, not a heuristic.
+Nothing here guesses that a quiet inbox means trashed mail; an operator seeing
+an unexpectedly empty inbox checks the label and sets the key. Trashed messages
+keep their labels in `meta.labels`, so a scorer can still tell them apart.
+
+## Pagination
+
+The listing is paged: a response carries `next_page_token` when more messages
+match, and `page_token` continues from it. `fetch()` follows that until it has
+`limit` messages or the pages run out, so `limit` bounds the run rather than the
+page. Unknown query parameters are ignored by the API rather than rejected,
+which is why the token parameter is spelled exactly `page_token`. A response
+that is not an object with a `messages` list raises: a source that cannot read
+its own API must not report an empty inbox.
+
 Contract: see docs/PLUGIN-CONTRACT.md.
 """
 from __future__ import annotations
@@ -58,11 +82,13 @@ class AgentMailSource:
         from_contains: list[str] | None = None,
         subject_contains: list[str] | None = None,
         fetch_body: bool = True,
+        include_trash: bool = False,
         label: str = "agentmail",
         timeout: int = 30,
     ):
         self.inbox = inbox
         self.limit = limit
+        self.include_trash = include_trash
         # An inbox is often shared across agents, so filter to what this one
         # cares about. Empty filters accept everything.
         self.from_contains = [s.lower() for s in (from_contains or [])]
@@ -86,18 +112,39 @@ class AgentMailSource:
         return True
 
     def _list_messages(self) -> list[dict]:
-        resp = requests.get(
-            f"{_API_BASE}/inboxes/{self.inbox}/messages",
-            headers=self._headers,
-            params={"limit": self.limit},
-            timeout=self.timeout,
-        )
-        resp.raise_for_status()
-        payload = resp.json()
-        if isinstance(payload, list):
-            retval = payload
-        else:
-            retval = payload.get("messages", [])
+        """Recent messages, following `next_page_token` up to `limit`."""
+        messages: list[dict] = []
+        page_token = ""
+        while len(messages) < self.limit:
+            params: dict[str, str] = {"limit": str(self.limit - len(messages))}
+            if self.include_trash:
+                params["include_trash"] = "true"
+            if page_token:
+                params["page_token"] = page_token
+            resp = requests.get(
+                f"{_API_BASE}/inboxes/{self.inbox}/messages",
+                headers=self._headers,
+                params=params,
+                timeout=self.timeout,
+            )
+            resp.raise_for_status()
+            payload = resp.json()
+            # Fail loud on a shape this code cannot read: a silently empty run
+            # is the failure mode this repo keeps paying for, and an API that
+            # changed shape is exactly when a source stops seeing anything.
+            if not isinstance(payload, dict) or not isinstance(payload.get("messages"), list):
+                raise RuntimeError(
+                    f"agentmail source: unexpected response from the messages endpoint for "
+                    f"{self.inbox}: expected an object with a 'messages' list, got "
+                    f"{type(payload).__name__} with keys "
+                    f"{sorted(payload) if isinstance(payload, dict) else 'n/a'}"
+                )
+            page = payload["messages"]
+            messages.extend(page)
+            page_token = payload.get("next_page_token") or ""
+            if not page_token or not page:
+                break
+        retval = messages[: self.limit]
         return retval
 
     def _body_for(self, message_id: str) -> str:
@@ -166,6 +213,7 @@ def build(cfg: dict) -> Source:
         from_contains=cfg.get("from_contains"),
         subject_contains=cfg.get("subject_contains"),
         fetch_body=bool(cfg.get("fetch_body", True)),
+        include_trash=bool(cfg.get("include_trash", False)),
         label=cfg.get("label", "agentmail"),
         timeout=int(cfg.get("timeout", 30)),
     )
