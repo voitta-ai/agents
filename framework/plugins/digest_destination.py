@@ -43,8 +43,11 @@ key becomes a template name for the action's steps:
 
 The values are descriptions written for the model, not defaults. `body_md` is
 required among them, because it is what `render()` promises its caller and what
-the proposal's Slack message shows. Without a `fields` key nothing changes: one
-prose summary, in `body_md`.
+the proposal's Slack message shows. `empty`, `footer`, `items` and `model` are
+refused: `render()` sets those for its caller, and a drafted string landing on
+`empty` would tell the approval destination there was nothing to propose,
+losing a digest that had already been written. Without a `fields` key nothing
+changes: one prose summary, in `body_md`.
 
 A reply that is not a JSON object carrying every configured key raises
 `DigestFieldError` after one retry, and the run ends without recording a
@@ -55,7 +58,10 @@ again with the same signals, because nothing was marked seen.
 them, for agents whose scorer is a filter rather than a ranking. Dropped items
 are not in the item count either, so a run that gates everything out reads as
 the quiet run it was. Signals are still marked seen: the gate says "not worth
-summarizing", not "look at this again next run".
+summarizing", not "look at this again next run". A gated run also shows the
+model each item's score and the scorer's reasons; an ungated one does not, so
+a digest that was running before this change reads exactly the prompt it
+always did.
 
 Contract: see docs/PLUGIN-CONTRACT.md.
 """
@@ -77,6 +83,14 @@ _DEFAULT_SYSTEM = (
 )
 
 _DECODER = json.JSONDecoder()
+
+# Keys `render()` sets for its caller, which a drafted field must never
+# overwrite. `empty` is the dangerous one: a truthy `empty` tells the approval
+# destination there is nothing to propose, so a real digest would be posted
+# and dropped, its signals marked seen, and the run would report `ok` having
+# silently lost drafted content. `title` and `body_md` are absent on purpose:
+# drafting them is the point, and `title`'s override is handled.
+_RESERVED_FIELDS = frozenset({"empty", "footer", "items", "model"})
 
 
 class DigestFieldError(RuntimeError):
@@ -192,14 +206,24 @@ class DigestDestination:
         self._buffered.append(scored)
 
     def _render_items(self) -> str:
+        """The item list the model reads.
+
+        Scores and the scorer's reasons appear only when `min_score` gates the
+        run. A config with a gate is demonstrably using scores for something,
+        and showing them lets the model say which items cleared the bar; a
+        config without one gets the list it has always got, rather than a
+        prompt newly seasoned with whatever its scorer writes into `reasons`
+        ("matched keyword X", for the regex scorer).
+        """
+        show_scores = self.min_score > 0
         lines = []
         for scored in self._buffered[: self.max_signals]:
             sig = scored.signal
             head = (sig.meta or {}).get("title") or sig.text.splitlines()[0]
-            line = f"- [{scored.score}] {head}"
+            line = f"- [{scored.score}] {head}" if show_scores else f"- {head}"
             if sig.url:
                 line += f" ({sig.url})"
-            if scored.reasons:
+            if show_scores and scored.reasons:
                 line += f"\n  why: {'; '.join(scored.reasons)}"
             body = sig.text.strip()
             if body and body != head:
@@ -353,6 +377,14 @@ def build(cfg: dict) -> Destination:
             raise RuntimeError(
                 "digest destination's 'fields' must include 'body_md': it is what "
                 "render() promises its caller and what the digest message shows"
+            )
+        clashes = sorted(name for name in fields if name in _RESERVED_FIELDS)
+        if clashes:
+            raise RuntimeError(
+                f"digest destination's fields {', '.join(clashes)} would overwrite "
+                "render()'s own keys; rename them. Reserved: "
+                f"{', '.join(sorted(_RESERVED_FIELDS))} "
+                "('title' and 'body_md' are yours to draft)"
             )
 
     llm = build_client(cfg, what="digest destination")

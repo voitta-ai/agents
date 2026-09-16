@@ -224,8 +224,10 @@ and every key becomes a template name for the steps:
 
 A step can then say `{"type": "twitter-post", "text": "{blurb_twitter}"}`. The
 values are descriptions for the model, not defaults, and `body_md` has to be
-one of them. Without a `fields` key the digest behaves exactly as before: one
-prose summary in `body_md`.
+one of them. `empty`, `footer`, `items` and `model` are refused as field names:
+`render()` sets those itself, and a field named `empty` would make a written
+digest look like a quiet run and be dropped. Without a `fields` key the digest
+behaves exactly as before: one prose summary in `body_md`.
 
 The proposal message shows the model's `title` and `body_md`, then lists the
 other fields under `also drafted:` with their text, so what is approved is what
@@ -236,8 +238,9 @@ rather than publishing half an announcement.
 
 `min_score` (default 0, no gate) drops signals scoring below it before the
 model sees them, and they are not in the item count either. They are still
-marked seen. The item list the model reads carries each item's score and the
-scorer's reasons.
+marked seen. With a gate set, the item list the model reads also carries each
+item's score and the scorer's reasons; without one it does not, so a digest
+configured before this existed reads exactly the prompt it always did.
 
 Steps are **action** plugins, the fourth kind (`docs/PLUGIN-CONTRACT.md`).
 Later steps see earlier results by `{name}` templating over the proposal's
