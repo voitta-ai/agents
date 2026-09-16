@@ -27,6 +27,23 @@ this repo already had to clean up twice (issue #7).
 Slack incoming webhooks are bound to a channel when they are created, so the
 `channel` key here is a label for humans reading the config, not routing.
 
+Two per-route keys shape what a message says (issue #64). Both may also be set
+once at the top level of the destination block, where they are the default for
+every route that does not set its own; the flat single-route form reads them
+from the same place it reads `webhook_env`.
+
+    footer        a string appended verbatim as the last line of every message
+                  this route sends, streamed or batched. It exists for standing
+                  lines that must appear on every message, so nothing here
+                  wraps, truncates or formats it, and no other key can suppress
+                  it. Empty (the default) appends nothing.
+    show_reasons  render `ScoredSignal.reasons` as a bulleted block under the
+                  score. Default true: both scorers fill `reasons` in (the llm
+                  scorer puts its rationale and the answering model there), and
+                  a lead posted without them is harder to triage. A signal with
+                  no reasons renders exactly as it did before this key existed,
+                  and so does any signal under `show_reasons: false`.
+
 Sheets/email destinations are explicitly out of scope for v1.
 
 Contract: see docs/PLUGIN-CONTRACT.md — routing and gating are the
@@ -43,10 +60,19 @@ from framework.registry import register_destination
 
 
 class _Route:
-    def __init__(self, webhook_url: str, min_score: int, channel_label: str = ""):
+    def __init__(
+        self,
+        webhook_url: str,
+        min_score: int,
+        channel_label: str = "",
+        footer: str = "",
+        show_reasons: bool = True,
+    ):
         self.webhook_url = webhook_url
         self.min_score = min_score
         self.channel_label = channel_label
+        self.footer = footer
+        self.show_reasons = show_reasons
 
 
 class SlackDestination:
@@ -60,7 +86,7 @@ class SlackDestination:
         self._mode = mode
         self._buffered: dict[int, list[str]] = {}
 
-    def _format(self, scored: ScoredSignal, compact: bool = False) -> str:
+    def _format(self, route: _Route, scored: ScoredSignal, compact: bool = False) -> str:
         """Render one signal.
 
         Streaming keeps the full `signal.text` — that is what deployed agents
@@ -68,6 +94,10 @@ class SlackDestination:
         Batching uses `meta.title` when a source provides one, because ten full
         post bodies in a single Slack message is unreadable. Sources without a
         title fall back to the full text either way.
+
+        The reasons block follows the url, in both modes: it is two short lines
+        that say why this signal scored what it did, which is exactly what a
+        batched list of ten is otherwise missing.
         """
         sig = scored.signal
         body = sig.text
@@ -76,9 +106,13 @@ class SlackDestination:
         text = f"*[{scored.score}]* {body}"
         if sig.url:
             text += f"\n{sig.url}"
+        if route.show_reasons and scored.reasons:
+            text += "\n" + "\n".join(f"• {reason}" for reason in scored.reasons)
         return text
 
     def _post(self, route: _Route, text: str) -> None:
+        if route.footer:
+            text += f"\n{route.footer}"
         resp = requests.post(
             route.webhook_url,
             json={"text": text},
@@ -98,9 +132,11 @@ class SlackDestination:
         if route is None:
             return
         if self._mode == "stream":
-            self._post(route, self._format(scored))
+            self._post(route, self._format(route, scored))
             return
-        self._buffered.setdefault(id(route), []).append(self._format(scored, compact=True))
+        self._buffered.setdefault(id(route), []).append(
+            self._format(route, scored, compact=True)
+        )
 
     def flush(self) -> None:
         """Emit one message per route in batch mode. No-op when streaming."""
@@ -117,7 +153,29 @@ class SlackDestination:
         self._buffered.clear()
 
 
-def _build_route(cfg: dict, label: str) -> _Route:
+def _footer(cfg: dict, label: str, default: str) -> str:
+    """`footer` for this route, falling back to the destination-level one."""
+    value = cfg.get("footer", default)
+    if not isinstance(value, str):
+        raise ValueError(f"slack destination: {label} 'footer' must be a string, got {value!r}")
+    return value
+
+
+def _show_reasons(cfg: dict, label: str, default: bool) -> bool:
+    """`show_reasons` for this route, falling back to the destination-level one.
+
+    Only a real boolean: a string "false" is a config typo that would otherwise
+    turn the block on and read as if the operator had turned it off.
+    """
+    value = cfg.get("show_reasons", default)
+    if not isinstance(value, bool):
+        raise ValueError(
+            f"slack destination: {label} 'show_reasons' must be true or false, got {value!r}"
+        )
+    return value
+
+
+def _build_route(cfg: dict, label: str, footer: str = "", show_reasons: bool = True) -> _Route:
     env_name = cfg.get("webhook_env")
     if not env_name:
         raise RuntimeError(f"slack destination: {label} needs a 'webhook_env'")
@@ -128,20 +186,25 @@ def _build_route(cfg: dict, label: str) -> _Route:
         webhook_url=webhook_url,
         min_score=int(cfg.get("min_score", 0)),
         channel_label=cfg.get("channel", ""),
+        footer=_footer(cfg, label, footer),
+        show_reasons=_show_reasons(cfg, label, show_reasons),
     )
     return retval
 
 
 @register_destination("slack")
 def build(cfg: dict) -> Destination:
+    footer = _footer(cfg, "destination", "")
+    show_reasons = _show_reasons(cfg, "destination", True)
     declared = cfg.get("routes")
     if isinstance(declared, list) and declared:
         routes = [
-            _build_route(r, r.get("channel") or f"route[{i}]") for i, r in enumerate(declared)
+            _build_route(r, r.get("channel") or f"route[{i}]", footer, show_reasons)
+            for i, r in enumerate(declared)
         ]
     else:
         # Flat single-route form, for agents that only ever post to one channel.
-        routes = [_build_route(cfg, cfg.get("channel") or "destination")]
+        routes = [_build_route(cfg, cfg.get("channel") or "destination", footer, show_reasons)]
 
     retval = SlackDestination(
         routes=routes,
