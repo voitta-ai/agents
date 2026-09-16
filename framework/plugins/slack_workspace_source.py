@@ -593,10 +593,16 @@ class _SessionTransport:
 
         `chat.getPermalink` is refused outright on an Enterprise Grid org
         (issue #69), and the link is a convenience while the message is the
-        signal, so a refusal builds the archive URL instead of failing the run.
-        `meta["permalink_source"]` says which happened, and the first fallback
-        of a run says so once on stderr: constructed links are correct but
-        unverified, and an operator should not have to guess which they have.
+        signal, so *that* refusal builds the archive URL instead of failing the
+        run. `meta["permalink_source"]` says which happened, and the first
+        fallback of a run says so once on stderr: constructed links are correct
+        but unverified, and an operator should not have to guess which they
+        have.
+
+        Only `enterprise_is_restricted` is treated that way. Any other Slack
+        error propagates, because a constructed link looks exactly the same
+        whether the org restricts the method or the call was wrong, and a run
+        that quietly builds links over a real fault would never be noticed.
         """
         link = ""
         try:
@@ -604,6 +610,12 @@ class _SessionTransport:
                 "chat.getPermalink", channel=channel_id, message_ts=ts
             ).get("permalink", "")
         except SlackAPIError as exc:
+            # Only the org-wide restriction is survivable. channel_not_found,
+            # message_not_found, missing_scope or a transient fatal_error say
+            # something is wrong with this call, and constructing a link would
+            # bury that under a URL indistinguishable from a healthy Grid run.
+            if exc.code != _RESTRICTED:
+                raise
             if not self._permalink_warned:
                 self._permalink_warned = True
                 print(
