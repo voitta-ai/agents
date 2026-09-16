@@ -27,10 +27,41 @@ posted, so the `approval` destination can wrap this one and turn the digest
 into a proposal. `flush()` is `render()` plus the post, and behaves exactly as
 before when this destination is used on its own.
 
+`fields` (issue #63) is what an approved *multi-step* action needs. A digest
+that only ever produces one blob of prose gives an action sequence exactly one
+template name, `{body_md}`, so a release-notes action that publishes the post
+and then posts a blurb to a social account has nowhere to get the blurb from
+and fails at that step, after the post is already published. With `fields`, the
+model is asked for one JSON object with those keys instead of prose, and every
+key becomes a template name for the action's steps:
+
+    "fields": {
+      "title":         "A post title, under 70 characters.",
+      "body_md":       "The post itself, Markdown.",
+      "blurb_twitter": "Under 240 characters, plain text, no hashtags."
+    }
+
+The values are descriptions written for the model, not defaults. `body_md` is
+required among them, because it is what `render()` promises its caller and what
+the proposal's Slack message shows. Without a `fields` key nothing changes: one
+prose summary, in `body_md`.
+
+A reply that is not a JSON object carrying every configured key raises
+`DigestFieldError` after one retry, and the run ends without recording a
+proposal. Half a release announcement is worse than none: the next run asks
+again with the same signals, because nothing was marked seen.
+
+`min_score` (issue #63) drops low-scoring signals before the model ever sees
+them, for agents whose scorer is a filter rather than a ranking. Dropped items
+are not in the item count either, so a run that gates everything out reads as
+the quiet run it was. Signals are still marked seen: the gate says "not worth
+summarizing", not "look at this again next run".
+
 Contract: see docs/PLUGIN-CONTRACT.md.
 """
 from __future__ import annotations
 
+import json
 import os
 
 import requests
@@ -44,6 +75,85 @@ _DEFAULT_SYSTEM = (
     "Omit anything routine. If little happened, say so plainly and stop — "
     "never pad to fill space."
 )
+
+_DECODER = json.JSONDecoder()
+
+
+class DigestFieldError(RuntimeError):
+    """The model answered, but not with a JSON object carrying every field.
+
+    Not an `LLMError`: every rung of the waterfall answered, so the chain is
+    healthy and reporting it as a dead chain would send an operator after the
+    wrong thing. `flush()` still surfaces it to the channel the same way.
+    """
+
+
+def _fields_instruction(fields: dict[str, str]) -> str:
+    """The JSON-only contract appended to the system prompt."""
+    lines = [f'  "{name}": {description}' for name, description in fields.items()]
+    body = "\n".join(lines)
+    retval = (
+        "Reply with a single JSON object and nothing else -- no code fence, no "
+        "commentary before or after it. The object has exactly these keys, each "
+        "a string:\n"
+        f"{body}\n"
+        "Every key must be present and non-empty."
+    )
+    return retval
+
+
+_RETRY_REMINDER = (
+    "\n\n---\n\nYour previous reply could not be read. Reply with one JSON object "
+    "and nothing else: no code fence, no text before or after it, every key "
+    "present, every value a non-empty string."
+)
+
+
+def _first_object_with(raw: str, names: list[str]) -> dict | None:
+    """First JSON object in `raw` that carries every name in `names`, or None.
+
+    Tries a decode at each `{` rather than spanning first-`{` to last-`}`: a
+    model that appends a second object (a correction, an example) must not
+    turn one readable answer into unparseable "extra data". Same reading the
+    llm scorer does for its `score` object.
+    """
+    retval = None
+    pos = raw.find("{")
+    while pos != -1 and retval is None:
+        try:
+            candidate, _end = _DECODER.raw_decode(raw, pos)
+        except ValueError:
+            candidate = None
+        if isinstance(candidate, dict) and all(name in candidate for name in names):
+            retval = candidate
+        pos = raw.find("{", pos + 1)
+    return retval
+
+
+def _parse_fields(raw: str, fields: dict[str, str]) -> dict[str, str]:
+    """Read the configured fields out of a model reply, or raise.
+
+    Every key has to be there and has to be a non-empty string. A field that
+    came back as an empty string is the failure this is here to catch: it
+    templates into a step as nothing at all, and an approved action would post
+    a blank blurb rather than fail.
+    """
+    names = list(fields)
+    payload = _first_object_with(raw, names)
+    if payload is None:
+        raise DigestFieldError(
+            f"no JSON object with the keys {', '.join(names)} in model reply: {raw[:300]!r}"
+        )
+    retval = {}
+    for name in names:
+        value = payload[name]
+        if not isinstance(value, str) or not value.strip():
+            raise DigestFieldError(
+                f"field {name!r} came back as {type(value).__name__} "
+                f"{str(value)[:80]!r}, not a non-empty string"
+            )
+        retval[name] = value.strip()
+    return retval
 
 
 class DigestDestination:
@@ -59,6 +169,8 @@ class DigestDestination:
         gate: bool = True,
         channel_label: str = "",
         timeout: int = 30,
+        fields: dict[str, str] | None = None,
+        min_score: int = 0,
     ):
         self.webhook_url = webhook_url
         self.llm = llm
@@ -70,9 +182,13 @@ class DigestDestination:
         self.gate = gate
         self.channel_label = channel_label
         self.timeout = timeout
+        self.fields = fields or {}
+        self.min_score = min_score
         self._buffered: list[ScoredSignal] = []
 
     def send(self, scored: ScoredSignal) -> None:
+        if scored.score < self.min_score:
+            return
         self._buffered.append(scored)
 
     def _render_items(self) -> str:
@@ -80,9 +196,11 @@ class DigestDestination:
         for scored in self._buffered[: self.max_signals]:
             sig = scored.signal
             head = (sig.meta or {}).get("title") or sig.text.splitlines()[0]
-            line = f"- {head}"
+            line = f"- [{scored.score}] {head}"
             if sig.url:
                 line += f" ({sig.url})"
+            if scored.reasons:
+                line += f"\n  why: {'; '.join(scored.reasons)}"
             body = sig.text.strip()
             if body and body != head:
                 line += f"\n  {body[:800]}"
@@ -123,19 +241,65 @@ class DigestDestination:
 
         dropped = max(0, len(self._buffered) - self.max_signals)
         user = f"{self.prompt}\n\n---\n\n{self._render_items()}"
-        summary = self.llm.complete(self.system, user)
+        if self.fields:
+            drafted = self._complete_fields(user)
+        else:
+            drafted = {"body_md": self.llm.complete(self.system, user)}
 
-        footer = f"_{len(self._buffered)} item(s) · {self.llm.model_used}_"
+        footer = self._extras_block(drafted)
+        footer += f"_{len(self._buffered)} item(s) · {self.llm.model_used}_"
         if dropped:
             footer += f" · _{dropped} item(s) omitted past max_signals_"
         retval = {
             "title": self.title,
-            "body_md": summary,
+            "body_md": drafted["body_md"],
             "footer": footer,
             "empty": False,
             "items": len(self._buffered),
             "model": self.llm.model_used,
         }
+        # The configured fields are the template names an approved action's
+        # steps render against, so they go in whole, after the keys above:
+        # a field named `title` is the model's post title and replaces the
+        # static config one, which is a label for the Slack message.
+        retval.update(drafted)
+        return retval
+
+    def _complete_fields(self, user: str) -> dict[str, str]:
+        """Ask for the configured fields as one JSON object; one retry, then raise."""
+        system = f"{self.system}\n\n{_fields_instruction(self.fields)}"
+        reply = self.llm.complete(system, user)
+        try:
+            retval = _parse_fields(reply, self.fields)
+        except DigestFieldError as first:
+            # Same one-retry rule the llm scorer uses: a model that drifted
+            # into prose once usually complies when told so, and a second miss
+            # is a real failure rather than a bad roll.
+            reply = self.llm.complete(system, user + _RETRY_REMINDER)
+            try:
+                retval = _parse_fields(reply, self.fields)
+            except DigestFieldError as second:
+                raise DigestFieldError(
+                    f"unreadable reply after one retry; first: {first}; retry: {second}"
+                ) from second
+        return retval
+
+    def _extras_block(self, drafted: dict[str, str]) -> str:
+        """The drafted fields other than `body_md`, shown under the digest.
+
+        A human approving a proposal has to see everything it will publish, not
+        just the part that happens to be the post. Named first, then quoted in
+        full, and the whole block sits in `footer` so that `body_md` stays
+        exactly what an action's publish step will send.
+        """
+        extras = [name for name in self.fields if name not in ("body_md", "title")]
+        if not extras:
+            retval = ""
+            return retval
+        parts = [f"*also drafted:* {', '.join(extras)}"]
+        for name in extras:
+            parts.append(f"*{name}*\n{drafted[name]}")
+        retval = "\n\n".join(parts) + "\n\n"
         return retval
 
     def flush(self) -> None:
@@ -145,7 +309,7 @@ class DigestDestination:
 
         try:
             rendered = self.render()
-        except LLMError as exc:
+        except (LLMError, DigestFieldError) as exc:
             # Surface the failure into the channel. Staying silent here would
             # look exactly like a quiet week.
             self._post(f"{header}\n\n:warning: digest not generated — {exc}")
@@ -172,6 +336,25 @@ def build(cfg: dict) -> Destination:
     if not prompt:
         raise RuntimeError("digest destination needs a 'prompt'")
 
+    fields = cfg.get("fields")
+    if fields is not None:
+        if not isinstance(fields, dict) or not fields:
+            raise RuntimeError(
+                "digest destination's 'fields' must be a non-empty object of "
+                "name -> description (the description is written for the model)"
+            )
+        bad = [name for name, desc in fields.items() if not isinstance(desc, str) or not desc]
+        if bad:
+            raise RuntimeError(
+                f"digest destination's fields {', '.join(sorted(bad))} need a "
+                "non-empty description string saying what the model should write"
+            )
+        if "body_md" not in fields:
+            raise RuntimeError(
+                "digest destination's 'fields' must include 'body_md': it is what "
+                "render() promises its caller and what the digest message shows"
+            )
+
     llm = build_client(cfg, what="digest destination")
 
     retval = DigestDestination(
@@ -185,5 +368,7 @@ def build(cfg: dict) -> Destination:
         gate=bool(cfg.get("gate", True)),
         channel_label=cfg.get("channel", ""),
         timeout=int(cfg.get("timeout", 30)),
+        fields=fields,
+        min_score=int(cfg.get("min_score", 0)),
     )
     return retval

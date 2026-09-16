@@ -201,6 +201,44 @@ runs all of its steps again, including any that already happened, if the
 original `do` is still inside the `hours` window (otherwise reply `do` again).
 To close it instead, set `"failed"`.
 
+### Drafting several things at once: `digest` fields
+
+An action whose steps publish a post *and* announce it needs more than one
+piece of text, and a digest that writes one blob of prose has only `{body_md}`
+to give them. `fields` (issue #63) asks the model for a JSON object instead,
+and every key becomes a template name for the steps:
+
+```json
+"wrap": {
+  "type": "digest",
+  "webhook_env": "SOME_WEBHOOK",
+  "prompt": "...",
+  "min_score": 60,
+  "fields": {
+    "title": "A post title, under 70 characters.",
+    "body_md": "The post itself, Markdown.",
+    "blurb_twitter": "Under 240 characters, plain text, no hashtags."
+  }
+}
+```
+
+A step can then say `{"type": "twitter-post", "text": "{blurb_twitter}"}`. The
+values are descriptions for the model, not defaults, and `body_md` has to be
+one of them. Without a `fields` key the digest behaves exactly as before: one
+prose summary in `body_md`.
+
+The proposal message shows the model's `title` and `body_md`, then lists the
+other fields under `also drafted:` with their text, so what is approved is what
+goes out. If the model does not come back with a JSON object carrying every
+field (or any of them is empty), the run asks once more and then fails without
+recording a proposal — nothing is marked seen, so the next run drafts again
+rather than publishing half an announcement.
+
+`min_score` (default 0, no gate) drops signals scoring below it before the
+model sees them, and they are not in the item count either. They are still
+marked seen. The item list the model reads carries each item's score and the
+scorer's reasons.
+
 Steps are **action** plugins, the fourth kind (`docs/PLUGIN-CONTRACT.md`).
 Later steps see earlier results by `{name}` templating over the proposal's
 payload merged with each step's returned dict. Shipped:
