@@ -42,10 +42,12 @@ is then not a deploy, and nothing an agent writes lands in the working tree.
 
 ```
 <workspaces-root>/               $AGENT_WORKSPACES_ROOT, else ~/agent-workspaces
-  _shared/                       cross-agent files (reserved; nothing reads it yet)
+  _shared/
+    llm.json                     the deployment's LLM waterfall (see below)
   <agent-name>/
     config.json                  the agent's declaration; the only file a human edits
     state/seen.json              SeenStore dedupe state (default; --state overrides)
+    state/llm-parked.json        vendors parked for budget exhaustion, with expiries
     logs/                        run.log / run.error.log (and approvals.*) when scheduled
 ```
 
@@ -57,6 +59,21 @@ agent run --workspace <workspaces-root>/<agent-name>
 helpers that take an agent *name*. Config is JSON: copy an example in as
 `config.json` and fill in real values. A `"_comment"` key anywhere is ignored by
 the framework and by every plugin, and is where decisions worth keeping go.
+
+## LLM waterfall
+
+Every LLM-backed plugin (the `llm` scorer, the `digest` destination) calls one
+ordered chain of vendors through LiteLLM's Router (`framework/llm.py`, issue
+#44). The chain is `<workspaces-root>/_shared/llm.json`, one per deployment; a
+plugin block with its own `"llm": {...}` of the same shape uses that instead.
+Copy `docs/llm.example.json` to start. Each row names the env var holding its
+key (`api_key_env`), never the key; a `codex/chatgpt/<model>` row runs on the
+ChatGPT subscription with no key, reading the codex CLI's `~/.codex/auth.json`
+(`codex login` when it expires). A vendor that answers with a budget-exhaustion
+error is parked for `budget_park_sec` (or until the date it names, at most 31
+days out) in
+`<workspace>/state/llm-parked.json`; delete an entry to un-park it early.
+Fallbacks and parks print one `llm:` line each on stderr.
 
 ## Scheduling
 
