@@ -123,10 +123,15 @@ Approval-gated actions), so avoid re-installing while one is executing.
   monitor currently running out of `hq/leads/signals/`. See issue #8.
 - `agents/slack-workspace/` — digests community Slack workspaces we
   participate in but don't administer, via their own notification emails
-  forwarded to AgentMail. See issue #19.
-- `agents/slack-workspace/` with `transport: session` — reads named channels
-  of such a workspace as the logged-in browser user (`d` cookie decrypted
-  from the local browser store, `xoxc` token scraped per run, nothing stored).
+  forwarded to AgentMail. See issue #19. An inbox that looks empty is usually
+  the `trash` label, which the AgentMail listing hides unless `include_trash`
+  is set (issue #61).
+- `agents/slack-workspace/` with `transport: session` — reads channels of such
+  a workspace as the logged-in browser user (`d` cookie decrypted from the
+  local browser store, `xoxc` token scraped per run, nothing stored).
+  `channels` takes names or conversation ids (`C...`/`G...`, and `D...` for a
+  direct message, which has no name to resolve), and `from_users` keeps only
+  the authors named, so a bot's DM reads without your own replies (issue #61).
   Read-only by construction: the client refuses every Slack method outside a
   fixed allowlist before any HTTP. Needs `pip install '.[slack-session]'`
   (pycookiecheat). See issue #45.

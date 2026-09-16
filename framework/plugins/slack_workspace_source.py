@@ -64,10 +64,25 @@ a guarantee that can be switched off in a config file is not one.
 
 ## Session transport: what a run does
 
-  - `channels` are names. They are resolved to ids once per run through
-    `conversations.list` (public and private, archived excluded, paginated).
-    An unknown name raises and lists what the workspace does have, so a typo
-    is a startup error and not an empty digest.
+  - `channels` entries are names or conversation ids. A name is resolved to
+    an id once per run through `conversations.list` (public and private,
+    archived excluded, paginated); an unknown name raises and lists what the
+    workspace does have, so a typo is a startup error and not an empty digest.
+    An entry shaped `^[CDG][A-Z0-9]{8,}$` is a conversation id and is used
+    directly. That is the only way to read a direct message: a DM has no name
+    and `conversations.list` does not carry it. An id gets one
+    `conversations.info` call for a `meta.channel` label — the channel's name,
+    or for a DM the other member's display name through `users.info`. A label
+    that cannot be read falls back to the id rather than failing the run.
+  - `from_users` (optional) keeps only messages posted by those ids. A
+    message's author is its `user`, or the `bot_profile.user_id` behind a bot
+    message; a `B...` id matches a message's `bot_id`, for integrations that
+    post with no user at all. This is what makes a bot's DM usable: the
+    conversation also holds your own replies, and without the filter they
+    would be scored as signals too. It applies to thread replies as well, so a
+    kept message folds in only the replies from a wanted author — otherwise
+    the text of a filtered signal would carry the very writing the filter
+    excludes. A parent whose replies are all filtered out folds nothing.
   - `conversations.history` is read per channel with `oldest = now -
     since_hours`, paginated by cursor. Only top-level messages become
     Signals; thread replies that Slack surfaces in history (broadcasts) are
@@ -101,10 +116,17 @@ Config keys (session transport):
   subdomain       the `<subdomain>` in `<subdomain>.slack.com`, required
   browser         pycookiecheat browser name (chrome, chromium, brave,
                   firefox, slack); default chrome
-  channels        list of channel names, required and non-empty
+  channels        list of channel names or conversation ids (`C...`, `D...`,
+                  `G...`), required and non-empty
+  from_users      optional list of user ids; keeps only their messages
   since_hours     lookback window; default 24
   include_threads fold thread replies into the parent; default true
   timeout         per-request HTTP timeout in seconds; default 30
+
+The agentmail transport takes the agentmail source's own keys, including
+`include_trash` (default false): that inbox's list endpoint hides messages
+labelled `trash`, and a workspace's forwarded digests can end up there without
+this repo doing anything. See agentmail_source.py.
 
 ## Channel scoping is best-effort on the agentmail transport
 
@@ -169,6 +191,7 @@ _READ_METHODS: frozenset[str] = frozenset(
     {
         "auth.test",
         "conversations.list",
+        "conversations.info",
         "conversations.history",
         "conversations.replies",
         "chat.getPermalink",
@@ -176,6 +199,11 @@ _READ_METHODS: frozenset[str] = frozenset(
         "users.list",
     }
 )
+
+# A `channels` entry in this shape is a Slack conversation id and is used as
+# one: C public/private channel, D direct message, G legacy private group. A
+# DM has no name to resolve, which is the case that made this necessary.
+_CHANNEL_ID = re.compile(r"^[CDG][A-Z0-9]{8,}$")
 
 _USER_AGENT = "Mozilla/5.0"
 _PAGE_LIMIT = 200
@@ -358,40 +386,69 @@ class _SessionTransport:
         channels: list[str],
         since_hours: float,
         include_threads: bool,
+        from_users: list[str] | None = None,
     ):
         self._client = client
         self._workspace = workspace
-        self._channel_names = [c.lstrip("#") for c in channels]
+        self._channels = [c.strip() for c in channels]
         self._since_hours = since_hours
         self._include_threads = include_threads
+        self._from_users = set(from_users or [])
         self._user_names: dict[str, str] = {}
 
-    def _resolve_channels(self) -> dict[str, str]:
-        """Map configured channel names to ids; unknown names are a hard error."""
-        listed = self._client.paginate(
-            "conversations.list",
-            "channels",
-            types="public_channel,private_channel",
-            exclude_archived="true",
-        )
-        by_name = {c["name"]: c["id"] for c in listed if c.get("name") and c.get("id")}
-        missing = [n for n in self._channel_names if n not in by_name]
-        if missing:
-            raise RuntimeError(
-                f"slack-workspace source (transport: session): channel(s) "
-                f"{', '.join(missing)} not found in {self._workspace}; the "
-                f"workspace has: {', '.join(sorted(by_name))}"
+    def _resolve_channels(self) -> list[tuple[str, str]]:
+        """Configured entries as (label, id) pairs, in configured order.
+
+        A name is resolved through `conversations.list` and an unknown one is a
+        hard error. An id is used as given: a DM has no name to look up, and
+        `conversations.list` would not carry it anyway.
+        """
+        names = [c.lstrip("#") for c in self._channels if not _CHANNEL_ID.match(c)]
+        by_name: dict[str, str] = {}
+        if names:
+            listed = self._client.paginate(
+                "conversations.list",
+                "channels",
+                types="public_channel,private_channel",
+                exclude_archived="true",
             )
-        retval = {n: by_name[n] for n in self._channel_names}
+            by_name = {c["name"]: c["id"] for c in listed if c.get("name") and c.get("id")}
+            missing = [n for n in names if n not in by_name]
+            if missing:
+                raise RuntimeError(
+                    f"slack-workspace source (transport: session): channel(s) "
+                    f"{', '.join(missing)} not found in {self._workspace}; the "
+                    f"workspace has: {', '.join(sorted(by_name))}"
+                )
+
+        resolved: list[tuple[str, str]] = []
+        for entry in self._channels:
+            if _CHANNEL_ID.match(entry):
+                resolved.append((self._label_for_id(entry), entry))
+            else:
+                name = entry.lstrip("#")
+                resolved.append((name, by_name[name]))
+        retval = resolved
         return retval
 
-    def _user_name(self, message: dict[str, Any]) -> str:
-        user_id = message.get("user")
-        if not user_id:
-            # Bot and integration posts carry no user; fall back to what the
-            # message itself says.
-            retval = message.get("username") or message.get("bot_id") or "unknown"
-            return retval
+    def _label_for_id(self, channel_id: str) -> str:
+        """A human label for a conversation named by id, for `meta.channel`.
+
+        `conversations.info` names a channel. A DM has no name, so the label is
+        the other member's display name, which is what an operator reading the
+        digest recognises. Anything unreadable falls back to the id itself:
+        a label is not worth failing a run over.
+        """
+        info = self._client.call("conversations.info", channel=channel_id).get("channel") or {}
+        name = info.get("name") or info.get("name_normalized") or ""
+        if not name and info.get("is_im"):
+            other = info.get("user") or ""
+            name = f"dm:{self._display_name(other)}" if other else "dm"
+        retval = name or channel_id
+        return retval
+
+    def _display_name(self, user_id: str) -> str:
+        """Display name for a user id, cached for the run."""
         if user_id not in self._user_names:
             info = self._client.call("users.info", user=user_id).get("user") or {}
             profile = info.get("profile") or {}
@@ -403,6 +460,41 @@ class _SessionTransport:
                 or user_id
             )
         retval = self._user_names[user_id]
+        return retval
+
+    @staticmethod
+    def _message_user_id(message: dict[str, Any]) -> str:
+        """The posting user id, including the bot user behind a bot message."""
+        retval = message.get("user") or (message.get("bot_profile") or {}).get("user_id") or ""
+        return retval
+
+    def _user_name(self, message: dict[str, Any]) -> str:
+        user_id = self._message_user_id(message)
+        if not user_id:
+            # Bot and integration posts carry no user; fall back to what the
+            # message itself says.
+            retval = message.get("username") or message.get("bot_id") or "unknown"
+            return retval
+        retval = self._display_name(user_id)
+        return retval
+
+    def _is_wanted_author(self, message: dict[str, Any]) -> bool:
+        """`from_users` membership. Empty config means every author.
+
+        Applied to thread replies as well as to top-level messages: a reply is
+        as much someone's writing as a post, and a filtered conversation that
+        folded the filtered-out author's replies into the text would hand the
+        scorer exactly what the filter was meant to keep out.
+        """
+        if not self._from_users:
+            retval = True
+        else:
+            user_id = self._message_user_id(message)
+            # A `B...` id may be configured instead, for an integration whose
+            # messages carry no user at all.
+            retval = (user_id in self._from_users) or (
+                message.get("bot_id") in self._from_users
+            )
         return retval
 
     @staticmethod
@@ -418,6 +510,8 @@ class _SessionTransport:
         lines = []
         for reply in replies:
             if reply.get("ts") == parent_ts:
+                continue
+            if not self._is_wanted_author(reply):
                 continue
             lines.append(f"  {self._user_name(reply)}: {reply.get('text', '')}")
         retval = lines
@@ -451,7 +545,7 @@ class _SessionTransport:
         self._user_names = {}
         oldest = time.time() - self._since_hours * 3600
         signals: list[Signal] = []
-        for channel_name, channel_id in self._resolve_channels().items():
+        for channel_name, channel_id in self._resolve_channels():
             history = self._client.paginate(
                 "conversations.history",
                 "messages",
@@ -460,6 +554,8 @@ class _SessionTransport:
             )
             for message in history:
                 if not self._is_top_level(message):
+                    continue
+                if not self._is_wanted_author(message):
                     continue
                 signals.append(self._signal(channel_name, channel_id, message))
         retval = signals
@@ -496,6 +592,7 @@ def _build_agentmail_transport(cfg: dict) -> Source:
         from_contains=cfg.get("from_contains"),
         subject_contains=cfg.get("subject_contains"),
         fetch_body=bool(cfg.get("fetch_body", True)),
+        include_trash=bool(cfg.get("include_trash", False)),
         label=f"slack-workspace:{workspace}",
         timeout=int(cfg.get("timeout", 30)),
     )
@@ -524,7 +621,13 @@ def _build_session_transport(cfg: dict) -> Source:
     if not channels:
         raise RuntimeError(
             "slack-workspace source (transport: session) needs a non-empty "
-            "'channels' list of channel names"
+            "'channels' list of channel names or conversation ids"
+        )
+    from_users = cfg.get("from_users") or []
+    if not isinstance(from_users, list):
+        raise RuntimeError(
+            "slack-workspace source (transport: session): 'from_users' must be a "
+            "list of user ids"
         )
 
     # Local import on purpose: pycookiecheat is optional, and the #40 import
@@ -563,6 +666,7 @@ def _build_session_transport(cfg: dict) -> Source:
         channels=list(channels),
         since_hours=float(cfg.get("since_hours", 24)),
         include_threads=bool(cfg.get("include_threads", True)),
+        from_users=[str(u) for u in from_users],
     )
     return retval
 
