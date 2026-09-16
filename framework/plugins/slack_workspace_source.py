@@ -74,12 +74,15 @@ a guarantee that can be switched off in a config file is not one.
     `conversations.info` call for a `meta.channel` label — the channel's name,
     or for a DM the other member's display name through `users.info`. A label
     that cannot be read falls back to the id rather than failing the run.
-  - `from_users` (optional) keeps only top-level messages posted by those
-    ids. A message's author is its `user`, or the `bot_profile.user_id` behind
-    a bot message; a `B...` id matches a message's `bot_id`, for integrations
-    that post with no user at all. This is what makes a bot's DM usable: the
+  - `from_users` (optional) keeps only messages posted by those ids. A
+    message's author is its `user`, or the `bot_profile.user_id` behind a bot
+    message; a `B...` id matches a message's `bot_id`, for integrations that
+    post with no user at all. This is what makes a bot's DM usable: the
     conversation also holds your own replies, and without the filter they
-    would be scored as signals too.
+    would be scored as signals too. It applies to thread replies as well, so a
+    kept message folds in only the replies from a wanted author — otherwise
+    the text of a filtered signal would carry the very writing the filter
+    excludes. A parent whose replies are all filtered out folds nothing.
   - `conversations.history` is read per channel with `oldest = now -
     since_hours`, paginated by cursor. Only top-level messages become
     Signals; thread replies that Slack surfaces in history (broadcasts) are
@@ -476,15 +479,22 @@ class _SessionTransport:
         return retval
 
     def _is_wanted_author(self, message: dict[str, Any]) -> bool:
-        """`from_users` membership. Empty config means every author."""
+        """`from_users` membership. Empty config means every author.
+
+        Applied to thread replies as well as to top-level messages: a reply is
+        as much someone's writing as a post, and a filtered conversation that
+        folded the filtered-out author's replies into the text would hand the
+        scorer exactly what the filter was meant to keep out.
+        """
         if not self._from_users:
-            return True
-        user_id = self._message_user_id(message)
-        if user_id and user_id in self._from_users:
-            return True
-        # A `B...` id may be configured instead, for an integration whose
-        # messages carry no user at all.
-        retval = bool(message.get("bot_id")) and message["bot_id"] in self._from_users
+            retval = True
+        else:
+            user_id = self._message_user_id(message)
+            # A `B...` id may be configured instead, for an integration whose
+            # messages carry no user at all.
+            retval = (user_id in self._from_users) or (
+                message.get("bot_id") in self._from_users
+            )
         return retval
 
     @staticmethod
@@ -500,6 +510,8 @@ class _SessionTransport:
         lines = []
         for reply in replies:
             if reply.get("ts") == parent_ts:
+                continue
+            if not self._is_wanted_author(reply):
                 continue
             lines.append(f"  {self._user_name(reply)}: {reply.get('text', '')}")
         retval = lines
