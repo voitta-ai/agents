@@ -47,12 +47,13 @@
   },
   "destination": {
     "type": "slack",
-    "_comment": "One route mirrors the pipeline this replaces, which posts everything to a single channel. To restore two tiers, add a route with min_score 30 and its own webhook env var; the destination sends to the highest matching route only.",
+    "_comment": "One route mirrors the pipeline this replaces, which posts everything to a single channel. To restore two tiers, add a route with min_score 30 and its own webhook env var; the destination sends to the highest matching route only. 'footer' and 'show_reasons' (issue #64) may be set here, where they apply to every route, or on one route, which then overrides them. 'show_reasons' (default true) renders the scorer's reasons as a bulleted block under the score. 'footer' is a string appended verbatim as the last line of every message that route sends; it is deliberately absent from this example, because any non-empty string is valid and a placeholder left in by accident would post itself on every real lead. Add it only when a standing line is actually required, with the real text.",
     "routes": [
       {
         "min_score": 10,
         "webhook_env": "SLACK_LEADS_WEBHOOK",
-        "channel": "#<leads-channel>"
+        "channel": "#<leads-channel>",
+        "show_reasons": true
       }
     ]
   }
