@@ -51,6 +51,13 @@ Two behaviours worth knowing:
     The runner then marks nothing seen and the next run re-proposes, which is
     the at-least-once behaviour the rest of the framework has.
 
+The proposal message goes out through `framework.slack.post_message`, so the
+drafted Markdown arrives as mrkdwn and a long proposal is split into several
+messages rather than truncated (issue #73). What is *recorded* is untouched:
+`body_md` in the proposals store stays Markdown, because the publish step that
+later renders it wants Markdown, not Slack's dialect. `username` /
+`icon_emoji` / `icon_url` (issue #77) name the proposal's message.
+
 The proposal is the delivery. The runner marks signals seen after `flush()`
 returns, and this `flush()` returns only once the proposal is on disk and
 announced, so the seen-store semantics need no change: an approved-then-failed
@@ -61,11 +68,10 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-import requests
-
 from framework.interfaces import Destination, ScoredSignal
 from framework.proposals import ProposalStore, proposals_path
 from framework.registry import build_destination, register_destination
+from framework.slack import SlackIdentity, identity_from_config, post_message
 
 
 class ApprovalDestination:
@@ -76,6 +82,7 @@ class ApprovalDestination:
         store: ProposalStore,
         webhook_url: str,
         timeout: int = 30,
+        identity: SlackIdentity | None = None,
     ):
         render = getattr(wrapped, "render", None)
         if not callable(render):
@@ -90,18 +97,15 @@ class ApprovalDestination:
         self._store = store
         self._webhook_url = webhook_url
         self._timeout = timeout
+        self._identity = identity or SlackIdentity()
 
     def send(self, scored: ScoredSignal) -> None:
         self._wrapped.send(scored)
 
     def _post(self, text: str) -> None:
-        resp = requests.post(
-            self._webhook_url,
-            json={"text": text},
-            headers={"Content-type": "application/json"},
-            timeout=self._timeout,
+        post_message(
+            self._webhook_url, text, timeout=self._timeout, identity=self._identity
         )
-        resp.raise_for_status()
 
     def flush(self) -> None:
         try:
@@ -116,7 +120,7 @@ class ApprovalDestination:
             )
 
         title = rendered.get("title") or "Proposal"
-        text = f"*{title}*\n\n{rendered['body_md']}"
+        text = f"**{title}**\n\n{rendered['body_md']}"
         footer = rendered.get("footer")
         if footer:
             text += f"\n\n{footer}"
@@ -175,5 +179,6 @@ def build(cfg: dict) -> Destination:
         store=ProposalStore(proposals_path(Path(workspace))),
         webhook_url=webhook_url,
         timeout=int(cfg.get("timeout", 30)),
+        identity=identity_from_config(cfg, "approval destination"),
     )
     return retval
