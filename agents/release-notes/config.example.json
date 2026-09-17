@@ -23,9 +23,52 @@
     "rules": []
   },
   "destination": {
-    "type": "digest",
+    "type": "approval",
+    "_comment": "The post is published only after a trusted human replies 'do <id>' in the approvals channel; until then the digest is a proposal in <workspace>/state/proposals.json.",
     "webhook_env": "SOME_WEBHOOK",
-    "title": "Release notes",
-    "prompt": "Write this week's release notes from the releases below. Group by repo, keep each project's own wording where it is good, and skip version bumps with no user-visible change."
+    "wrap": {
+      "type": "digest",
+      "webhook_env": "SOME_WEBHOOK",
+      "title": "Release notes",
+      "prompt": "Write this week's release notes from the releases below. Group by repo, keep each project's own wording where it is good, and skip version bumps with no user-visible change.",
+      "fields": {
+        "title": "A post title, under 70 characters.",
+        "body_md": "The post itself, Markdown."
+      }
+    },
+    "actions": [
+      "publish-release-notes"
+    ]
+  },
+  "approvals": {
+    "channel_id": "C0123456789",
+    "bot_token_env": "SOME_BOT_TOKEN",
+    "trusted_user_ids": [
+      "U0123456789"
+    ],
+    "hours": 24
+  },
+  "actions": {
+    "publish-release-notes": {
+      "_comment": "tags are the standing ones plus {repos}, which the digest computes from the signals (the distinct meta['repo'] of this run's releases) rather than from the model's reply. It expands to a comma-separated string and becomes one tag per repo; blank entries are dropped and duplicates collapse, so a repo named after the project does not tag the post twice.",
+      "steps": [
+        {
+          "type": "wordpress-publish",
+          "site": "<site>.wordpress.com",
+          "mode": "draft",
+          "token_env": "WORDPRESS_ACCESS_TOKEN",
+          "categories": [
+            "voitta"
+          ],
+          "tags": [
+            "voitta",
+            "voitta-ai",
+            "agents",
+            "release-notes",
+            "{repos}"
+          ]
+        }
+      ]
+    }
   }
 }

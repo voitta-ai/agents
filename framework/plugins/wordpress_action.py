@@ -12,7 +12,7 @@ URL and id to the steps after it.
       "mode": "draft",
       "token_env": "WORDPRESS_ACCESS_TOKEN",
       "categories": ["releases"],
-      "tags": []
+      "tags": ["voitta", "release-notes", "{repos}"]
     }
 
 Config keys:
@@ -26,11 +26,33 @@ Config keys:
                   at once and the returned `url` is the public permalink.
   - `token_env`   env var holding the OAuth2 bearer token; default
                   `WORDPRESS_ACCESS_TOKEN`.
-  - `categories`  list of category names; optional.
-  - `tags`        list of tag names; optional.
+  - `categories`  list of category names; optional. Templated, see below.
+  - `tags`        list of tag names; optional. Templated, see below.
 
 `execute(payload, context)` reads `payload["title"]` and `payload["body_md"]`
 and returns `{"url": ..., "post_id": ...}` for later steps to template.
+
+**Taxonomy is templated, and per-run (issue #75).** The interesting tags on a
+weekly release-notes post are not static: they are which repos actually
+released. So every `categories` and `tags` entry goes through
+`framework.templating.render_template` against the payload, exactly like a
+step's other fields, and an entry that expands to a comma-separated string
+becomes separate names — `"{repos}"` with three repos in the payload is three
+tags, not one tag with commas in it. Blank entries are dropped instead of
+creating an empty tag (a source whose signals carry no `repo` yields an empty
+`{repos}`), and duplicates collapse, compared case-insensitively, keeping the
+first spelling: the standing tag list and the per-run repos overlap whenever a
+repo is named after the project. Order is the config's, first occurrence first.
+
+Take the per-run values from the digest's `meta_values` (`{repos}`), which the
+destination computes from the signals, rather than from a field the model
+drafted. A tag list is not prose: it must not change because a reply was worded
+differently, and a model asked for "the repositories covered" can leave one out.
+
+Splitting on commas is not a behaviour change for a real static config, because
+the API takes these as comma-separated strings in the first place, so a name
+with a comma in it was never sendable. A static entry with `{` or `}` in it is
+now a template error, which is the same rule every other action field follows.
 
 The token, the conversion and the failure modes all follow the
 `wordpress-com-publish` skill (voitta-ai/skillz), which is the reference for
@@ -97,6 +119,7 @@ from markdown_it import MarkdownIt
 
 from framework.interfaces import Action
 from framework.registry import register_action
+from framework.templating import render_template
 
 _API = "https://public-api.wordpress.com/rest/v1.1"
 _MODES = ("draft", "publish")
@@ -229,6 +252,21 @@ def _markdown_to_blocks(body_md: str) -> str:
     return retval
 
 
+def _taxonomy(entries: list[str], values: dict[str, Any]) -> list[str]:
+    """Render taxonomy entries, split on commas, drop blanks, collapse duplicates."""
+    names: list[str] = []
+    seen: set[str] = set()
+    for entry in entries:
+        for part in render_template(entry, values).split(","):
+            name = part.strip()
+            key = name.casefold()
+            if name and key not in seen:
+                seen.add(key)
+                names.append(name)
+    retval = names
+    return retval
+
+
 def _keychain_token() -> str:
     """The skill's Keychain fallback; empty when absent or not on macOS."""
     retval = ""
@@ -296,10 +334,12 @@ class WordPressPublishAction:
             "content": _markdown_to_blocks(payload["body_md"]),
             "status": self.mode,
         }
-        if self.categories:
-            form["categories"] = ",".join(self.categories)
-        if self.tags:
-            form["tags"] = ",".join(self.tags)
+        categories = _taxonomy(self.categories, payload)
+        if categories:
+            form["categories"] = ",".join(categories)
+        tags = _taxonomy(self.tags, payload)
+        if tags:
+            form["tags"] = ",".join(tags)
         resp = requests.post(
             f"{_API}/sites/{self.site}/posts/new",
             headers={"Authorization": f"Bearer {token}"},
