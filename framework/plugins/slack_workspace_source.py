@@ -98,6 +98,14 @@ a guarantee that can be switched off in a config file is not one.
     `channel` (the name), `user` (display name), `reply_count`,
     `permalink_source` (`"api"` or `"constructed"`) and
     `transport: "session"`.
+  - `meta["job_url"]` is the message's first http(s) link, read out of
+    Slack's `<url|label>` markup (or, for a client that does not use it, out
+    of the prose), and `meta["apply_url"]` a later link whose
+    label says "apply" and whose URL differs from it (issue #76). Both keys
+    are absent when there is nothing to put in them — notably `apply_url` for
+    a lead bot whose "Apply Now" link *is* the job page; see `_link_meta`.
+    A destination that wants to render a link therefore reads
+    `job_url` and falls back to `url` (the permalink to the message itself).
   - User ids are rendered to display names through `users.info`, cached for
     the run.
   - HTTP 429 (and the JSON-level `ratelimited` error) honour `Retry-After`
@@ -168,6 +176,7 @@ Contract: see docs/PLUGIN-CONTRACT.md.
 
 from __future__ import annotations
 
+import html
 import os
 import re
 import sys
@@ -236,9 +245,130 @@ _CHANNEL_ID = re.compile(r"^[CDG][A-Z0-9]{8,}$")
 # not allow it (issue #69). It is a property of the workspace, not of the call.
 _RESTRICTED = "enterprise_is_restricted"
 
+# Slack's own link markup, `<url>` or `<url|label>` (issue #76). Restricted to
+# http(s) on purpose: the same syntax carries `<@U123>`, `<#C123|name>` and
+# `<!here>`, which are mentions, not links. Slack escapes `&`, `<` and `>` in
+# message text, so a captured URL is unescaped before it is handed on, or a
+# query string would arrive with `&amp;` in it.
+_SLACK_LINK = re.compile(r"<(https?://[^>|\s]+)(?:\|([^>]*))?>")
+_BARE_URL = re.compile(r"(?<![<|])https?://[^\s<>|]+")
+_APPLY_LABEL = re.compile(r"\bapply\b", re.I)
+
+# Sentence punctuation that ends a URL in prose rather than belonging to it.
+# A bracket is not here: a real URL can end in one, so brackets are trimmed
+# only when they are unbalanced (see `_trim_url`).
+_URL_TAIL = "".join((".", ",", ";", ":", "!", "?", "'", '"', "‘", "’", "“", "”"))
+_URL_BRACKETS = (("(", ")"), ("[", "]"), ("{", "}"))
+
 _USER_AGENT = "Mozilla/5.0"
 _PAGE_LIMIT = 200
 _MAX_RATE_LIMIT_RETRIES = 5
+
+
+def _link_meta(text: str) -> dict[str, str]:
+    """`job_url` and, when there is a separate one, `apply_url` (issue #76).
+
+    A lead arrives as a bot message whose body is prose: the link a human
+    would click is in Slack's markup, not in a structured field, so it is read
+    back out of the text. `job_url` is the message's first http(s) link, which
+    for a notification bot is the thing being notified about (the job title is
+    a link). `apply_url` is a later link whose label says "apply" *and* points
+    somewhere else.
+
+    That last condition is what the measurement called for. In the live lead
+    DM this was written against, every one of the 654 "Apply Now" links across
+    760 messages was byte-identical to that message's job link: the bot does
+    not publish an apply URL, and applying starts from a button on the job
+    page. The portal does have an application page of its own — a few
+    *post*-application follow-up messages link one directly — but its address
+    is never given out in a lead, and assembling one from the job id would put
+    a fabricated link in front of an operator. So the key is absent, and a
+    consumer falls back to `job_url`. A bot that does post a distinct apply
+    link gets both keys with no change here.
+
+    Markup and bare URLs mix in one message, so the two are searched per slot
+    rather than one falling back to the other wholesale: a markup job link and
+    a bare apply link in the same message yield both keys. For a bare URL there
+    is no label to read, so the line it sits on stands in for one.
+
+    Keys are absent rather than empty when nothing is found: a caller tests
+    membership and never has to tell "no link" from "a link that is nothing".
+    """
+    body = text or ""
+    marked = [(html.unescape(url), label or "") for url, label in _SLACK_LINK.findall(body)]
+    bare = _bare_links(body)
+
+    retval: dict[str, str] = {}
+    ordered = marked or bare
+    if not ordered:
+        return retval
+
+    job_url = ordered[0][0]
+    retval["job_url"] = job_url
+
+    apply_url = _first_apply(ordered[1:], job_url)
+    if not apply_url and marked:
+        # The job link was markup; an apply link in the same message may still
+        # be bare. Searched per slot, or a mixed message loses it entirely.
+        apply_url = _first_apply(bare, job_url)
+    if apply_url:
+        retval["apply_url"] = apply_url
+    return retval
+
+
+def _first_apply(candidates: list[tuple[str, str]], job_url: str) -> str:
+    """First candidate whose describing text says "apply" and that is not the job.
+
+    The describing text is a markup link's label, or the line a bare URL sits
+    on. "apply" is matched as a whole word so an "Applicant tracking" link is
+    not mistaken for one.
+    """
+    retval = ""
+    for url, described_by in candidates:
+        if url != job_url and _APPLY_LABEL.search(described_by):
+            retval = url
+            break
+    return retval
+
+
+def _bare_links(text: str) -> list[tuple[str, str]]:
+    """Unwrapped URLs in `text`, each with the line it appears on.
+
+    Not every client wraps its URLs in Slack's markup. A URL written in prose
+    runs into whatever punctuation follows it, so the match is trimmed: a
+    trailing full stop or comma cannot be part of the address, while a closing
+    bracket can, and is kept only when the URL opens one to match. Getting this
+    wrong is not cosmetic — an action built on `job_url` would navigate to the
+    404 that a trailing `.` produces.
+    """
+    retval = []
+    for match in _BARE_URL.finditer(text):
+        url = _trim_url(html.unescape(match.group(0)))
+        if not url:
+            continue
+        line_start = text.rfind("\n", 0, match.start()) + 1
+        line_end = text.find("\n", match.end())
+        line = text[line_start:] if line_end == -1 else text[line_start:line_end]
+        retval.append((url, line))
+    return retval
+
+
+def _trim_url(url: str) -> str:
+    """Drop sentence punctuation a URL picked up from the prose around it."""
+    retval = url
+    while retval:
+        last = retval[-1]
+        if last in _URL_TAIL:
+            retval = retval[:-1]
+            continue
+        unbalanced = any(
+            last == close and retval.count(close) > retval.count(opener)
+            for opener, close in _URL_BRACKETS
+        )
+        if not unbalanced:
+            break
+        retval = retval[:-1]
+    return retval
 
 
 class SlackAPIError(RuntimeError):
@@ -649,6 +779,10 @@ class _SessionTransport:
                 "reply_count": reply_count,
                 "permalink_source": permalink_source,
                 "transport": "session",
+                # From the parent message only: a reply's links belong to the
+                # reply, and folding them in would attach someone else's link
+                # to this signal.
+                **_link_meta(message.get("text", "")),
             },
         )
         return retval
@@ -671,6 +805,15 @@ class _SessionTransport:
                 if not self._is_wanted_author(message):
                     continue
                 signals.append(self._signal(channel_name, channel_id, message))
+        if signals and not any("job_url" in s.meta for s in signals):
+            # Extraction reads a bot's prose, so a format change on the bot's
+            # side shows up here as a field that is simply always missing. Say
+            # it once, or the first anyone learns of it is a dead button.
+            print(
+                f"slack-workspace source (transport: session): no links found in any of "
+                f"{len(signals)} message(s); meta.job_url is unset for all of them",
+                file=sys.stderr,
+            )
         retval = signals
         return retval
 

@@ -54,6 +54,21 @@ A reply that is not a JSON object carrying every configured key raises
 proposal. Half a release announcement is worse than none: the next run asks
 again with the same signals, because nothing was marked seen.
 
+`meta_values` (issue #75) is the other half of that. A drafted field is the
+model's prose, and prose is the wrong source for a tag list: a post's taxonomy
+must not change because the model phrased its answer differently. So `render()`
+also returns values the destination computed itself from the buffered signals,
+not from the reply. The first is `repos`: the distinct `meta["repo"]` values of
+the items the model was shown, comma-separated, which for the release-notes
+agent is exactly the repos that released this run. They appear twice in the
+rendered result — once collected under `meta_values`, for a caller that wants to
+know which values were computed rather than drafted, and once as plain top-level
+keys, because an action's steps template against the proposal payload by bare
+name (`framework/templating.py` refuses `{meta_values[repos]}` for reaching into
+a value) and `{repos}` has to resolve. A field name that collides with one of
+them is refused at build time rather than shadowed, so a config cannot end up
+with a taxonomy the model wrote.
+
 The digest the model writes is Markdown, and it goes out through
 `framework.slack.post_message`, which renders it as mrkdwn and splits a digest
 past the block limit into several messages in order (issue #73). `render()` is
@@ -98,6 +113,12 @@ _DECODER = json.JSONDecoder()
 # silently lost drafted content. `title` and `body_md` are absent on purpose:
 # drafting them is the point, and `title`'s override is handled.
 _RESERVED_FIELDS = frozenset({"empty", "footer", "items", "model"})
+
+# Keys `render()` computes from the signals themselves (issue #75). Reserved for
+# the same reason as the ones above, and one more: these exist precisely so a
+# taxonomy can come from something the model never wrote, which a drafted field
+# of the same name would quietly undo.
+_COMPUTED_FIELDS = frozenset({"meta_values", "repos"})
 
 
 class DigestFieldError(RuntimeError):
@@ -241,6 +262,24 @@ class DigestDestination:
         retval = "\n".join(lines)
         return retval
 
+    def _meta_values(self) -> dict[str, str]:
+        """Values computed from the buffered signals, for taxonomy and the like.
+
+        `repos`: the distinct `meta["repo"]` values, in first-seen order,
+        comma-separated. Taken from the same `max_signals` slice the model is
+        shown, so the tags on a post always describe the items in it; an item
+        omitted past `max_signals` is not in the prose either. A source whose
+        signals carry no `repo` yields an empty string, which the WordPress
+        action drops rather than turning into an empty tag.
+        """
+        repos: list[str] = []
+        for scored in self._buffered[: self.max_signals]:
+            repo = str((scored.signal.meta or {}).get("repo") or "").strip()
+            if repo and repo not in repos:
+                repos.append(repo)
+        retval = {"repos": ", ".join(repos)}
+        return retval
+
     def _post(self, text: str) -> None:
         post_message(text=text, webhook_url=self.webhook_url, timeout=self.timeout,
                      identity=self.identity)
@@ -257,6 +296,7 @@ class DigestDestination:
         where to surface it. Does not clear the buffer, so it can be called more
         than once per run.
         """
+        meta_values = self._meta_values()
         if not self._buffered:
             retval = {
                 "title": self.title,
@@ -264,6 +304,8 @@ class DigestDestination:
                 "footer": "",
                 "empty": True,
                 "items": 0,
+                "meta_values": meta_values,
+                **meta_values,
             }
             return retval
 
@@ -285,12 +327,17 @@ class DigestDestination:
             "empty": False,
             "items": len(self._buffered),
             "model": self.llm.model_used,
+            "meta_values": meta_values,
         }
         # The configured fields are the template names an approved action's
         # steps render against, so they go in whole, after the keys above:
         # a field named `title` is the model's post title and replaces the
         # static config one, which is a label for the Slack message.
         retval.update(drafted)
+        # After the drafted fields, so the order states the precedence: a
+        # computed value is never overwritten by a model-written one. Build-time
+        # validation refuses that collision outright, and this is the belt.
+        retval.update(meta_values)
         return retval
 
     def _complete_fields(self, user: str) -> dict[str, str]:
@@ -389,6 +436,14 @@ def build(cfg: dict) -> Destination:
                 "render()'s own keys; rename them. Reserved: "
                 f"{', '.join(sorted(_RESERVED_FIELDS))} "
                 "('title' and 'body_md' are yours to draft)"
+            )
+        computed = sorted(name for name in fields if name in _COMPUTED_FIELDS)
+        if computed:
+            raise RuntimeError(
+                f"digest destination's fields {', '.join(computed)} are computed "
+                "from the signals themselves, so asking the model for them would "
+                "shadow a value it cannot get wrong; rename them. Computed: "
+                f"{', '.join(sorted(_COMPUTED_FIELDS))}"
             )
 
     llm = build_client(cfg, what="digest destination")

@@ -135,6 +135,9 @@ Approval-gated actions), so avoid re-installing while one is executing.
   On an Enterprise Grid org a user session cannot list channels or ask for
   permalinks, so names raise with ids named as the remedy and links are
   constructed (`meta.permalink_source`); ids work there unchanged (issue #69).
+  A signal's `meta` carries `job_url` (the message's first link) and, when a
+  bot posts a distinct one, `apply_url`, so a destination can link what the
+  message is about rather than only the message (issue #76).
   Read-only by construction: the client refuses every Slack method outside a
   fixed allowlist before any HTTP. Needs `pip install '.[slack-session]'`
   (pycookiecheat). See issue #45.
@@ -244,6 +247,16 @@ field (or any of them is empty), the run asks once more and then fails without
 recording a proposal — nothing is marked seen, so the next run drafts again
 rather than publishing half an announcement.
 
+Alongside the drafted fields, `render()` returns values the digest computed from
+the signals rather than from the reply (issue #75), as `meta_values` and as
+plain template names. The first is `repos`: the distinct `meta["repo"]` of the
+items the model was shown, comma-separated, so a release-notes post can be
+tagged with the repos that actually released. Use those for anything that must
+not move when the model phrases its answer differently — a taxonomy, a routing
+key — and a drafted field for prose. `meta_values` and `repos` are refused as
+field names, so a config cannot end up asking the model for a value it already
+has.
+
 `min_score` (default 0, no gate) drops signals scoring below it before the
 model sees them, and they are not in the item count either. They are still
 marked seen. With a gate set, the item list the model reads also carries each
@@ -284,11 +297,16 @@ payload merged with each step's returned dict. Shipped:
   `payload["title"]` + `payload["body_md"]` (Markdown) into a WordPress.com post
   and returns `{"url", "post_id"}` for later steps. Config:
   `{"type": "wordpress-publish", "site": "<site>.wordpress.com", "mode": "draft",
-  "token_env": "WORDPRESS_ACCESS_TOKEN", "categories": [], "tags": []}`.
+  "token_env": "WORDPRESS_ACCESS_TOKEN", "categories": ["releases"],
+  "tags": ["release-notes", "{repos}"]}`.
   `mode` is `draft` (safety valve; `url` is the preview) or `publish` (`url` is
   the public permalink). The token comes from `token_env`, else the macOS
   Keychain item `wpcom_token` the `wordpress-com-publish` skill writes; missing
   or rejected tokens fail loud naming that skill as the fix. See issue #47.
+  `categories` and `tags` entries are templates (issue #75): an entry that
+  expands to a comma-separated string becomes separate names, blanks are
+  dropped, and duplicates collapse case-insensitively keeping the first
+  spelling, so standing tags and per-run `{repos}` can overlap freely.
 
 ## Operating notes
 
