@@ -1,5 +1,5 @@
 {
-  "_comment": "Copy into a workspace directory as config.json (outside any git checkout) and fill in real values. Secrets never live here: credentials are named by env var, not stored. One agent per community workspace: give each its own workspace directory and 'agent' name so their dedupe state does not collide.",
+  "_comment": "Copy into a workspace directory as config.json (outside any git checkout) and fill in real values. Give the destination block a 'username' and an 'icon_emoji' (issue #77) when several of these digests share one webhook, so each arrives as itself rather than reading as one long message; they are deliberately not placeholders here, because whatever is written is posted as written. Secrets never live here: credentials are named by env var, not stored. One agent per community workspace: give each its own workspace directory and 'agent' name so their dedupe state does not collide.",
   "agent": "slack-workspace-example",
   "schedule": "0 */6 * * *",
   "source": {

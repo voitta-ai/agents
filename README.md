@@ -292,6 +292,28 @@ payload merged with each step's returned dict. Shipped:
 
 ## Operating notes
 
+### Slack renders mrkdwn, not Markdown
+
+Everything this repo posts to a Slack webhook goes through one function,
+`framework/slack.py::post_message`, which converts Markdown to Slack's own
+mrkdwn on the way out (issue #73): headings become bold lines, `[text](url)`
+becomes `<url|text>`, `**bold**` becomes `*bold*`, list markers become bullets,
+and code spans and fenced blocks are left exactly as written. Text that holds
+no Markdown is posted unchanged. Code in this repo that builds a header writes
+Markdown (`**Title**`) for the same reason: there is one place that renders.
+
+A message longer than a Slack block (3000 characters) is posted as **several
+messages in order**, split at a paragraph boundary where there is one, never
+truncated; a split inside a fenced block closes and reopens the fence. Only the
+Slack rendering changes: `body_md` in a recorded proposal, which is what a
+WordPress publish step later sends, stays Markdown.
+
+Every webhook destination (`slack`, `digest`, `approval`) also takes `username`
+and `icon_emoji` (with the colons, `:rocket:`) or `icon_url` (issue #77). Several
+agents usually share one webhook, and without them two digests arriving seconds
+apart read as one message. With none of them set the payload is exactly what it
+was before: `{"text": ...}`.
+
 ### Secrets live in the environment, never in config
 
 Each destination names the env var holding its credential (`webhook_env`,
