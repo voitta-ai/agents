@@ -117,6 +117,9 @@ from framework.proposals import (
 from framework.registry import build_action
 
 _SLACK_API = "https://slack.com/api"
+# Methods that write and therefore always take a JSON body, whatever this
+# particular call happens to pass. `_needs_json_body` catches the rest.
+_WRITE_METHODS = ("chat.postMessage", "chat.update", "chat.postEphemeral")
 _REPLY_RE = re.compile(r"^(do|skip)\s+(\S+)$")
 _DEFAULT_HOURS = 24
 
@@ -241,8 +244,23 @@ class SlackApiError(RuntimeError):
     """Slack answered, but with `ok: false`."""
 
 
+def _needs_json_body(params: dict[str, Any]) -> bool:
+    """Whether these params have to go as a JSON body rather than a query string.
+
+    The rule is the shape of the payload, not a list of method names. A param
+    that is a list or a dict (`blocks`, `attachments`) cannot survive a query
+    string: `requests` flattens a list of dicts into one repeated key per dict
+    *key*, so `blocks=[{"type": "section", "text": {...}}]` goes out as
+    `blocks=type&blocks=text` and the message arrives with every block gone.
+    That is how `chat.update` was broken when it was added as a caller and the
+    branch here still only named `chat.postMessage` (issue #74 review).
+    """
+    retval = any(isinstance(value, (list, dict)) for value in params.values())
+    return retval
+
+
 def _slack_call(method: str, token: str, timeout: int, **params: Any) -> dict[str, Any]:
-    if method == "chat.postMessage":
+    if method in _WRITE_METHODS or _needs_json_body(params):
         resp = requests.post(
             f"{_SLACK_API}/{method}",
             headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},

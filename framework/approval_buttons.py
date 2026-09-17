@@ -50,9 +50,17 @@ Two things a reader should not be surprised by:
     what the operator was trying not to publish. The proposal stays pending,
     so Post or Discard still work.
 
-Nothing here logs a token, a payload or a message body: the stdout line per
-interaction is the proposal id, the verdict and the user id, which is what an
-operator needs to see in `approvals.listen.log`.
+Nothing here logs a token, a payload, a message body or a `response_url`: the
+stdout line per interaction is the proposal id, the verdict and the user id,
+which is what an operator needs to see in `approvals.listen.log`. A
+`response_url` is a bearer capability (30 minutes, five uses), and the
+`requests` exception for a failed post carries the URL it posted to, so both
+ways of talking back sanitise their failures into `ResponderError` before
+anything can print them.
+
+A click is acted on only if it came from the configured `channel_id` and from
+a user in `trusted_user_ids`; either check failing is an ephemeral refusal and
+nothing else.
 """
 from __future__ import annotations
 
@@ -224,11 +232,36 @@ def outcome_line(status: str, variant: str, user_id: str, when: str, detail: str
     return retval
 
 
+class ResponderError(RuntimeError):
+    """Talking back to Slack failed. Carries no URL, no token, no body.
+
+    Raised in place of the underlying `requests` exception, whose message
+    embeds the request URL. For `response_url` that URL *is* the credential --
+    a bearer capability good for 30 minutes and five uses -- and its ordinary
+    failure modes (expired, used up, a Slack-side blip) would otherwise write
+    it into `approvals.listen.error.log`, which the listener's catch-all
+    prints to. Losing the URL from the message costs nothing: there is exactly
+    one response_url per interaction, and the proposal id in the same line
+    says which.
+    """
+
+
+def _sanitised(what: str, exc: Exception) -> ResponderError:
+    """`exc` without whatever URL it was carrying."""
+    detail = getattr(getattr(exc, "response", None), "status_code", None)
+    if detail is not None:
+        retval = ResponderError(f"{what} failed: HTTP {detail}")
+        return retval
+    retval = ResponderError(f"{what} failed: {type(exc).__name__}")
+    return retval
+
+
 class SlackResponder:
     """The two ways this module talks back: edit the message, or one user only.
 
     A thin seam rather than the full web client: the listener is verified
     offline with a fake in its place, and everything it needs is two calls.
+    Both sanitise their failures (see `ResponderError`).
     """
 
     def __init__(self, bot_token: str, timeout: int = 30):
@@ -236,15 +269,21 @@ class SlackResponder:
         self._timeout = timeout
 
     def update(self, channel: str, ts: str, text: str, blocks: list[dict[str, Any]]) -> None:
-        _slack_call(
-            "chat.update",
-            self._bot_token,
-            self._timeout,
-            channel=channel,
-            ts=ts,
-            text=text,
-            blocks=blocks,
-        )
+        try:
+            _slack_call(
+                "chat.update",
+                self._bot_token,
+                self._timeout,
+                channel=channel,
+                ts=ts,
+                text=text,
+                blocks=blocks,
+            )
+        except Exception as exc:
+            # The API URL is not secret, but the token is in the headers and a
+            # transport error can quote a redirect target; one rule for both
+            # calls is easier to keep true than two.
+            raise _sanitised("chat.update", exc) from None
 
     def ephemeral(self, response_url: str, text: str) -> None:
         """Say something to the clicker alone, visible to nobody else.
@@ -253,12 +292,15 @@ class SlackResponder:
         interaction hands us, it needs no extra scope, and an approval refusal
         should not be an audit-visible message in the channel.
         """
-        resp = requests.post(
-            response_url,
-            json={"response_type": "ephemeral", "replace_original": False, "text": text},
-            timeout=self._timeout,
-        )
-        resp.raise_for_status()
+        try:
+            resp = requests.post(
+                response_url,
+                json={"response_type": "ephemeral", "replace_original": False, "text": text},
+                timeout=self._timeout,
+            )
+            resp.raise_for_status()
+        except Exception as exc:
+            raise _sanitised("ephemeral reply", exc) from None
 
 
 def handle_block_action(
@@ -287,6 +329,21 @@ def handle_block_action(
     message = payload.get("message") or {}
     ts = str(message.get("ts") or (payload.get("container") or {}).get("message_ts") or "")
     clicked_at = str(action.get("action_ts") or "")
+
+    # The reply path is scoped to one channel by construction: it only ever
+    # reads `conversations.history` for `channel_id`. A click arrives from
+    # wherever the message was, so the same scope is checked here rather than
+    # assumed. In a one-app-per-workspace deployment nothing else can carry a
+    # matching action_id, but that is a property of the deployment, not of
+    # this code.
+    if channel != cfg.channel_id:
+        responder.ephemeral(
+            response_url,
+            f"Proposal {proposal_id} is approved in this agent's own approval channel, "
+            "not here. Nothing ran.",
+        )
+        retval = f"proposal={proposal_id} verdict=refused user={user_id} (wrong channel)"
+        return retval
 
     if user_id not in cfg.trusted_user_ids:
         responder.ephemeral(
@@ -438,8 +495,11 @@ def run_listener(cfg: ApprovalsConfig) -> int:
 
     client.socket_mode_request_listeners.append(on_request)
     print(f"agent={cfg.agent} listening for approval clicks (socket mode)", flush=True)
-    client.connect()
     try:
+        # Inside the try: a rejected app token fails the handshake here, and
+        # launchd restarts this job (KeepAlive), so the socket has to be closed
+        # on the way out or every restart leaks one.
+        client.connect()
         _block_forever()
     except KeyboardInterrupt:
         print(f"agent={cfg.agent} listener stopped", flush=True)

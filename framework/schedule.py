@@ -25,7 +25,9 @@ serve both. With `"approvals": {"listen": true}` (issue #74) there is a third,
 `<label>.approvals.listen`, running `agent approvals --listen`: a Socket Mode
 client for approval button clicks. It is the one job with no schedule at all --
 `KeepAlive` is true and launchd restarts it whenever it exits, which is how a
-dropped connection or a slept laptop becomes a reconnect. The polling job stays
+dropped connection or a slept laptop becomes a reconnect. `ThrottleInterval`
+bounds that: a listener that cannot start at all (revoked app token, missing
+dependency) retries once a minute instead of as fast as it can crash. The polling job stays
 installed alongside it as the fallback that resolves a click that never arrived.
 Nothing else in the `approvals` block is checked here. Its bot token lives in
 the login profile the job loads, not necessarily in the shell running the
@@ -123,6 +125,11 @@ from framework.config import AgentConfig, ConfigError, load_workspace
 DEFAULT_APPROVALS_SCHEDULE = "every 5m"
 APPROVALS_LABEL_SUFFIX = ".approvals"
 LISTEN_LABEL_SUFFIX = ".approvals.listen"
+# Seconds launchd waits before restarting the listener. A failure that cannot
+# fix itself -- a revoked app token, a venv without slack_sdk, a config typo --
+# would otherwise respawn as fast as the process can die, filling the error log
+# with the same line and hiding it in its own noise.
+LISTEN_THROTTLE_SEC = 60
 LOGS_DIRNAME = "logs"
 LAUNCH_AGENTS_DIR = Path.home() / "Library" / "LaunchAgents"
 MANAGED_KEY = "AgentsFrameworkManaged"
@@ -336,7 +343,7 @@ def build_jobs(cfg: AgentConfig, label: str | None, venv: str | Path | None) -> 
                         "approvals --listen",
                         cfg.workspace,
                         "approvals.listen",
-                        {},
+                        {"ThrottleInterval": LISTEN_THROTTLE_SEC},
                         keep_alive=True,
                     ),
                 )
