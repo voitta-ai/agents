@@ -58,6 +58,22 @@ messages rather than truncated (issue #73). What is *recorded* is untouched:
 later renders it wants Markdown, not Slack's dialect. `username` /
 `icon_emoji` / `icon_url` (issue #77) name the proposal's message.
 
+**Announced first, stored second** (issue #73 review). `flush()` reserves each
+proposal's id, posts the announcement, and only then writes the proposals to
+disk, because a long digest is now posted as several messages and a failure
+part-way through used to leave a live, approvable proposal whose instructions
+never reached the channel. In the new order a failed announcement stores
+nothing: the runner marks no signals seen and the next run proposes again. The
+accepted cost is the other half of at-least-once — a failure after the last
+part was posted means the channel holds an announcement for a proposal that
+was never stored, and the next run posts a second one with a new id. A stale
+id nobody can act on is a dead message; a live proposal nobody was told how to
+approve is a silent one, and this repo pays for silence.
+
+The instruction lines (`Reply "do <id>"`) sit directly under the title, above
+the digest, for the same reason: they have to be in the first message of a
+split, not the last.
+
 The proposal is the delivery. The runner marks signals seen after `flush()`
 returns, and this `flush()` returns only once the proposal is on disk and
 announced, so the seen-store semantics need no change: an approved-then-failed
@@ -120,24 +136,26 @@ class ApprovalDestination:
             )
 
         title = rendered.get("title") or "Proposal"
-        text = f"**{title}**\n\n{rendered['body_md']}"
+        body = rendered["body_md"]
         footer = rendered.get("footer")
         if footer:
-            text += f"\n\n{footer}"
+            body += f"\n\n{footer}"
 
         if rendered.get("empty"):
-            self._post(text)
+            self._post(f"**{title}**\n\n{body}")
             return
 
         payload = dict(rendered)
-        lines = []
-        for action in self._actions:
-            proposal = self._store.record(action, payload)
-            pid = proposal["id"]
-            lines.append(
-                f'Proposal {pid}: {action}. Reply "do {pid}" or "skip {pid}".'
-            )
-        self._post(text + "\n\n" + "\n".join(lines))
+        reserved = [self._store.reserve(action, payload) for action in self._actions]
+        lines = [
+            f'Proposal {p["id"]}: {p["action"]}. Reply "do {p["id"]}" or "skip {p["id"]}".'
+            for p in reserved
+        ]
+        # Announce first, store second, and put the instructions above the
+        # digest rather than after it (see the note in the module docstring).
+        self._post(f"**{title}**\n\n" + "\n".join(lines) + "\n\n" + body)
+        for proposal in reserved:
+            self._store.add(proposal)
 
 
 @register_destination("approval")

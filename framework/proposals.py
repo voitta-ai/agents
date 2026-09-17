@@ -139,8 +139,16 @@ class ProposalStore:
         tmp.write_text(json.dumps(data, indent=2, sort_keys=True))
         os.replace(tmp, self.path)
 
-    def record(self, action: str, payload: dict[str, Any]) -> dict[str, Any]:
-        """Append a pending proposal and return it (with its new id)."""
+    def reserve(self, action: str, payload: dict[str, Any]) -> dict[str, Any]:
+        """Take the next id and build a pending proposal, without storing it.
+
+        The announcement has to quote the id, and the id has to come from the
+        counter, so a caller that wants to announce *before* it commits needs
+        the two steps apart (issue #73 review): `reserve()`, post, then `add()`.
+        The counter is advanced here and never rewound, so an announcement that
+        fails leaves a gap in the numbering rather than a second proposal
+        claiming an id the channel has already seen.
+        """
         now = datetime.now(timezone.utc)
         with self._locked():
             data = self._read()
@@ -153,9 +161,22 @@ class ProposalStore:
                 "status": STATUS_PENDING,
             }
             data["next_id"] = int(data["next_id"]) + 1
+            self._write(data)
+        retval = proposal
+        return retval
+
+    def add(self, proposal: dict[str, Any]) -> dict[str, Any]:
+        """Store a proposal `reserve()` built. Approvable from this moment on."""
+        with self._locked():
+            data = self._read()
             data["proposals"].append(proposal)
             self._write(data)
         retval = proposal
+        return retval
+
+    def record(self, action: str, payload: dict[str, Any]) -> dict[str, Any]:
+        """Reserve and store in one step, for a caller that announces nothing."""
+        retval = self.add(self.reserve(action, payload))
         return retval
 
     def with_status(self, status: str) -> list[dict[str, Any]]:
