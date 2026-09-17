@@ -300,7 +300,10 @@ mrkdwn on the way out (issue #73): headings become bold lines, `[text](url)`
 becomes `<url|text>`, `**bold**` becomes `*bold*`, list markers become bullets,
 and code spans and fenced blocks are left exactly as written. Emphasis fires
 only on word boundaries, so `https://example.com/a__b__c` keeps its underscores:
-a URL that lost a pair is a different URL. `&`, `<` and `>` become entities in
+a URL that lost a pair is a different URL. `__x__` is not treated as bold at all,
+on purpose: what this repo posts is release notes and scorer reasons about code,
+where `__init__` is an ordinary word and `**bold**` is how anyone here writes
+bold. `&`, `<` and `>` become entities in
 literal text, per Slack's own rule, and never inside a link this repo built, a
 blockquote marker or a code block. Text that holds none of those characters and
 no Markdown is posted unchanged. Code in this repo that builds a header writes

@@ -21,7 +21,8 @@ What `to_mrkdwn` does, per issue #73:
     <url> (autolink)       ->  <url>
     bare url               ->  left alone (Slack links it)
     ***bold italic***      ->  *_bold italic_*
-    **bold**, __bold__     ->  *bold*
+    **bold**               ->  *bold*
+    __bold__, ___x___      ->  left alone, on purpose (see below)
     *italic*, _italic_     ->  _italic_
     \\*escaped\\*            ->  *escaped*, the backslash consumed, no emphasis
     `code`, ``` blocks     ->  unchanged, and their content is never converted
@@ -30,6 +31,13 @@ What `to_mrkdwn` does, per issue #73:
     tables                 ->  left as text
     & < >                  ->  &amp; &lt; &gt; in literal text
 
+**`__bold__` is deliberately not converted**, though Markdown says it is. What
+these agents actually emit is release notes and scorer reasons about code, where
+`__init__`-style names are ordinary and nobody writes bold as `__bold__`. Turning
+a dunder name into `*init*` in a message about that name is the more likely
+mistake, so the underscore bold rule is gone on purpose: do not restore it as a
+bug fix. `**bold**` still converts, and `_italic_` is unaffected.
+
 **Emphasis only fires on word boundaries**, both for `*` and for `_`, which is
 what keeps `https://example.com/a__b__c` and `snake_case_name` intact. A URL
 that lost a pair of underscores to a bold rule is a different URL, and an
@@ -37,6 +45,14 @@ approved `slack-post` step templating `{url}` would then post a link the
 operator never approved. Emphasis is resolved through placeholders in one pass
 rather than by sequential substitution, because `**b**` -> `*b*` followed by an
 italic rule would immediately turn that `*b*` back into `_b_`.
+
+**`__x__` is deliberately not bold, though Markdown says it is.** Do not "fix"
+this back. What goes through here is release notes and scorer reasons about
+code, where `__init__`, `__main__` and `__all__` are ordinary words and a
+double underscore almost never means emphasis; nobody writing for this channel
+reaches for `__x__` when `**x**` is right there. So `**bold**` converts,
+`__bold__` and `___bold___` pass through as written, and a name that arrives
+without backticks survives instead of turning into `*init*`.
 
 **Escaping** is Slack's documented rule for `text`: `&`, `<` and `>` become
 entities so that content which happens to look like `<something>` is not read
@@ -115,11 +131,12 @@ _LINK_RE = re.compile(
     r"(!?)\[((?:[^\[\]]|\[[^\[\]]*\])*)\]\(\s*(?:<([^<>\s]*)>|([^()\s]+))(?:\s+\"[^\"]*\")?\s*\)"
 )
 _BOLD_ITALIC_RE = re.compile(r"(?<![\w*])\*\*\*(\S(?:.*?\S)?)\*\*\*(?![\w*])", re.S)
-_BOLD_ITALIC_UNDER_RE = re.compile(r"(?<![\w_])___(\S(?:.*?\S)?)___(?![\w_])", re.S)
 _BOLD_STAR_RE = re.compile(r"(?<![\w*])\*\*(\S(?:.*?\S)?)\*\*(?![\w*])", re.S)
-_BOLD_UNDER_RE = re.compile(r"(?<![\w_])__(\S(?:.*?\S)?)__(?![\w_])", re.S)
 _ITALIC_STAR_RE = re.compile(r"(?<![\w*])\*(\S(?:[^*\n]*\S)?)\*(?![\w*])")
-_ITALIC_UNDER_RE = re.compile(r"(?<![\w_])_(\S(?:[^_\n]*\S)?)_(?![\w_])")
+# One underscore each side, never two: see "__x__ is left alone" in the module
+# docstring. The inner guards keep `__x__` and `___x___` out entirely rather
+# than letting the italic rule take a bite out of the ends.
+_ITALIC_UNDER_RE = re.compile(r"(?<![\w_])_(?!_)(\S(?:[^_\n]*\S)?)_(?!_)(?![\w])")
 
 
 _ENTITY_RE = re.compile(r"&(?!amp;|lt;|gt;|#\d+;|#x[0-9a-fA-F]+;)")
@@ -189,9 +206,7 @@ def _emphasis(text: str) -> str:
 
     for pattern, repl in (
         (_BOLD_ITALIC_RE, bold_italic),
-        (_BOLD_ITALIC_UNDER_RE, bold_italic),
         (_BOLD_STAR_RE, bold),
-        (_BOLD_UNDER_RE, bold),
         (_ITALIC_STAR_RE, italic),
         (_ITALIC_UNDER_RE, italic),
     ):
