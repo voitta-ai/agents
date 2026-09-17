@@ -59,7 +59,12 @@ entities so that content which happens to look like `<something>` is not read
 as a channel, user or link reference. It is applied to literal text only —
 never to a `<url|label>` this module built, never to a blockquote's `>` marker,
 and never inside a code span or a fenced block, whose contents this module
-leaves exactly as written. A link's URL keeps its `&` escaped as well, and a
+leaves exactly as written. A `<url|label>` that arrives *already formatted*
+is held aside the same way, because upstream content is full of them: a
+scorer's reasons, a digest's prose and the slack-workspace source's own message
+text all carry links a human already wrote in Slack's syntax, and escaping one
+posts its markup instead of the link. The recogniser insists on a real scheme
+in the URL half, so prose like `if a<b|c>d` is escaped as the text it is. A link's URL keeps its `&` escaped as well, and a
 `|`, `<` or `>` inside a URL is percent-encoded, since mrkdwn's link syntax
 splits on the first `|` and ends at the first `>`: without that, a URL holding
 one silently produces a link pointing somewhere else.
@@ -125,6 +130,10 @@ _QUOTE_RE = re.compile(r"^(\s*>+\s?)(.*)$")
 _CODE_SPAN_RE = re.compile(r"(`+[^`]*`+)")
 _BACKSLASH_RE = re.compile(r"\\([\\`*_{}\[\]()#+\-.!>|~])")
 _AUTOLINK_RE = re.compile(r"<((?:https?|mailto):[^<>\s]+)>")
+# An already-formed mrkdwn link, `<url|label>`, as upstream content carries it.
+# The URL half must be a real scheme, so prose like `if a<b|c>d` is not mistaken
+# for one and quietly turned into a link.
+_MRKDWN_LINK_RE = re.compile(r"<((?:https?://|mailto:|tel:)[^<>|\s]*)\|([^<>|]*)>")
 # A label may hold one level of nested brackets; a URL may hold '>' and is
 # taken whole, either bare or wrapped in angle brackets.
 _LINK_RE = re.compile(
@@ -162,7 +171,7 @@ def _link_url(url: str) -> str:
     is escaped like any other ampersand Slack is given.
     """
     retval = url.replace("<", "%3C").replace(">", "%3E").replace("|", "%7C")
-    retval = retval.replace("&", "&amp;")
+    retval = _ENTITY_RE.sub("&amp;", retval)
     return retval
 
 
@@ -233,6 +242,13 @@ def _inline(text: str, holder: _Holder | None = None) -> str:
         pieces.append(piece)
     text = "".join(pieces)
 
+    # A `<url|label>` that arrived already formatted is held whole, before any
+    # escaping can turn its angle brackets into entities. Upstream content is
+    # where these come from: a scorer's reasons, a digest's prose, and the
+    # slack-workspace source's own message text all carry them.
+    text = _MRKDWN_LINK_RE.sub(
+        lambda m: holder.hold(f"<{_link_url(m.group(1))}|{_escape(m.group(2))}>"), text
+    )
     text = _BACKSLASH_RE.sub(lambda m: holder.hold(_escape(m.group(1))), text)
 
     def link(match: re.Match) -> str:

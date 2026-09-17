@@ -167,11 +167,22 @@ class ProposalStore:
 
     def add(self, proposal: dict[str, Any]) -> dict[str, Any]:
         """Store a proposal `reserve()` built. Approvable from this moment on."""
+        retval = self.add_all([proposal])[0]
+        return retval
+
+    def add_all(self, proposals: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Store several reserved proposals in one write, all or none.
+
+        A run that announced two actions in one message must not be able to
+        leave the first stored and the second not: the write is a single
+        `os.replace` under the lock, so a failure leaves the store as it was
+        and the next run proposes both again.
+        """
         with self._locked():
             data = self._read()
-            data["proposals"].append(proposal)
+            data["proposals"].extend(proposals)
             self._write(data)
-        retval = proposal
+        retval = proposals
         return retval
 
     def record(self, action: str, payload: dict[str, Any]) -> dict[str, Any]:

@@ -63,7 +63,9 @@ proposal's id, posts the announcement, and only then writes the proposals to
 disk, because a long digest is now posted as several messages and a failure
 part-way through used to leave a live, approvable proposal whose instructions
 never reached the channel. In the new order a failed announcement stores
-nothing: the runner marks no signals seen and the next run proposes again. The
+nothing: the runner marks no signals seen and the next run proposes again. Two
+configured actions are stored in one write (`add_all`), so a run cannot leave
+one of them behind for a retry to duplicate. The
 accepted cost is the other half of at-least-once — a failure after the last
 part was posted means the channel holds an announcement for a proposal that
 was never stored, and the next run posts a second one with a new id. A stale
@@ -154,8 +156,7 @@ class ApprovalDestination:
         # Announce first, store second, and put the instructions above the
         # digest rather than after it (see the note in the module docstring).
         self._post(f"**{title}**\n\n" + "\n".join(lines) + "\n\n" + body)
-        for proposal in reserved:
-            self._store.add(proposal)
+        self._store.add_all(reserved)
 
 
 @register_destination("approval")
