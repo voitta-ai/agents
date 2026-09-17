@@ -19,6 +19,8 @@ dependencies = [
 slack-session = ["pycookiecheat>=0.6"]
 # twitter-post action (issue #48).
 twitter = ["requests-oauthlib>=1.3"]
+# approval buttons over Socket Mode: `agent approvals --listen` (issue #74).
+approvals-buttons = ["slack_sdk>=3.27", "websocket-client>=1.7"]
 
 [project.scripts]
 agent = "framework.cli:main"

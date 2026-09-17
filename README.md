@@ -92,6 +92,13 @@ profile supplies credentials), from the workspace, logging to `<dir>/logs/`.
 `--venv` defaults to the venv of the `agent` you ran. `--dry-run` prints the
 plist(s) and does nothing else.
 
+A workspace gets one job, two, or three: `agent run` on `schedule`, plus
+`<label>.approvals` on `approvals.schedule` when the config has an `approvals`
+block, plus `<label>.approvals.listen` when that block says `"listen": true`.
+The listener is the one job with no schedule: `KeepAlive` instead of an
+interval (see "Buttons instead of replies"). A job the config no longer asks
+for is removed by the next install.
+
 Every generated plist is marked with `AgentsFrameworkManaged` and
 `AgentsFrameworkWorkspace` (the workspace path). Install and uninstall refuse
 to touch a label whose plist lacks the marker, belongs to another workspace, or
@@ -208,6 +215,52 @@ once which steps the store recorded as done. Re-running it is a manual edit of
 runs all of its steps again, including any that already happened, if the
 original `do` is still inside the `hours` window (otherwise reply `do` again).
 To close it instead, set `"failed"`.
+
+### Buttons instead of replies
+
+Replying `do <id>` works, but the case that matters most -- a drafted blog post
+-- wants one click, and a third answer the reply grammar has no room for. With
+`"buttons": true` on the `approval` destination, a proposal is posted as Block
+Kit with three buttons (issue #74):
+
+- **Post** runs the action as configured.
+- **Draft** runs the same sequence with the `wordpress-publish` step forced to
+  `mode: draft`, and skips every step after it, so the post lands in the editor
+  and nothing is announced. An action with no `wordpress-publish` step has
+  nothing to draft: the click is refused, to that user only, and the proposal
+  stays pending.
+- **Discard** marks the proposal skipped. No step runs.
+
+After a click the message is edited in place to say what happened, by whom and
+when, so the channel shows the outcome instead of a stale prompt. Which variant
+ran is recorded on the proposal, next to who decided it and whether it came
+from a button or a reply.
+
+A button needs Slack to deliver the click somewhere, which normally means a
+public HTTPS endpoint. Socket Mode dials out instead:
+
+```
+agent approvals --listen --workspace <workspaces-root>/<agent-name>
+```
+
+is a long-running client holding that connection. It needs an app-level token
+(`xapp-...`, scope `connections:write`, and Socket Mode plus Interactivity
+turned on for the app), named by `approvals.app_token_env` the same way the bot
+token is named by `bot_token_env`. Install it with `"listen": true` in the
+`approvals` block; `install-schedule` then writes a third job,
+`<label>.approvals.listen`, with `KeepAlive` and no interval, so launchd
+restarts it whenever it exits -- a dropped connection or a slept laptop becomes
+a reconnect. It needs `pip install '.[approvals-buttons]'` (slack_sdk,
+websocket-client).
+
+The polling pass stays installed next to it, and is the reason a click that
+never arrives is not a lost proposal: `do <id>` still resolves it. Both paths
+take the same `pending -> running` claim, so a click racing a reply cannot run
+the steps twice -- whichever claims first runs, and the other is told the
+proposal is already spoken for. One consequence to know: a proposal resolved by
+*reply* keeps its buttons, because the webhook that posted it returns no message
+`ts` to edit. Clicking them afterwards runs nothing and says so, to the clicker
+only.
 
 ### Drafting several things at once: `digest` fields
 
