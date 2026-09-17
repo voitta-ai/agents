@@ -135,6 +135,9 @@ Approval-gated actions), so avoid re-installing while one is executing.
   On an Enterprise Grid org a user session cannot list channels or ask for
   permalinks, so names raise with ids named as the remedy and links are
   constructed (`meta.permalink_source`); ids work there unchanged (issue #69).
+  A signal's `meta` carries `job_url` (the message's first link) and, when a
+  bot posts a distinct one, `apply_url`, so a destination can link what the
+  message is about rather than only the message (issue #76).
   Read-only by construction: the client refuses every Slack method outside a
   fixed allowlist before any HTTP. Needs `pip install '.[slack-session]'`
   (pycookiecheat). See issue #45.
