@@ -196,6 +196,17 @@ class ProposalStore:
         retval = [p for p in data["proposals"] if p.get("status") == status]
         return retval
 
+    def get(self, proposal_id: str) -> dict[str, Any] | None:
+        """One proposal by id, or None. A read, so no claim and no lock held."""
+        with self._locked():
+            data = self._read()
+        retval = None
+        for proposal in data["proposals"]:
+            if proposal.get("id") == proposal_id:
+                retval = proposal
+                break
+        return retval
+
     def pending(self) -> list[dict[str, Any]]:
         retval = self.with_status(STATUS_PENDING)
         return retval

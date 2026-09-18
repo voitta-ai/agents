@@ -41,6 +41,14 @@ factory only its own block (docs/PLUGIN-CONTRACT.md) and the proposals store
 lives beside the dedupe state, not beside the config. It passes `_workspace`
 and `_root` on to the `wrap` block it builds, since the CLI never sees that one.
 
+`buttons: true` (issue #74) posts the proposal as Block Kit with Post, Draft
+and Discard buttons instead of the "reply do/skip" line, one message per named
+action, since a button carries one proposal id. Turn it on together with
+`agent approvals --listen` (framework/approval_buttons.py): without a listener
+holding the Socket Mode connection, the buttons render but no interaction is
+ever delivered. The reply path keeps working either way, and the reply grammar
+is repeated in the message's context line so it is still discoverable.
+
 Two behaviours worth knowing:
 
   - A run with nothing to propose (the wrapped `render()` says `empty`) posts
@@ -53,10 +61,14 @@ Two behaviours worth knowing:
 
 The proposal message goes out through `framework.slack.post_message`, so the
 drafted Markdown arrives as mrkdwn and a long proposal is split into several
-messages rather than truncated (issue #73). What is *recorded* is untouched:
-`body_md` in the proposals store stays Markdown, because the publish step that
-later renders it wants Markdown, not Slack's dialect. `username` /
-`icon_emoji` / `icon_url` (issue #77) name the proposal's message.
+messages rather than truncated (issue #73). With `buttons: true` the same
+conversion runs before the Block Kit message is built, on the section text and
+on the notification fallback alike, since a human reads both; the blocks carry
+their own length handling, so that path does not split into several messages.
+What is *recorded* is untouched either way: `body_md` in the proposals store
+stays Markdown, because the publish step that later renders it wants Markdown,
+not Slack's dialect. `username` / `icon_emoji` / `icon_url` (issue #77) name
+the proposal's message in both modes.
 
 **Announced first, stored second** (issue #73 review). `flush()` reserves each
 proposal's id, posts the announcement, and only then writes the proposals to
@@ -65,7 +77,10 @@ part-way through used to leave a live, approvable proposal whose instructions
 never reached the channel. In the new order a failed announcement stores
 nothing: the runner marks no signals seen and the next run proposes again. Two
 configured actions are stored in one write (`add_all`), so a run cannot leave
-one of them behind for a retry to duplicate. The
+one of them behind for a retry to duplicate. `buttons: true` posts one message
+per proposal and is held to the same rule: every id is reserved first, every
+message goes out, and only then is anything stored, so a failure on the second
+of two button messages leaves neither clickable rather than one live. The
 accepted cost is the other half of at-least-once — a failure after the last
 part was posted means the channel holds an announcement for a proposal that
 was never stored, and the next run posts a second one with a new id. A stale
@@ -74,7 +89,9 @@ approve is a silent one, and this repo pays for silence.
 
 The instruction lines (`Reply "do <id>"`) sit directly under the title, above
 the digest, for the same reason: they have to be in the first message of a
-split, not the last.
+split, not the last. With `buttons: true` there are no such lines: the buttons
+are the instruction, and the reply grammar already appears once in the context
+line `proposal_blocks` builds.
 
 The proposal is the delivery. The runner marks signals seen after `flush()`
 returns, and this `flush()` returns only once the proposal is on disk and
@@ -86,10 +103,13 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+import requests
+
+from framework.approval_buttons import proposal_blocks
 from framework.interfaces import Destination, ScoredSignal
 from framework.proposals import ProposalStore, proposals_path
 from framework.registry import build_destination, register_destination
-from framework.slack import SlackIdentity, identity_from_config, post_message
+from framework.slack import SlackIdentity, identity_from_config, post_message, to_mrkdwn
 
 
 class ApprovalDestination:
@@ -101,6 +121,7 @@ class ApprovalDestination:
         webhook_url: str,
         timeout: int = 30,
         identity: SlackIdentity | None = None,
+        buttons: bool = False,
     ):
         render = getattr(wrapped, "render", None)
         if not callable(render):
@@ -116,6 +137,7 @@ class ApprovalDestination:
         self._webhook_url = webhook_url
         self._timeout = timeout
         self._identity = identity or SlackIdentity()
+        self._buttons = buttons
 
     def send(self, scored: ScoredSignal) -> None:
         self._wrapped.send(scored)
@@ -124,6 +146,33 @@ class ApprovalDestination:
         post_message(
             self._webhook_url, text, timeout=self._timeout, identity=self._identity
         )
+
+    def _post_buttons(self, text: str, proposal: dict) -> None:
+        """One proposal as Block Kit: the content, then Post / Draft / Discard.
+
+        Blocks carry their own length handling, so this does not go through
+        `post_message`'s splitting, but it converts the same way: the section
+        blocks and the notification fallback are both mrkdwn, because both are
+        read by a human. `text` is the fallback a push notification and a
+        screen reader get when the blocks are not rendered; the reply grammar
+        lives in the context line `proposal_blocks` builds, and is deliberately
+        not repeated here.
+        """
+        pid = proposal["id"]
+        action = proposal["action"]
+        rendered = to_mrkdwn(text)
+        body: dict = {
+            "text": f"{rendered}\n\nProposal {pid}: {action}.",
+            "blocks": proposal_blocks(rendered, pid, action),
+        }
+        body.update(self._identity.payload())
+        resp = requests.post(
+            self._webhook_url,
+            json=body,
+            headers={"Content-type": "application/json"},
+            timeout=self._timeout,
+        )
+        resp.raise_for_status()
 
     def flush(self) -> None:
         try:
@@ -148,7 +197,18 @@ class ApprovalDestination:
             return
 
         payload = dict(rendered)
+        # Every id is taken before anything is announced, and nothing is stored
+        # until every announcement is out: both modes announce first and store
+        # second, in one write.
         reserved = [self._store.reserve(action, payload) for action in self._actions]
+        if self._buttons:
+            # One message per proposal: the buttons carry a single proposal id,
+            # so two actions in one message would leave the second unclickable.
+            for proposal in reserved:
+                self._post_buttons(f"**{title}**\n\n{body}", proposal)
+            self._store.add_all(reserved)
+            return
+
         lines = [
             f'Proposal {p["id"]}: {p["action"]}. Reply "do {p["id"]}" or "skip {p["id"]}".'
             for p in reserved
@@ -199,5 +259,6 @@ def build(cfg: dict) -> Destination:
         webhook_url=webhook_url,
         timeout=int(cfg.get("timeout", 30)),
         identity=identity_from_config(cfg, "approval destination"),
+        buttons=bool(cfg.get("buttons", False)),
     )
     return retval
