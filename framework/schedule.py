@@ -17,10 +17,18 @@ Config keys read from `<dir>/config.json`:
       ...
     }
 
-A workspace gets one job, or two. `agent run` always, on `schedule`. When the
-config has an `approvals` block (issue #21), `agent approvals` is its own job
-on its own clock, labelled `<label>.approvals`: it has to answer a `do` within
-minutes while the run may fire every few hours, so one plist cannot serve both.
+A workspace gets one job, two, or three. `agent run` always, on `schedule`.
+When the config has an `approvals` block (issue #21), `agent approvals` is its
+own job on its own clock, labelled `<label>.approvals`: it has to answer a `do`
+within minutes while the run may fire every few hours, so one plist cannot
+serve both. With `"approvals": {"listen": true}` (issue #74) there is a third,
+`<label>.approvals.listen`, running `agent approvals --listen`: a Socket Mode
+client for approval button clicks. It is the one job with no schedule at all --
+`KeepAlive` is true and launchd restarts it whenever it exits, which is how a
+dropped connection or a slept laptop becomes a reconnect. `ThrottleInterval`
+bounds that: a listener that cannot start at all (revoked app token, missing
+dependency) retries once a minute instead of as fast as it can crash. The polling job stays
+installed alongside it as the fallback that resolves a click that never arrived.
 Nothing else in the `approvals` block is checked here. Its bot token lives in
 the login profile the job loads, not necessarily in the shell running the
 install, so validating it now would fail installs that would run fine; the
@@ -49,7 +57,8 @@ in the environment"). `--venv` defaults to the venv the running `agent` lives
 in (`sys.prefix`), so installing from the deployment checkout's venv points
 the job at that venv. `WorkingDirectory` is the workspace; stdout and stderr go
 to `<dir>/logs/run.log` / `run.error.log` (or `approvals.log` /
-`approvals.error.log`); `RunAtLoad` is true and `KeepAlive` false, so an
+`approvals.error.log`); `RunAtLoad` is true and `KeepAlive` false (except for the
+listener job, which is the reverse of both ideas: nothing but `KeepAlive`), so an
 install fires once immediately and then waits for its schedule. Every
 generated plist also carries `AgentsFrameworkManaged` (true) and
 `AgentsFrameworkWorkspace` (the workspace path); launchd ignores keys it does
@@ -115,6 +124,12 @@ from framework.config import AgentConfig, ConfigError, load_workspace
 
 DEFAULT_APPROVALS_SCHEDULE = "every 5m"
 APPROVALS_LABEL_SUFFIX = ".approvals"
+LISTEN_LABEL_SUFFIX = ".approvals.listen"
+# Seconds launchd waits before restarting the listener. A failure that cannot
+# fix itself -- a revoked app token, a venv without slack_sdk, a config typo --
+# would otherwise respawn as fast as the process can die, filling the error log
+# with the same line and hiding it in its own noise.
+LISTEN_THROTTLE_SEC = 60
 LOGS_DIRNAME = "logs"
 LAUNCH_AGENTS_DIR = Path.home() / "Library" / "LaunchAgents"
 MANAGED_KEY = "AgentsFrameworkManaged"
@@ -263,7 +278,15 @@ def _agent_binary(venv: str | Path) -> Path:
     return retval
 
 
-def _plist(label: str, binary: Path, command: str, workspace: Path, log_stem: str, schedule: dict[str, Any]) -> dict[str, Any]:
+def _plist(
+    label: str,
+    binary: Path,
+    command: str,
+    workspace: Path,
+    log_stem: str,
+    schedule: dict[str, Any],
+    keep_alive: bool = False,
+) -> dict[str, Any]:
     logs = workspace / LOGS_DIRNAME
     shell = f"exec {shlex.quote(str(binary))} {command} --workspace {shlex.quote(str(workspace))}"
     retval = {
@@ -273,7 +296,7 @@ def _plist(label: str, binary: Path, command: str, workspace: Path, log_stem: st
         "StandardOutPath": str(logs / f"{log_stem}.log"),
         "StandardErrorPath": str(logs / f"{log_stem}.error.log"),
         "RunAtLoad": True,
-        "KeepAlive": False,
+        "KeepAlive": keep_alive,
         MANAGED_KEY: True,
         WORKSPACE_KEY: str(workspace),
         **schedule,
@@ -304,6 +327,27 @@ def build_jobs(cfg: AgentConfig, label: str | None, venv: str | Path | None) -> 
                 _plist(approvals_label, binary, "approvals", cfg.workspace, "approvals", approvals_schedule),
             )
         )
+        if approvals.get("listen"):
+            # The one job that is not a clock. `agent approvals --listen` holds
+            # a Socket Mode connection (issue #74), so it has no interval and
+            # KeepAlive instead: launchd restarts it whenever it exits, which
+            # is how a dropped connection, a laptop waking up, or a crash
+            # becomes a reconnect without anyone watching.
+            listen_label = job_label + LISTEN_LABEL_SUFFIX
+            jobs.append(
+                Job(
+                    listen_label,
+                    _plist(
+                        listen_label,
+                        binary,
+                        "approvals --listen",
+                        cfg.workspace,
+                        "approvals.listen",
+                        {"ThrottleInterval": LISTEN_THROTTLE_SEC},
+                        keep_alive=True,
+                    ),
+                )
+            )
     retval = jobs
     return retval
 
@@ -489,8 +533,16 @@ def install_schedule(workspace: str | Path, label: str | None, venv: str | Path 
         return retval
 
     _require_macos()
-    # No approvals block: remove the approvals job an earlier install made.
-    stale = [jobs[0].label + APPROVALS_LABEL_SUFFIX] if len(jobs) == 1 else []
+    # Remove what an earlier install made that this config no longer asks for:
+    # the approvals job when the block is gone, the listener when `listen` was
+    # turned off. Leaving either behind means a job firing for a config that
+    # does not describe it any more.
+    installed = {job.label for job in jobs}
+    stale = [
+        jobs[0].label + suffix
+        for suffix in (APPROVALS_LABEL_SUFFIX, LISTEN_LABEL_SUFFIX)
+        if jobs[0].label + suffix not in installed
+    ]
     _check_ownership([job.label for job in jobs] + stale, cfg.workspace, force, "replace")
     (cfg.workspace / LOGS_DIRNAME).mkdir(parents=True, exist_ok=True)
     for job in jobs:
@@ -507,12 +559,12 @@ def uninstall_schedule(workspace: str | Path, label: str | None, force: bool) ->
     _check_label(label)
     _require_macos()
 
-    labels = [label, label + APPROVALS_LABEL_SUFFIX]
+    labels = [label, label + APPROVALS_LABEL_SUFFIX, label + LISTEN_LABEL_SUFFIX]
     _check_ownership(labels, Path(workspace).expanduser().resolve(), force, "remove")
     removed = [_remove_job(name) for name in labels]
     if not any(removed):
         raise ScheduleError(
-            f"nothing to uninstall: neither {label} nor {label}{APPROVALS_LABEL_SUFFIX} "
+            f"nothing to uninstall: none of {', '.join(labels)} "
             f"is loaded or has a plist in {LAUNCH_AGENTS_DIR} (pass --label if the install used one)"
         )
     retval = 0

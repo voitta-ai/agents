@@ -58,6 +58,15 @@ naming the step, later steps do not run, and nothing is retried. Retrying a
 publish is not obviously safe (the first attempt may have half-succeeded), so
 retry is a human decision made by reading the outcome message and the store.
 
+A proposal can also be resolved by clicking a button on its message instead of
+replying, when the deployment runs `agent approvals --listen` (issue #74, see
+framework/approval_buttons.py). That path shares this module's claim, its step
+runner and its store, so a click and a reply racing each other cannot both
+execute: whichever claims first runs, the other is told the proposal is already
+spoken for. It adds one variant, `draft`, which forces the WordPress step to
+`mode: draft` and skips the announcement steps after it; a reply is always the
+`post` variant. The variant is recorded on the proposal.
+
 Whatever happened, one outcome message goes to the channel through
 `chat.postMessage`, and one summary line is printed, unconditionally, in the
 shape the runner uses (issue #31): `agent=<name> status=ok approvals=N
@@ -108,6 +117,9 @@ from framework.proposals import (
 from framework.registry import build_action
 
 _SLACK_API = "https://slack.com/api"
+# Methods that write and therefore always take a JSON body, whatever this
+# particular call happens to pass. `_needs_json_body` catches the rest.
+_WRITE_METHODS = ("chat.postMessage", "chat.update", "chat.postEphemeral")
 _REPLY_RE = re.compile(r"^(do|skip)\s+(\S+)$")
 _DEFAULT_HOURS = 24
 
@@ -123,6 +135,7 @@ class ApprovalsConfig:
         hours: float,
         actions: dict[str, Any],
         timeout: int = 30,
+        app_token: str = "",
     ):
         self.agent = agent
         self.workspace = workspace
@@ -132,6 +145,7 @@ class ApprovalsConfig:
         self.hours = hours
         self.actions = actions
         self.timeout = timeout
+        self.app_token = app_token
 
 
 def load_approvals_config(workspace: str | Path) -> ApprovalsConfig:
@@ -175,6 +189,19 @@ def load_approvals_config(workspace: str | Path) -> ApprovalsConfig:
     bot_token = os.environ.get(token_env)
     if not bot_token:
         raise ConfigError(f"approvals need the Slack bot token in ${token_env}")
+    # Read only by `--listen` (framework/approval_buttons.py), and only if the
+    # config names it: a workspace that approves by reply needs no app token,
+    # and demanding one here would break every existing deployment.
+    app_token_env = block.get("app_token_env")
+    app_token = ""
+    if app_token_env:
+        app_token = os.environ.get(app_token_env, "")
+        if not app_token:
+            raise ConfigError(
+                f"approvals need the Slack app-level token in ${app_token_env} "
+                f"(named by {config_path}: 'approvals.app_token_env')"
+            )
+
     trusted = block.get("trusted_user_ids")
     if not isinstance(trusted, list) or not trusted or not all(isinstance(u, str) for u in trusted):
         raise ConfigError(
@@ -203,6 +230,7 @@ def load_approvals_config(workspace: str | Path) -> ApprovalsConfig:
         hours=float(block.get("hours", _DEFAULT_HOURS)),
         actions=actions,
         timeout=int(block.get("timeout", 30)),
+        app_token=app_token,
     )
     return retval
 
@@ -216,8 +244,23 @@ class SlackApiError(RuntimeError):
     """Slack answered, but with `ok: false`."""
 
 
+def _needs_json_body(params: dict[str, Any]) -> bool:
+    """Whether these params have to go as a JSON body rather than a query string.
+
+    The rule is the shape of the payload, not a list of method names. A param
+    that is a list or a dict (`blocks`, `attachments`) cannot survive a query
+    string: `requests` flattens a list of dicts into one repeated key per dict
+    *key*, so `blocks=[{"type": "section", "text": {...}}]` goes out as
+    `blocks=type&blocks=text` and the message arrives with every block gone.
+    That is how `chat.update` was broken when it was added as a caller and the
+    branch here still only named `chat.postMessage` (issue #74 review).
+    """
+    retval = any(isinstance(value, (list, dict)) for value in params.values())
+    return retval
+
+
 def _slack_call(method: str, token: str, timeout: int, **params: Any) -> dict[str, Any]:
-    if method == "chat.postMessage":
+    if method in _WRITE_METHODS or _needs_json_body(params):
         resp = requests.post(
             f"{_SLACK_API}/{method}",
             headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
@@ -275,15 +318,79 @@ def read_replies(cfg: ApprovalsConfig) -> dict[str, dict[str, str]]:
     return retval
 
 
+DRAFTABLE_STEP = "wordpress-publish"
+VARIANT_POST = "post"
+VARIANT_DRAFT = "draft"
+
+
+def has_draftable_step(cfg: ApprovalsConfig, action_name: str) -> bool:
+    """Whether `action_name` has a step the `draft` variant can draft."""
+    action = cfg.actions.get(action_name)
+    steps = (action or {}).get("steps") or []
+    retval = any(step.get("type") == DRAFTABLE_STEP for step in steps)
+    return retval
+
+
+def plan_steps(steps: list[dict[str, Any]], variant: str) -> list[tuple[int, dict | None, str]]:
+    """The steps to run for `variant`, as (number, config-or-None, why-skipped).
+
+    `post` is the sequence as configured. `draft` forces the WordPress step to
+    `mode: draft` and skips everything after it: those later steps are the
+    announcement, by construction -- they consume the publish result -- and
+    announcing a draft is the one thing the Draft button exists to avoid.
+    Nothing before the publish step is skipped; it is what produced the content.
+    """
+    if variant != VARIANT_DRAFT:
+        retval = [(i, dict(step), "") for i, step in enumerate(steps, start=1)]
+        return retval
+    last_draftable = 0
+    for i, step in enumerate(steps, start=1):
+        if step.get("type") == DRAFTABLE_STEP:
+            last_draftable = i
+    plan: list[tuple[int, dict | None, str]] = []
+    for i, step in enumerate(steps, start=1):
+        if i > last_draftable:
+            plan.append((i, None, "skipped: draft announces nothing"))
+            continue
+        step = dict(step)
+        if step.get("type") == DRAFTABLE_STEP:
+            step["mode"] = "draft"
+        plan.append((i, step, ""))
+    retval = plan
+    return retval
+
+
+def steps_detail(results: list[dict[str, Any]]) -> str:
+    """One human-readable line naming each step and how it went."""
+    retval = ", ".join(f"{r['type']} {r['status']}" for r in results) or "no steps run"
+    return retval
+
+
+def human_time(slack_ts: str) -> str:
+    """A Slack `ts` (epoch seconds, as a string) as a readable UTC time."""
+    try:
+        moment = datetime.fromtimestamp(float(slack_ts), tz=timezone.utc)
+    except (TypeError, ValueError):
+        retval = _now_iso()
+        return retval
+    retval = moment.isoformat(timespec="seconds")
+    return retval
+
+
 def _run_steps(
-    cfg: ApprovalsConfig, store: ProposalStore, proposal: dict[str, Any]
+    cfg: ApprovalsConfig,
+    store: ProposalStore,
+    proposal: dict[str, Any],
+    variant: str = VARIANT_POST,
 ) -> tuple[list[dict[str, Any]], str | None]:
     """Run the claimed proposal's action steps in order; return (results, error).
 
     `error` is None when every step ran, else a message naming the step that
     stopped the sequence. `results` holds one entry per step attempted, and is
     written to the store after each step so that a pass dying mid-sequence
-    leaves a record of what already happened.
+    leaves a record of what already happened. A step the variant skips is
+    recorded too, as `status: "skipped"`, so the store says what did not run
+    as plainly as what did.
     """
     name = proposal["action"]
     action = cfg.actions.get(name)
@@ -299,8 +406,16 @@ def _run_steps(
         "agent": cfg.agent,
         "proposal_id": proposal["id"],
         "action": name,
+        "variant": variant,
     }
-    for i, step_cfg in enumerate(action["steps"], start=1):
+    for i, step_cfg, skipped in plan_steps(action["steps"], variant):
+        if step_cfg is None:
+            results.append(
+                {"step": i, "type": action["steps"][i - 1].get("type"), "status": "skipped",
+                 "note": skipped}
+            )
+            store.transition(proposal["id"], STATUS_RUNNING, STATUS_RUNNING, results=results)
+            continue
         step_type = step_cfg.get("type")
         try:
             step = build_action(step_cfg)
@@ -401,7 +516,7 @@ def _outcome_text(proposal: dict[str, Any], status: str, results: list, error: s
     if status == STATUS_SKIPPED:
         retval = f"Proposal {pid} ({action}): skipped."
         return retval
-    steps = ", ".join(f"{r['type']} {r['status']}" for r in results) or "no steps run"
+    steps = steps_detail(results)
     if status == STATUS_DONE:
         retval = f"Proposal {pid} ({action}): done. Steps: {steps}."
         return retval
@@ -436,7 +551,11 @@ def run_approvals(cfg: ApprovalsConfig) -> int:
                     file=sys.stderr,
                 )
                 continue
-            decided = {"decided_by": reply["user"], "decided_ts": reply["ts"]}
+            decided = {
+                "decided_by": reply["user"],
+                "decided_ts": reply["ts"],
+                "decided_via": "reply",
+            }
             if reply["verb"] == "skip":
                 if store.transition(pid, STATUS_PENDING, STATUS_SKIPPED, **decided) is None:
                     continue
@@ -449,6 +568,7 @@ def run_approvals(cfg: ApprovalsConfig) -> int:
                     STATUS_RUNNING,
                     claimed_at=_now_iso(),
                     claimed_pid=os.getpid(),
+                    variant=VARIANT_POST,
                     **decided,
                 )
                 if claimed is None:

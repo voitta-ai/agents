@@ -12,6 +12,8 @@ updated. Passing it exits 2 with a message that names `--workspace`.
 
 `agent approvals --workspace <dir>` is the second entrypoint (issue #21): same
 contract, its own clock, executes proposals a trusted human has replied to.
+With `--listen` it is instead the one long-running entrypoint (issue #74): a
+Socket Mode client acting on approval button clicks until it is killed.
 
 `agent install-schedule` / `uninstall-schedule` (issue #10) write and remove the
 launchd jobs that invoke those two; see `framework/schedule.py`.
@@ -22,6 +24,7 @@ import argparse
 import sys
 from pathlib import Path
 
+from framework.approval_buttons import ListenerError, run_listener
 from framework.approvals import load_approvals_config, run_approvals
 from framework.config import STATE_DIRNAME, ConfigError, load_workspace
 from framework.plugins import PluginImportFailure
@@ -100,6 +103,9 @@ def _cmd_run(args: argparse.Namespace) -> int:
 def _cmd_approvals(args: argparse.Namespace) -> int:
     cfg = load_approvals_config(args.workspace)
     _report_failed_plugins(load_plugins())
+    if args.listen:
+        retval = run_listener(cfg)
+        return retval
     retval = run_approvals(cfg)
     return retval
 
@@ -141,6 +147,14 @@ def build_parser() -> argparse.ArgumentParser:
         required=True,
         help="The agent's workspace directory; <dir>/config.json and <dir>/state/proposals.json.",
     )
+    approvals_parser.add_argument(
+        "--listen",
+        action="store_true",
+        help=(
+            "Hold a Socket Mode connection and act on approval button clicks until killed "
+            "(long-running; needs approvals.app_token_env). Without it, one polling pass."
+        ),
+    )
     approvals_parser.set_defaults(func=_cmd_approvals)
 
     install_parser = sub.add_parser(
@@ -155,7 +169,10 @@ def build_parser() -> argparse.ArgumentParser:
     install_parser.add_argument(
         "--label",
         default=None,
-        help="launchd label (default: com.agents.<agent>); the approvals job is <label>.approvals.",
+        help=(
+            "launchd label (default: com.agents.<agent>); the approvals job is "
+            "<label>.approvals and the button listener <label>.approvals.listen."
+        ),
     )
     install_parser.add_argument(
         "--venv",
@@ -202,7 +219,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         retval = args.func(args)
-    except (ConfigError, UnknownPluginError, PluginImportError) as exc:
+    except (ConfigError, ListenerError, UnknownPluginError, PluginImportError) as exc:
         print(f"agent: {exc}", file=sys.stderr)
         return 2
     except ScheduleError as exc:

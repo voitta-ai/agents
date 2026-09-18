@@ -41,6 +41,14 @@ factory only its own block (docs/PLUGIN-CONTRACT.md) and the proposals store
 lives beside the dedupe state, not beside the config. It passes `_workspace`
 and `_root` on to the `wrap` block it builds, since the CLI never sees that one.
 
+`buttons: true` (issue #74) posts the proposal as Block Kit with Post, Draft
+and Discard buttons instead of the "reply do/skip" line, one message per named
+action, since a button carries one proposal id. Turn it on together with
+`agent approvals --listen` (framework/approval_buttons.py): without a listener
+holding the Socket Mode connection, the buttons render but no interaction is
+ever delivered. The reply path keeps working either way, and the reply grammar
+is repeated in the message's context line so it is still discoverable.
+
 Two behaviours worth knowing:
 
   - A run with nothing to propose (the wrapped `render()` says `empty`) posts
@@ -63,6 +71,7 @@ from pathlib import Path
 
 import requests
 
+from framework.approval_buttons import proposal_blocks
 from framework.interfaces import Destination, ScoredSignal
 from framework.proposals import ProposalStore, proposals_path
 from framework.registry import build_destination, register_destination
@@ -76,6 +85,7 @@ class ApprovalDestination:
         store: ProposalStore,
         webhook_url: str,
         timeout: int = 30,
+        buttons: bool = False,
     ):
         render = getattr(wrapped, "render", None)
         if not callable(render):
@@ -90,14 +100,20 @@ class ApprovalDestination:
         self._store = store
         self._webhook_url = webhook_url
         self._timeout = timeout
+        self._buttons = buttons
 
     def send(self, scored: ScoredSignal) -> None:
         self._wrapped.send(scored)
 
-    def _post(self, text: str) -> None:
+    def _post(self, text: str, blocks: list | None = None) -> None:
+        body: dict = {"text": text}
+        if blocks:
+            # `text` stays as the notification fallback: it is what a push
+            # notification and a screen reader get when blocks are not rendered.
+            body["blocks"] = blocks
         resp = requests.post(
             self._webhook_url,
-            json={"text": text},
+            json=body,
             headers={"Content-type": "application/json"},
             timeout=self._timeout,
         )
@@ -126,6 +142,17 @@ class ApprovalDestination:
             return
 
         payload = dict(rendered)
+        if self._buttons:
+            # One message per proposal: the buttons carry a single proposal id,
+            # so two actions in one message would leave the second unclickable.
+            for action in self._actions:
+                proposal = self._store.record(action, payload)
+                self._post(
+                    f'{text}\n\nProposal {proposal["id"]}: {action}.',
+                    proposal_blocks(text, proposal["id"], action),
+                )
+            return
+
         lines = []
         for action in self._actions:
             proposal = self._store.record(action, payload)
@@ -175,5 +202,6 @@ def build(cfg: dict) -> Destination:
         store=ProposalStore(proposals_path(Path(workspace))),
         webhook_url=webhook_url,
         timeout=int(cfg.get("timeout", 30)),
+        buttons=bool(cfg.get("buttons", False)),
     )
     return retval
