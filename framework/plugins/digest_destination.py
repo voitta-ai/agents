@@ -69,6 +69,14 @@ a value) and `{repos}` has to resolve. A field name that collides with one of
 them is refused at build time rather than shadowed, so a config cannot end up
 with a taxonomy the model wrote.
 
+The digest the model writes is Markdown, and it goes out through
+`framework.slack.post_message`, which renders it as mrkdwn and splits a digest
+past the block limit into several messages in order (issue #73). `render()` is
+untouched by that: its `body_md` stays Markdown, because that is what a
+WordPress publish step wants. `username` / `icon_emoji` / `icon_url` (issue
+#77) name this digest in the channel, so two digests posted seconds apart
+through one webhook do not read as one message.
+
 `min_score` (issue #63) drops low-scoring signals before the model ever sees
 them, for agents whose scorer is a filter rather than a ranking. Dropped items
 are not in the item count either, so a run that gates everything out reads as
@@ -85,11 +93,10 @@ from __future__ import annotations
 import json
 import os
 
-import requests
-
 from framework.interfaces import Destination, ScoredSignal
 from framework.llm import LLMClient, LLMError, build_client
 from framework.registry import register_destination
+from framework.slack import SlackIdentity, identity_from_config, post_message
 
 _DEFAULT_SYSTEM = (
     "You write short, factual internal digests. Lead with what matters. "
@@ -206,6 +213,7 @@ class DigestDestination:
         timeout: int = 30,
         fields: dict[str, str] | None = None,
         min_score: int = 0,
+        identity: SlackIdentity | None = None,
     ):
         self.webhook_url = webhook_url
         self.llm = llm
@@ -219,6 +227,7 @@ class DigestDestination:
         self.timeout = timeout
         self.fields = fields or {}
         self.min_score = min_score
+        self.identity = identity or SlackIdentity()
         self._buffered: list[ScoredSignal] = []
 
     def send(self, scored: ScoredSignal) -> None:
@@ -272,13 +281,8 @@ class DigestDestination:
         return retval
 
     def _post(self, text: str) -> None:
-        resp = requests.post(
-            self.webhook_url,
-            json={"text": text},
-            headers={"Content-type": "application/json"},
-            timeout=self.timeout,
-        )
-        resp.raise_for_status()
+        post_message(text=text, webhook_url=self.webhook_url, timeout=self.timeout,
+                     identity=self.identity)
 
     def render(self) -> dict:
         """Write the digest without posting it (issue #21).
@@ -367,14 +371,14 @@ class DigestDestination:
         if not extras:
             retval = ""
             return retval
-        parts = [f"*also drafted:* {', '.join(extras)}"]
+        parts = [f"**also drafted:** {', '.join(extras)}"]
         for name in extras:
-            parts.append(f"*{name}*\n{drafted[name]}")
+            parts.append(f"**{name}**\n{drafted[name]}")
         retval = "\n\n".join(parts) + "\n\n"
         return retval
 
     def flush(self) -> None:
-        header = f"*{self.title}*"
+        header = f"**{self.title}**"
         if self.gate:
             header += "  _(draft — review before publishing)_"
 
@@ -457,5 +461,6 @@ def build(cfg: dict) -> Destination:
         timeout=int(cfg.get("timeout", 30)),
         fields=fields,
         min_score=int(cfg.get("min_score", 0)),
+        identity=identity_from_config(cfg, "digest destination"),
     )
     return retval

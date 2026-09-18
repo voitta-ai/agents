@@ -12,6 +12,10 @@ placeholder with no value fails the step rather than posting a blank. The
 webhook is bound to a channel when Slack issues it, so there is no channel
 key here.
 
+The line goes out through `framework.slack.post_message` like every other
+Slack post here, so a `text` holding a Markdown link arrives clickable rather
+than as literal brackets (issue #73). A plain line is posted unchanged.
+
 Returns an empty dict: an incoming webhook answers `ok` and nothing a later
 step could use.
 
@@ -22,10 +26,9 @@ from __future__ import annotations
 import os
 from typing import Any
 
-import requests
-
 from framework.interfaces import Action
 from framework.registry import register_action
+from framework.slack import post_message
 from framework.templating import render_template
 
 
@@ -37,13 +40,7 @@ class SlackPostAction:
 
     def execute(self, payload: dict[str, Any], context: dict[str, Any]) -> dict[str, Any]:
         text = render_template(self._text, payload)
-        resp = requests.post(
-            self._webhook_url,
-            json={"text": text},
-            headers={"Content-type": "application/json"},
-            timeout=self._timeout,
-        )
-        resp.raise_for_status()
+        post_message(self._webhook_url, text, timeout=self._timeout)
         retval: dict[str, Any] = {}
         return retval
 

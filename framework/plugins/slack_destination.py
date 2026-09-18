@@ -32,6 +32,12 @@ once at the top level of the destination block, where they are the default for
 every route that does not set its own; the flat single-route form reads them
 from the same place it reads `webhook_env`.
 
+    username      the name this route's messages are posted under, and
+    icon_emoji    the icon beside them (`:rocket:`, with the colons) or
+    icon_url      an image url instead. Unset means Slack uses the webhook's
+                  own identity, exactly as before. Several agents post through
+                  one webhook, so without these two digests landing seconds
+                  apart read as one message (issue #77).
     footer        a string appended verbatim as the last line of every message
                   this route sends, streamed or batched. It exists for standing
                   lines that must appear on every message, so nothing here
@@ -44,6 +50,12 @@ from the same place it reads `webhook_env`.
                   no reasons renders exactly as it did before this key existed,
                   and so does any signal under `show_reasons: false`.
 
+Message text is Markdown on the way in and mrkdwn on the way out: it goes
+through `framework.slack.post_message`, which converts it and splits a message
+over the block limit into several, in order (issue #73). That is why the header
+here is written `**[42]**` and not `*[42]*` — the text this module builds is
+Markdown like everything else it carries, and the one post site renders it.
+
 Sheets/email destinations are explicitly out of scope for v1.
 
 Contract: see docs/PLUGIN-CONTRACT.md — routing and gating are the
@@ -53,10 +65,9 @@ from __future__ import annotations
 
 import os
 
-import requests
-
 from framework.interfaces import Destination, ScoredSignal
 from framework.registry import register_destination
+from framework.slack import SlackIdentity, identity_from_config, post_message
 
 
 class _Route:
@@ -67,12 +78,14 @@ class _Route:
         channel_label: str = "",
         footer: str = "",
         show_reasons: bool = True,
+        identity: SlackIdentity | None = None,
     ):
         self.webhook_url = webhook_url
         self.min_score = min_score
         self.channel_label = channel_label
         self.footer = footer
         self.show_reasons = show_reasons
+        self.identity = identity or SlackIdentity()
 
 
 class SlackDestination:
@@ -103,7 +116,7 @@ class SlackDestination:
         body = sig.text
         if compact and isinstance(sig.meta, dict) and sig.meta.get("title"):
             body = sig.meta["title"]
-        text = f"*[{scored.score}]* {body}"
+        text = f"**[{scored.score}]** {body}"
         if sig.url:
             text += f"\n{sig.url}"
         if route.show_reasons and scored.reasons:
@@ -111,15 +124,13 @@ class SlackDestination:
         return text
 
     def _post(self, route: _Route, text: str) -> None:
-        if route.footer:
-            text += f"\n{route.footer}"
-        resp = requests.post(
+        post_message(
             route.webhook_url,
-            json={"text": text},
-            headers={"Content-type": "application/json"},
+            text,
             timeout=self._timeout,
+            footer=route.footer,
+            identity=route.identity,
         )
-        resp.raise_for_status()
 
     def _route_for(self, scored: ScoredSignal) -> _Route | None:
         for route in self._routes:
@@ -146,7 +157,7 @@ class SlackDestination:
             lines = self._buffered.get(id(route))
             if not lines:
                 continue
-            header = f"*{len(lines)} signal(s)*"
+            header = f"**{len(lines)} signal(s)**"
             if route.channel_label:
                 header += f" — {route.channel_label}"
             self._post(route, header + "\n\n" + "\n\n".join(lines))
@@ -175,7 +186,13 @@ def _show_reasons(cfg: dict, label: str, default: bool) -> bool:
     return value
 
 
-def _build_route(cfg: dict, label: str, footer: str = "", show_reasons: bool = True) -> _Route:
+def _build_route(
+    cfg: dict,
+    label: str,
+    footer: str = "",
+    show_reasons: bool = True,
+    identity: SlackIdentity | None = None,
+) -> _Route:
     env_name = cfg.get("webhook_env")
     if not env_name:
         raise RuntimeError(f"slack destination: {label} needs a 'webhook_env'")
@@ -188,6 +205,7 @@ def _build_route(cfg: dict, label: str, footer: str = "", show_reasons: bool = T
         channel_label=cfg.get("channel", ""),
         footer=_footer(cfg, label, footer),
         show_reasons=_show_reasons(cfg, label, show_reasons),
+        identity=identity_from_config(cfg, f"slack destination: {label}", identity),
     )
     return retval
 
@@ -196,15 +214,18 @@ def _build_route(cfg: dict, label: str, footer: str = "", show_reasons: bool = T
 def build(cfg: dict) -> Destination:
     footer = _footer(cfg, "destination", "")
     show_reasons = _show_reasons(cfg, "destination", True)
+    identity = identity_from_config(cfg, "slack destination", None)
     declared = cfg.get("routes")
     if isinstance(declared, list) and declared:
         routes = [
-            _build_route(r, r.get("channel") or f"route[{i}]", footer, show_reasons)
+            _build_route(r, r.get("channel") or f"route[{i}]", footer, show_reasons, identity)
             for i, r in enumerate(declared)
         ]
     else:
         # Flat single-route form, for agents that only ever post to one channel.
-        routes = [_build_route(cfg, cfg.get("channel") or "destination", footer, show_reasons)]
+        routes = [
+            _build_route(cfg, cfg.get("channel") or "destination", footer, show_reasons, identity)
+        ]
 
     retval = SlackDestination(
         routes=routes,

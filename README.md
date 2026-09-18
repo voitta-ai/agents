@@ -363,6 +363,38 @@ payload merged with each step's returned dict. Shipped:
 
 ## Operating notes
 
+### Slack renders mrkdwn, not Markdown
+
+Everything this repo posts to a Slack webhook goes through one function,
+`framework/slack.py::post_message`, which converts Markdown to Slack's own
+mrkdwn on the way out (issue #73): headings become bold lines, `[text](url)`
+becomes `<url|text>`, `**bold**` becomes `*bold*`, list markers become bullets,
+and code spans and fenced blocks are left exactly as written. Emphasis fires
+only on word boundaries, so `https://example.com/a__b__c` keeps its underscores:
+a URL that lost a pair is a different URL. `__x__` is not treated as bold at all,
+on purpose: what this repo posts is release notes and scorer reasons about code,
+where `__init__` is an ordinary word and `**bold**` is how anyone here writes
+bold. `&`, `<` and `>` become entities in
+literal text, per Slack's own rule, and never inside a link this repo built, a
+blockquote marker or a code block. Text that holds none of those characters and
+no Markdown is posted unchanged. Code in this repo that builds a header writes
+Markdown (`**Title**`) for the same reason: there is one place that renders.
+
+A message longer than a Slack block (3000 characters) is posted as **several
+messages in order**, split at a paragraph boundary where there is one, never
+truncated; a split inside a fenced block closes and reopens the fence, and a
+cut inside a line falls between grapheme clusters so an emoji is never halved.
+Parts are numbered (`_(part 2 of 3)_`), because another agent sharing the
+webhook can post between them. Only the
+Slack rendering changes: `body_md` in a recorded proposal, which is what a
+WordPress publish step later sends, stays Markdown.
+
+Every webhook destination (`slack`, `digest`, `approval`) also takes `username`
+and `icon_emoji` (with the colons, `:rocket:`) or `icon_url` (issue #77). Several
+agents usually share one webhook, and without them two digests arriving seconds
+apart read as one message. With none of them set the payload is exactly what it
+was before: `{"text": ...}`.
+
 ### Secrets live in the environment, never in config
 
 Each destination names the env var holding its credential (`webhook_env`,

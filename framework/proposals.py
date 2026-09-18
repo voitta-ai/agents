@@ -139,8 +139,16 @@ class ProposalStore:
         tmp.write_text(json.dumps(data, indent=2, sort_keys=True))
         os.replace(tmp, self.path)
 
-    def record(self, action: str, payload: dict[str, Any]) -> dict[str, Any]:
-        """Append a pending proposal and return it (with its new id)."""
+    def reserve(self, action: str, payload: dict[str, Any]) -> dict[str, Any]:
+        """Take the next id and build a pending proposal, without storing it.
+
+        The announcement has to quote the id, and the id has to come from the
+        counter, so a caller that wants to announce *before* it commits needs
+        the two steps apart (issue #73 review): `reserve()`, post, then `add()`.
+        The counter is advanced here and never rewound, so an announcement that
+        fails leaves a gap in the numbering rather than a second proposal
+        claiming an id the channel has already seen.
+        """
         now = datetime.now(timezone.utc)
         with self._locked():
             data = self._read()
@@ -153,9 +161,33 @@ class ProposalStore:
                 "status": STATUS_PENDING,
             }
             data["next_id"] = int(data["next_id"]) + 1
-            data["proposals"].append(proposal)
             self._write(data)
         retval = proposal
+        return retval
+
+    def add(self, proposal: dict[str, Any]) -> dict[str, Any]:
+        """Store a proposal `reserve()` built. Approvable from this moment on."""
+        retval = self.add_all([proposal])[0]
+        return retval
+
+    def add_all(self, proposals: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Store several reserved proposals in one write, all or none.
+
+        A run that announced two actions in one message must not be able to
+        leave the first stored and the second not: the write is a single
+        `os.replace` under the lock, so a failure leaves the store as it was
+        and the next run proposes both again.
+        """
+        with self._locked():
+            data = self._read()
+            data["proposals"].extend(proposals)
+            self._write(data)
+        retval = proposals
+        return retval
+
+    def record(self, action: str, payload: dict[str, Any]) -> dict[str, Any]:
+        """Reserve and store in one step, for a caller that announces nothing."""
+        retval = self.add(self.reserve(action, payload))
         return retval
 
     def with_status(self, status: str) -> list[dict[str, Any]]:
