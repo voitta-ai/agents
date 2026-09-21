@@ -18,7 +18,7 @@ one — a hot lead is not also firehosed, because double-posting the best signal
 is how you train yourself to ignore a channel.
 
 One route is a perfectly good configuration: that is the single-channel
-behaviour the toptal agent uses.
+behaviour most agents here use.
 
 Credentials come from the environment, never from config: a route names its own
 env var via `webhook_env` or `bot_token_env`. That keeps live webhooks and
