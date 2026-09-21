@@ -20,12 +20,23 @@ is how you train yourself to ignore a channel.
 One route is a perfectly good configuration: that is the single-channel
 behaviour the toptal agent uses.
 
-Webhook URLs come from the environment, never from config: each route names its
-own env var via `webhook_env`. That keeps live webhooks out of git — the failure
-this repo already had to clean up twice (issue #7).
+Credentials come from the environment, never from config: a route names its own
+env var via `webhook_env` or `bot_token_env`. That keeps live webhooks and
+tokens out of git — the failure this repo already had to clean up twice
+(issue #7).
 
-Slack incoming webhooks are bound to a channel when they are created, so the
-`channel` key here is a label for humans reading the config, not routing.
+A route posts either through an incoming webhook (`webhook_env`) or through
+`chat.postMessage` (`bot_token_env` plus `channel_id`), exactly one of the two
+(issue #86). The API form is what makes `username` and `icon_emoji` work at
+all: a modern incoming webhook ignores both, so two agents sharing one webhook
+arrive under the same name however they are configured. A destination-level
+`bot_token_env` is the default for every route, so one token can serve several
+routes that each name their own `channel_id`.
+
+Slack incoming webhooks are bound to a channel when they are created, so with
+`webhook_env` the `channel` key is a label for humans reading the config, not
+routing. With `bot_token_env` the routing is `channel_id`, and `channel` stays
+the label.
 
 Two per-route keys shape what a message says (issue #64). Both may also be set
 once at the top level of the destination block, where they are the default for
@@ -63,24 +74,28 @@ destination's job, not the framework's.
 """
 from __future__ import annotations
 
-import os
-
 from framework.interfaces import Destination, ScoredSignal
 from framework.registry import register_destination
-from framework.slack import SlackIdentity, identity_from_config, post_message
+from framework.slack import (
+    SlackIdentity,
+    SlackTransport,
+    identity_from_config,
+    post_message,
+    transport_from_config,
+)
 
 
 class _Route:
     def __init__(
         self,
-        webhook_url: str,
+        transport: SlackTransport,
         min_score: int,
         channel_label: str = "",
         footer: str = "",
         show_reasons: bool = True,
         identity: SlackIdentity | None = None,
     ):
-        self.webhook_url = webhook_url
+        self.transport = transport
         self.min_score = min_score
         self.channel_label = channel_label
         self.footer = footer
@@ -125,7 +140,7 @@ class SlackDestination:
 
     def _post(self, route: _Route, text: str) -> None:
         post_message(
-            route.webhook_url,
+            route.transport,
             text,
             timeout=self._timeout,
             footer=route.footer,
@@ -164,6 +179,22 @@ class SlackDestination:
         self._buffered.clear()
 
 
+_TRANSPORT_KEYS = ("webhook_env", "bot_token_env", "channel_id")
+
+
+def _transport_cfg(cfg: dict, defaults: dict) -> dict:
+    """A route's transport keys, falling back to the destination-level ones.
+
+    One bot token named once at the top, with a `channel_id` per route, is the
+    shape a two-tier agent wants; a route naming its own `webhook_env` still
+    overrides all of it.
+    """
+    retval = {key: cfg[key] for key in _TRANSPORT_KEYS if key in cfg}
+    if not any(key in retval for key in ("webhook_env", "bot_token_env")):
+        retval = {key: defaults[key] for key in _TRANSPORT_KEYS if key in defaults} | retval
+    return retval
+
+
 def _footer(cfg: dict, label: str, default: str) -> str:
     """`footer` for this route, falling back to the destination-level one."""
     value = cfg.get("footer", default)
@@ -192,15 +223,15 @@ def _build_route(
     footer: str = "",
     show_reasons: bool = True,
     identity: SlackIdentity | None = None,
+    timeout: int = 30,
+    transport_defaults: dict | None = None,
 ) -> _Route:
-    env_name = cfg.get("webhook_env")
-    if not env_name:
-        raise RuntimeError(f"slack destination: {label} needs a 'webhook_env'")
-    webhook_url = os.environ.get(env_name)
-    if not webhook_url:
-        raise RuntimeError(f"slack destination: {label} needs the webhook URL in ${env_name}")
     retval = _Route(
-        webhook_url=webhook_url,
+        transport=transport_from_config(
+            _transport_cfg(cfg, transport_defaults or {}),
+            f"slack destination: {label}",
+            timeout,
+        ),
         min_score=int(cfg.get("min_score", 0)),
         channel_label=cfg.get("channel", ""),
         footer=_footer(cfg, label, footer),
@@ -212,24 +243,35 @@ def _build_route(
 
 @register_destination("slack")
 def build(cfg: dict) -> Destination:
+    timeout = int(cfg.get("timeout", 30))
     footer = _footer(cfg, "destination", "")
     show_reasons = _show_reasons(cfg, "destination", True)
     identity = identity_from_config(cfg, "slack destination", None)
     declared = cfg.get("routes")
     if isinstance(declared, list) and declared:
         routes = [
-            _build_route(r, r.get("channel") or f"route[{i}]", footer, show_reasons, identity)
+            _build_route(
+                r,
+                r.get("channel") or f"route[{i}]",
+                footer,
+                show_reasons,
+                identity,
+                timeout,
+                cfg,
+            )
             for i, r in enumerate(declared)
         ]
     else:
         # Flat single-route form, for agents that only ever post to one channel.
         routes = [
-            _build_route(cfg, cfg.get("channel") or "destination", footer, show_reasons, identity)
+            _build_route(
+                cfg, cfg.get("channel") or "destination", footer, show_reasons, identity, timeout
+            )
         ]
 
     retval = SlackDestination(
         routes=routes,
-        timeout=int(cfg.get("timeout", 30)),
+        timeout=timeout,
         mode=cfg.get("mode", "stream"),
     )
     return retval
