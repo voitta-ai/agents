@@ -123,6 +123,8 @@ import unicodedata
 import requests
 
 SLACK_API = "https://slack.com/api"
+# Methods that write and therefore always take a JSON body, whatever this
+# particular call happens to pass. `_needs_json_body` catches the rest.
 _WRITE_METHODS = ("chat.postMessage", "chat.update", "chat.postEphemeral")
 
 # A Slack section block holds 3000 characters; a message that would exceed one
@@ -500,7 +502,7 @@ def _needs_json_body(params: dict) -> bool:
     return retval
 
 
-def slack_api_call(method: str, token: str, timeout: int, **params) -> dict:
+def slack_call(method: str, token: str, timeout: int, **params) -> dict:
     """One Web API call, raising `SlackApiError` on `ok: false`.
 
     A write, or any call carrying a list or dict, goes as a JSON body; the
@@ -567,21 +569,32 @@ class SlackTransport:
             resp.raise_for_status()
             retval = ""
             return retval
-        body = slack_api_call(
+        body = slack_call(
             "chat.postMessage", self.bot_token, self.timeout, channel=self.channel_id, **payload
         )
         retval = str(body.get("ts") or "")
         return retval
 
-    def update(self, ts: str, payload: dict) -> None:
-        """Edit a message this transport posted. API path only."""
+    def update(self, ts: str, payload: dict, timeout: int | None = None) -> None:
+        """Edit a message this transport posted. API path only.
+
+        A webhook transport raises rather than doing nothing: a caller only
+        reaches here holding a stored `ts`, which only the API path ever
+        produces, so arriving with a webhook is a bug and a message that
+        silently keeps its buttons is the worst way to learn about it.
+        """
         if not self.can_edit:
             raise RuntimeError(
                 "slack transport: a message posted through an incoming webhook has no ts "
                 "and cannot be edited; configure 'bot_token_env' and 'channel_id' instead"
             )
-        slack_api_call(
-            "chat.update", self.bot_token, self.timeout, channel=self.channel_id, ts=ts, **payload
+        slack_call(
+            "chat.update",
+            self.bot_token,
+            timeout if timeout is not None else self.timeout,
+            channel=self.channel_id,
+            ts=ts,
+            **payload,
         )
 
 
@@ -677,18 +690,22 @@ def post_message(
 def update_message(
     transport: SlackTransport,
     ts: str,
-    text: str,
+    text: str = "",
     blocks: list | None = None,
     identity: SlackIdentity | None = None,
+    timeout: int | None = None,
 ) -> None:
     """Replace a posted message's text (and blocks) in place.
 
     `blocks=[]` removes them, which is how a resolved proposal loses its
-    buttons. `text` is converted like any other message.
+    buttons. `text` is converted like any other message. The call always goes
+    as a JSON body (`chat.update` is a write), because `blocks` flattened into
+    a query string arrives as `blocks=type&blocks=text` and the message loses
+    every block without saying so.
     """
     payload: dict = {"text": to_mrkdwn(text)}
     if blocks is not None:
         payload["blocks"] = blocks
     if identity:
         payload.update(identity.payload())
-    transport.update(ts, payload)
+    transport.update(ts, payload, timeout)
