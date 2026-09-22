@@ -265,6 +265,14 @@ proposal is already spoken for. One consequence to know: a proposal resolved by
 `ts` to edit. Clicking them afterwards runs nothing and says so, to the clicker
 only.
 
+One operator action to know about: a proposal carries no channel of its own, so
+changing `approvals.channel_id` while proposals are still pending strands them.
+Their buttons refuse as "wrong channel", visibly only to whoever clicked, and
+the reply path will not see a `do` either, since it reads only the configured
+channel's history. Resolve what is pending before moving an agent to a new
+approval channel, or edit `state/proposals.json` and let the next run propose
+them again.
+
 ### Drafting several things at once: `digest` fields
 
 An action whose steps publish a post *and* announce it needs more than one
