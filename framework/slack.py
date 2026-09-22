@@ -77,7 +77,10 @@ needed neither conversion nor splitting is byte-identical to what this repo
 posted before, and a reader scrolling a channel sees the parts in order with no
 block-level truncation to notice. Splits land on a paragraph boundary where one
 exists, then a line boundary, and only inside a line when a single line is
-itself over the limit. A split that would land inside a fenced code block
+itself over the limit. A paragraph longer than the limit is handed to the line
+pass whole rather than cut where the paragraph pass reached: a bullet list with
+no blank line in it is one paragraph, and cutting it mid-word when every line
+in it is short would be a worse split than the one available. A split that would land inside a fenced code block
 closes the fence and reopens it in the next message, so no part renders as
 broken code. Cutting inside a line cuts between **grapheme clusters**, never
 between the code points of one: a ZWJ emoji split down the middle leaves a
@@ -372,7 +375,11 @@ def _hard_split(line: str, limit: int) -> list[str]:
 
 
 def _pack(pieces: list[str], joiner: str, limit: int) -> list[str]:
-    """Greedily fill messages with `pieces`, joined by `joiner`."""
+    """Greedily fill messages with `pieces`, joined by `joiner`.
+
+    A single piece over the limit is cut between grapheme clusters: this runs
+    on lines, where there is no finer boundary left to prefer.
+    """
     retval: list[str] = []
     current = ""
     for piece in pieces:
@@ -421,11 +428,26 @@ def split_for_slack(text: str, limit: int = SLACK_BLOCK_LIMIT) -> list[str]:
     fenced = any(_FENCE_RE.match(line) for line in text.split("\n"))
     room = limit - 8 if fenced else limit
     parts: list[str] = []
-    for block in _pack(text.split("\n\n"), "\n\n", room):
-        if len(block) <= room:
-            parts.append(block)
+    current = ""
+    for paragraph in text.split("\n\n"):
+        candidate = f"{current}\n\n{paragraph}" if current else paragraph
+        if len(candidate) <= room:
+            current = candidate
             continue
-        parts.extend(_pack(block.split("\n"), "\n", room))
+        if current:
+            parts.append(current)
+            current = ""
+        if len(paragraph) <= room:
+            current = paragraph
+            continue
+        # Too long on its own: try its line boundaries before cutting inside a
+        # line. Its last piece stays open, so the paragraph after it can still
+        # share that message rather than starting a nearly empty one.
+        chunks = _pack(paragraph.split("\n"), "\n", room)
+        parts.extend(chunks[:-1])
+        current = chunks[-1]
+    if current:
+        parts.append(current)
     retval = _close_fences(parts)
     return retval
 
