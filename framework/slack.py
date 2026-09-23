@@ -689,13 +689,22 @@ def post_message(
     """
     transport = _as_transport(target, timeout)
     body = to_mrkdwn(text)
+    limit = SLACK_BLOCK_LIMIT - (len(footer) + 1 if footer else 0)
+    if limit <= _MARKER_ROOM:
+        # Every message carries the footer, so a footer this long leaves no
+        # room for the message itself: splitting would post a run of messages
+        # that are all over the limit and all rejected by Slack, which is a
+        # digest quietly going missing.
+        raise ValueError(
+            f"slack footer is {len(footer)} characters, which leaves no room for content "
+            f"under Slack's {SLACK_BLOCK_LIMIT}-character limit"
+        )
     extra = identity.payload() if identity else {}
     if blocks is not None:
         payload = {"text": f"{body}\n{footer}" if footer else body, "blocks": blocks}
         payload.update(extra)
         retval = [transport.post(payload)]
         return retval
-    limit = SLACK_BLOCK_LIMIT - (len(footer) + 1 if footer else 0)
     parts = split_for_slack(body, limit)
     if len(parts) > 1:
         # Numbering costs characters, so the split is redone with room for it
