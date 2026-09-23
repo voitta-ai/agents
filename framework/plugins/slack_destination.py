@@ -79,6 +79,7 @@ from framework.registry import register_destination
 from framework.slack import (
     SlackIdentity,
     SlackTransport,
+    check_footer,
     identity_from_config,
     post_message,
     transport_from_config,
@@ -200,6 +201,10 @@ def _footer(cfg: dict, label: str, default: str) -> str:
     value = cfg.get("footer", default)
     if not isinstance(value, str):
         raise ValueError(f"slack destination: {label} 'footer' must be a string, got {value!r}")
+    # Here rather than only at post time: a footer too long to leave room for a
+    # message is knowable before the run fetches, scores or asks a model
+    # anything, and this names the config key that has to change.
+    check_footer(value, f"slack destination: {label} 'footer'")
     return value
 
 

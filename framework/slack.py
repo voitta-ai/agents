@@ -138,6 +138,11 @@ SLACK_BLOCK_LIMIT = 3000
 # can never push it over the limit.
 _MARKER_ROOM = 24
 
+# The longest footer that still leaves room for a message. A footer rides on
+# every message, costing its length plus the newline before it, and a split
+# message also carries a part marker. See `check_footer`.
+MAX_FOOTER_CHARS = SLACK_BLOCK_LIMIT - _MARKER_ROOM - 2
+
 BULLET = "•"
 _ZWJ = "‍"
 
@@ -171,6 +176,23 @@ _ITALIC_UNDER_RE = re.compile(r"(?<![\w_])_(?!_)(\S(?:[^_\n]*\S)?)_(?!_)(?![\w])
 
 
 _ENTITY_RE = re.compile(r"&(?!amp;|lt;|gt;|#\d+;|#x[0-9a-fA-F]+;)")
+
+
+def check_footer(footer: str, label: str = "slack footer") -> None:
+    """Refuse a footer that leaves no room for the message it rides on.
+
+    Every message carries the footer, so a footer within a part marker's width
+    of the limit turns a long body into a run of messages that are each over
+    the limit and each dropped by Slack: the run reports success and the digest
+    is simply not there. Checked where the config is read, so it fails before
+    the run has paid for an LLM call, and again at post time for a caller whose
+    footer comes from somewhere else.
+    """
+    if len(footer) > MAX_FOOTER_CHARS:
+        raise ValueError(
+            f"{label} is {len(footer)} characters, which leaves no room for content "
+            f"under Slack's {SLACK_BLOCK_LIMIT}-character limit"
+        )
 
 
 def _escape(text: str) -> str:
@@ -689,16 +711,8 @@ def post_message(
     """
     transport = _as_transport(target, timeout)
     body = to_mrkdwn(text)
+    check_footer(footer)
     limit = SLACK_BLOCK_LIMIT - (len(footer) + 1 if footer else 0)
-    if limit <= _MARKER_ROOM:
-        # Every message carries the footer, so a footer this long leaves no
-        # room for the message itself: splitting would post a run of messages
-        # that are all over the limit and all rejected by Slack, which is a
-        # digest quietly going missing.
-        raise ValueError(
-            f"slack footer is {len(footer)} characters, which leaves no room for content "
-            f"under Slack's {SLACK_BLOCK_LIMIT}-character limit"
-        )
     extra = identity.payload() if identity else {}
     if blocks is not None:
         payload = {"text": f"{body}\n{footer}" if footer else body, "blocks": blocks}
