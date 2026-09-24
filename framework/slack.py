@@ -134,6 +134,10 @@ _WRITE_METHODS = ("chat.postMessage", "chat.update", "chat.postEphemeral")
 # is posted as several messages (see the module docstring).
 SLACK_BLOCK_LIMIT = 3000
 
+# A `text` field may hold far more than a section block: it is what the blocks
+# path uses for the notification fallback, which is not split.
+SLACK_TEXT_LIMIT = 40000
+
 # Room kept back for `_(part 12 of 34)_` plus its newline, so numbering a part
 # can never push it over the limit.
 _MARKER_ROOM = 24
@@ -178,6 +182,33 @@ _ITALIC_UNDER_RE = re.compile(r"(?<![\w_])_(?!_)(\S(?:[^_\n]*\S)?)_(?!_)(?![\w])
 _ENTITY_RE = re.compile(r"&(?!amp;|lt;|gt;|#\d+;|#x[0-9a-fA-F]+;)")
 
 
+def _sender(transport: SlackTransport, identity: SlackIdentity | None) -> str:
+    """Who was posting and where, for a message that refuses to go out."""
+    where = f"channel {transport.channel_id}" if transport.can_edit else "an incoming webhook"
+    name = identity.username if identity and identity.username else ""
+    retval = f"{name} to {where}" if name else where
+    return retval
+
+
+def _check_assembled(text: str, limit: int, sender: str) -> None:
+    """Refuse a message that is already over the limit, before posting it.
+
+    The last thing between this repo and the failure it keeps paying for:
+    Slack drops an over-long message without an error, so the run reports
+    success and the digest is simply not there. Every reservation this module
+    makes -- the footer's length and its newline, the part marker's width, the
+    join between paragraphs -- is arithmetic that can be wrong, and whatever
+    the next feature adds to a part is arithmetic nobody has written yet. This
+    measures the bytes instead of predicting them, so a slip anywhere becomes
+    a loud failure naming the size rather than a message nobody receives.
+    """
+    if len(text) > limit:
+        raise ValueError(
+            f"slack message from {sender} assembled to {len(text)} characters, over the "
+            f"{limit}-character limit; refusing to post a message Slack would drop"
+        )
+
+
 def check_footer(footer: str, label: str = "slack footer") -> None:
     """Refuse a footer that leaves no room for the message it rides on.
 
@@ -187,6 +218,10 @@ def check_footer(footer: str, label: str = "slack footer") -> None:
     is simply not there. Checked where the config is read, so it fails before
     the run has paid for an LLM call, and again at post time for a caller whose
     footer comes from somewhere else.
+
+    The threshold sits two characters below the naive one because a footer
+    costs its own length *plus* the newline before it, and the part marker
+    claims the rest. `_check_assembled` is what backstops that arithmetic.
     """
     if len(footer) > MAX_FOOTER_CHARS:
         raise ValueError(
@@ -708,15 +743,24 @@ def post_message(
     `blocks` posts one message carrying them, with the converted text as the
     notification fallback and no splitting, because blocks carry their own
     length handling.
+
+    Every payload is measured immediately before it goes out and refused if it
+    is over the limit: see `_check_assembled` for why that is worth one
+    comparison per message.
     """
     transport = _as_transport(target, timeout)
     body = to_mrkdwn(text)
     check_footer(footer)
     limit = SLACK_BLOCK_LIMIT - (len(footer) + 1 if footer else 0)
     extra = identity.payload() if identity else {}
+    sender = _sender(transport, identity)
     if blocks is not None:
         payload = {"text": f"{body}\n{footer}" if footer else body, "blocks": blocks}
         payload.update(extra)
+        # The blocks carry the content; this `text` is the notification
+        # fallback, which is not split and is held to the `text` limit rather
+        # than a block's.
+        _check_assembled(payload["text"], SLACK_TEXT_LIMIT, sender)
         retval = [transport.post(payload)]
         return retval
     parts = split_for_slack(body, limit)
@@ -728,6 +772,7 @@ def post_message(
     for part in parts:
         payload = {"text": f"{part}\n{footer}" if footer else part}
         payload.update(extra)
+        _check_assembled(payload["text"], SLACK_BLOCK_LIMIT, sender)
         retval.append(transport.post(payload))
     return retval
 
