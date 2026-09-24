@@ -37,7 +37,7 @@ the store's lock, framework/proposals.py), so a click and a reply racing each
 other cannot both run the steps: the loser is told the proposal is already
 spoken for and does nothing.
 
-Two things a reader should not be surprised by:
+Three things a reader should not be surprised by:
 
   - **A proposal resolved by reply keeps its buttons.** The proposal is posted
     through an incoming webhook, which returns no message `ts`, so the polling
@@ -49,6 +49,14 @@ Two things a reader should not be surprised by:
     is nothing to draft, and running the sequence anyway would publish exactly
     what the operator was trying not to publish. The proposal stays pending,
     so Post or Discard still work.
+  - **Changing `channel_id` strands the proposals already posted.** A proposal
+    records no channel of its own, so a click is checked against whatever
+    `channel_id` says now. Move an agent to a new approval channel with
+    proposals still pending in the old one and their buttons refuse as "wrong
+    channel", visibly only to whoever clicked. The reply path has the same
+    shape -- it only reads the configured channel's history -- so the fix is
+    the same either way: resolve what is pending before moving the agent, or
+    edit `state/proposals.json` and let them be re-proposed.
 
 Nothing here logs a token, a payload, a message body or a `response_url`: the
 stdout line per interaction is the proposal id, the verdict and the user id,
@@ -88,6 +96,7 @@ from framework.proposals import (
     STATUS_RUNNING,
     STATUS_SKIPPED,
 )
+from framework.slack import SLACK_BLOCK_LIMIT, split_for_slack
 
 ACTION_POST = "approval:post"
 ACTION_DRAFT = "approval:draft"
@@ -101,11 +110,6 @@ _ACTION_VARIANTS = {
     ACTION_DRAFT: VARIANT_DRAFT,
 }
 
-# Slack rejects a section whose text runs past 3000 characters, and a digest
-# body md can be longer than that. Split on line boundaries instead, well
-# under the limit, rather than truncating content a human is being asked to
-# approve.
-_SECTION_LIMIT = 2800
 
 
 class ListenerError(RuntimeError):
@@ -113,28 +117,21 @@ class ListenerError(RuntimeError):
 
 
 def _sections(text: str) -> list[dict[str, Any]]:
-    """`text` as one or more mrkdwn section blocks, split on line boundaries."""
-    blocks: list[dict[str, Any]] = []
-    chunk = ""
-    for line in text.split("\n"):
-        # A single line longer than the limit is split mid-line; there is no
-        # boundary left to prefer.
-        while len(line) > _SECTION_LIMIT:
-            if chunk:
-                blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": chunk}})
-                chunk = ""
-            blocks.append(
-                {"type": "section", "text": {"type": "mrkdwn", "text": line[:_SECTION_LIMIT]}}
-            )
-            line = line[_SECTION_LIMIT:]
-        candidate = f"{chunk}\n{line}" if chunk else line
-        if len(candidate) > _SECTION_LIMIT:
-            blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": chunk}})
-            chunk = line
-        else:
-            chunk = candidate
-    if chunk:
-        blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": chunk}})
+    """`text` as one or more mrkdwn section blocks (issue #85).
+
+    `split_for_slack` is the repo's one splitting rule, shared with the webhook
+    path: paragraph boundaries first, then lines, and inside a line only when
+    one line is itself longer than the limit -- and there, on a grapheme
+    boundary, so a family emoji or a flag pair is never cut in half. This used
+    to split by code-point index at an arbitrary 2800, which could leave a
+    stray joiner at the head of the next block, and disagreed with the other
+    path about where a long line may be cut. Both now stop at
+    `SLACK_BLOCK_LIMIT`, which is Slack's actual limit for a section's text.
+    """
+    blocks = [
+        {"type": "section", "text": {"type": "mrkdwn", "text": part}}
+        for part in split_for_slack(text, SLACK_BLOCK_LIMIT)
+    ]
     retval = blocks
     return retval
 
