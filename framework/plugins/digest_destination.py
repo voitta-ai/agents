@@ -69,6 +69,12 @@ a value) and `{repos}` has to resolve. A field name that collides with one of
 them is refused at build time rather than shadowed, so a config cannot end up
 with a taxonomy the model wrote.
 
+The digest posts through an incoming webhook (`webhook_env`) or through
+`chat.postMessage` (`bot_token_env` plus `channel_id`), exactly one of the two
+(issue #86). Only the second honours `username` / `icon_emoji`, which is the
+whole point for a deployment running several digests through one Slack app:
+a webhook ignores them and every digest arrives under the same name.
+
 The digest the model writes is Markdown, and it goes out through
 `framework.slack.post_message`, which renders it as mrkdwn and splits a digest
 past the block limit into several messages in order (issue #73). `render()` is
@@ -91,12 +97,17 @@ Contract: see docs/PLUGIN-CONTRACT.md.
 from __future__ import annotations
 
 import json
-import os
 
 from framework.interfaces import Destination, ScoredSignal
 from framework.llm import LLMClient, LLMError, build_client
 from framework.registry import register_destination
-from framework.slack import SlackIdentity, identity_from_config, post_message
+from framework.slack import (
+    SlackIdentity,
+    SlackTransport,
+    identity_from_config,
+    post_message,
+    transport_from_config,
+)
 
 _DEFAULT_SYSTEM = (
     "You write short, factual internal digests. Lead with what matters. "
@@ -201,7 +212,7 @@ def _parse_fields(raw: str, fields: dict[str, str]) -> dict[str, str]:
 class DigestDestination:
     def __init__(
         self,
-        webhook_url: str,
+        transport: SlackTransport,
         llm: LLMClient,
         prompt: str,
         system: str = _DEFAULT_SYSTEM,
@@ -215,7 +226,7 @@ class DigestDestination:
         min_score: int = 0,
         identity: SlackIdentity | None = None,
     ):
-        self.webhook_url = webhook_url
+        self.transport = transport
         self.llm = llm
         self.prompt = prompt
         self.system = system
@@ -281,8 +292,7 @@ class DigestDestination:
         return retval
 
     def _post(self, text: str) -> None:
-        post_message(text=text, webhook_url=self.webhook_url, timeout=self.timeout,
-                     identity=self.identity)
+        post_message(self.transport, text, timeout=self.timeout, identity=self.identity)
 
     def render(self) -> dict:
         """Write the digest without posting it (issue #21).
@@ -400,12 +410,8 @@ class DigestDestination:
 
 @register_destination("digest")
 def build(cfg: dict) -> Destination:
-    env_name = cfg.get("webhook_env")
-    if not env_name:
-        raise RuntimeError("digest destination needs a 'webhook_env'")
-    webhook_url = os.environ.get(env_name)
-    if not webhook_url:
-        raise RuntimeError(f"digest destination needs the webhook URL in ${env_name}")
+    timeout = int(cfg.get("timeout", 30))
+    transport = transport_from_config(cfg, "digest destination", timeout)
 
     prompt = cfg.get("prompt")
     if not prompt:
@@ -449,7 +455,7 @@ def build(cfg: dict) -> Destination:
     llm = build_client(cfg, what="digest destination")
 
     retval = DigestDestination(
-        webhook_url=webhook_url,
+        transport=transport,
         llm=llm,
         prompt=prompt,
         system=cfg.get("system", _DEFAULT_SYSTEM),
@@ -458,7 +464,7 @@ def build(cfg: dict) -> Destination:
         max_signals=int(cfg.get("max_signals", 200)),
         gate=bool(cfg.get("gate", True)),
         channel_label=cfg.get("channel", ""),
-        timeout=int(cfg.get("timeout", 30)),
+        timeout=timeout,
         fields=fields,
         min_score=int(cfg.get("min_score", 0)),
         identity=identity_from_config(cfg, "digest destination"),

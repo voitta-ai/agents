@@ -397,16 +397,41 @@ webhook can post between them. Only the
 Slack rendering changes: `body_md` in a recorded proposal, which is what a
 WordPress publish step later sends, stays Markdown.
 
-Every webhook destination (`slack`, `digest`, `approval`) also takes `username`
-and `icon_emoji` (with the colons, `:rocket:`) or `icon_url` (issue #77). Several
-agents usually share one webhook, and without them two digests arriving seconds
-apart read as one message. With none of them set the payload is exactly what it
-was before: `{"text": ...}`.
+### Two ways to reach Slack, and why the second one matters
+
+A Slack destination (`slack`, `digest`) and the `slack-post` action name either
+an incoming webhook or a bot token, exactly one (issue #86):
+
+```json
+{"type": "digest", "webhook_env": "SOME_WEBHOOK", "prompt": "..."}
+{"type": "digest", "bot_token_env": "SOME_BOT_TOKEN", "channel_id": "C0123456789",
+ "prompt": "...", "username": "release notes", "icon_emoji": ":package:"}
+```
+
+Conversion, splitting, footers, part markers and blocks are identical on both.
+Naming both, or neither, fails at build time. Two things differ:
+
+- **`username` / `icon_emoji` / `icon_url` (issue #77) only work with a bot
+  token.** A modern incoming webhook ignores them: the post returns `ok` and
+  the message still arrives under the app's own name, so several agents sharing
+  one webhook are indistinguishable however they are configured. Through
+  `chat.postMessage` they are honoured, given the bot's `chat:write.customize`
+  scope. The keys ride on the payload either way, since a webhook ignoring them
+  is not an error.
+- **Only a bot token gets a message `ts` back.** A webhook answers `ok` and
+  nothing else, so a message posted through one can never be edited afterwards
+  — which is why a proposal announced over a webhook keeps its buttons after it
+  has been resolved. With a token, `post_message` returns the `ts` of every
+  message it posted and `update_message` can edit it in place.
+
+The bot needs `chat:write`, plus `chat:write.customize` for the name and icon,
+and it has to be in the channel `channel_id` names. A route may carry its own
+`channel_id` under one destination-level `bot_token_env`.
 
 ### Secrets live in the environment, never in config
 
 Each destination names the env var holding its credential (`webhook_env`,
-`api_key_env`). Real per-agent `config.json` files live in workspaces outside
+`bot_token_env`, `api_key_env`). Real per-agent `config.json` files live in workspaces outside
 the checkout; only `config.example.json` is committed. The framework itself only
 ever reads `os.environ` when it builds a destination — how those variables get
 there is the deployment's business, not this repo's.

@@ -77,7 +77,10 @@ needed neither conversion nor splitting is byte-identical to what this repo
 posted before, and a reader scrolling a channel sees the parts in order with no
 block-level truncation to notice. Splits land on a paragraph boundary where one
 exists, then a line boundary, and only inside a line when a single line is
-itself over the limit. A split that would land inside a fenced code block
+itself over the limit. A paragraph longer than the limit is handed to the line
+pass whole rather than cut where the paragraph pass reached: a bullet list with
+no blank line in it is one paragraph, and cutting it mid-word when every line
+in it is short would be a worse split than the one available. A split that would land inside a fenced code block
 closes the fence and reopens it in the next message, so no part renders as
 broken code. Cutting inside a line cuts between **grapheme clusters**, never
 between the code points of one: a ZWJ emoji split down the middle leaves a
@@ -90,11 +93,24 @@ agent sharing the webhook can post between them, and without the marker a
 reader cannot tell a continuation from an unrelated message that landed in the
 middle.
 
-**Identity** (issue #77): `username`, `icon_emoji` and `icon_url` ride on the
-payload. Several agents post through one webhook, and without these every
-digest arrives under the same bot name, so two that land seconds apart read as
-one message. Unset means the payload does not carry the key at all and Slack
-uses the webhook's own identity, exactly as before.
+**Two transports** (issue #86). A destination names either `webhook_env`, an
+incoming webhook, or `bot_token_env` plus `channel_id`, which posts through
+`chat.postMessage`. Exactly one, and a block naming both or neither fails at
+build time. Conversion, splitting, the footer, the part markers and blocks are
+identical on both; the difference is what Slack does with them:
+
+  - **Identity actually works only on the API path.** `username` and
+    `icon_emoji` (issue #77) are ignored by a modern incoming webhook — the
+    post returns `ok` and the stored message has `username: None` — while
+    `chat.postMessage` honours them, given the bot's `chat:write.customize`
+    scope. The keys ride on the payload either way, since a webhook ignoring
+    them is not an error, but a deployment that wants two digests to look
+    different has to use a bot token.
+  - **Only the API path returns a message `ts`.** A webhook answers `ok` and
+    nothing else, which is why a proposal announced through one can never have
+    its buttons removed once it is resolved. `post_message` returns the `ts` of
+    every message it posted (empty on the webhook path), so a caller that keeps
+    one can edit that message later through `update_message`.
 
 The `footer` (issue #64) is appended after conversion, verbatim, to *every*
 message a split produces: it exists for a standing line that has to be on every
@@ -103,18 +119,33 @@ not that.
 """
 from __future__ import annotations
 
+import os
 import re
 import unicodedata
 
 import requests
 
+SLACK_API = "https://slack.com/api"
+# Methods that write and therefore always take a JSON body, whatever this
+# particular call happens to pass. `_needs_json_body` catches the rest.
+_WRITE_METHODS = ("chat.postMessage", "chat.update", "chat.postEphemeral")
+
 # A Slack section block holds 3000 characters; a message that would exceed one
 # is posted as several messages (see the module docstring).
 SLACK_BLOCK_LIMIT = 3000
 
+# A `text` field may hold far more than a section block: it is what the blocks
+# path uses for the notification fallback, which is not split.
+SLACK_TEXT_LIMIT = 40000
+
 # Room kept back for `_(part 12 of 34)_` plus its newline, so numbering a part
 # can never push it over the limit.
 _MARKER_ROOM = 24
+
+# The longest footer that still leaves room for a message. A footer rides on
+# every message, costing its length plus the newline before it, and a split
+# message also carries a part marker. See `check_footer`.
+MAX_FOOTER_CHARS = SLACK_BLOCK_LIMIT - _MARKER_ROOM - 2
 
 BULLET = "•"
 _ZWJ = "‍"
@@ -149,6 +180,54 @@ _ITALIC_UNDER_RE = re.compile(r"(?<![\w_])_(?!_)(\S(?:[^_\n]*\S)?)_(?!_)(?![\w])
 
 
 _ENTITY_RE = re.compile(r"&(?!amp;|lt;|gt;|#\d+;|#x[0-9a-fA-F]+;)")
+
+
+def _sender(transport: SlackTransport, identity: SlackIdentity | None) -> str:
+    """Who was posting and where, for a message that refuses to go out."""
+    where = f"channel {transport.channel_id}" if transport.can_edit else "an incoming webhook"
+    name = identity.username if identity and identity.username else ""
+    retval = f"{name} to {where}" if name else where
+    return retval
+
+
+def _check_assembled(text: str, limit: int, sender: str) -> None:
+    """Refuse a message that is already over the limit, before posting it.
+
+    The last thing between this repo and the failure it keeps paying for:
+    Slack drops an over-long message without an error, so the run reports
+    success and the digest is simply not there. Every reservation this module
+    makes -- the footer's length and its newline, the part marker's width, the
+    join between paragraphs -- is arithmetic that can be wrong, and whatever
+    the next feature adds to a part is arithmetic nobody has written yet. This
+    measures the bytes instead of predicting them, so a slip anywhere becomes
+    a loud failure naming the size rather than a message nobody receives.
+    """
+    if len(text) > limit:
+        raise ValueError(
+            f"slack message from {sender} assembled to {len(text)} characters, over the "
+            f"{limit}-character limit; refusing to post a message Slack would drop"
+        )
+
+
+def check_footer(footer: str, label: str = "slack footer") -> None:
+    """Refuse a footer that leaves no room for the message it rides on.
+
+    Every message carries the footer, so a footer within a part marker's width
+    of the limit turns a long body into a run of messages that are each over
+    the limit and each dropped by Slack: the run reports success and the digest
+    is simply not there. Checked where the config is read, so it fails before
+    the run has paid for an LLM call, and again at post time for a caller whose
+    footer comes from somewhere else.
+
+    The threshold sits two characters below the naive one because a footer
+    costs its own length *plus* the newline before it, and the part marker
+    claims the rest. `_check_assembled` is what backstops that arithmetic.
+    """
+    if len(footer) > MAX_FOOTER_CHARS:
+        raise ValueError(
+            f"{label} is {len(footer)} characters, which leaves no room for content "
+            f"under Slack's {SLACK_BLOCK_LIMIT}-character limit"
+        )
 
 
 def _escape(text: str) -> str:
@@ -353,7 +432,11 @@ def _hard_split(line: str, limit: int) -> list[str]:
 
 
 def _pack(pieces: list[str], joiner: str, limit: int) -> list[str]:
-    """Greedily fill messages with `pieces`, joined by `joiner`."""
+    """Greedily fill messages with `pieces`, joined by `joiner`.
+
+    A single piece over the limit is cut between grapheme clusters: this runs
+    on lines, where there is no finer boundary left to prefer.
+    """
     retval: list[str] = []
     current = ""
     for piece in pieces:
@@ -402,11 +485,26 @@ def split_for_slack(text: str, limit: int = SLACK_BLOCK_LIMIT) -> list[str]:
     fenced = any(_FENCE_RE.match(line) for line in text.split("\n"))
     room = limit - 8 if fenced else limit
     parts: list[str] = []
-    for block in _pack(text.split("\n\n"), "\n\n", room):
-        if len(block) <= room:
-            parts.append(block)
+    current = ""
+    for paragraph in text.split("\n\n"):
+        candidate = f"{current}\n\n{paragraph}" if current else paragraph
+        if len(candidate) <= room:
+            current = candidate
             continue
-        parts.extend(_pack(block.split("\n"), "\n", room))
+        if current:
+            parts.append(current)
+            current = ""
+        if len(paragraph) <= room:
+            current = paragraph
+            continue
+        # Too long on its own: try its line boundaries before cutting inside a
+        # line. Its last piece stays open, so the paragraph after it can still
+        # share that message rather than starting a nearly empty one.
+        chunks = _pack(paragraph.split("\n"), "\n", room)
+        parts.extend(chunks[:-1])
+        current = chunks[-1]
+    if current:
+        parts.append(current)
     retval = _close_fences(parts)
     return retval
 
@@ -466,34 +564,238 @@ def identity_from_config(cfg: dict, label: str, default: SlackIdentity | None = 
     return retval
 
 
+class SlackApiError(RuntimeError):
+    """Slack answered, but with `ok: false`."""
+
+
+def _needs_json_body(params: dict) -> bool:
+    """Whether these params have to go as a JSON body rather than a query string.
+
+    The rule is the shape of the payload, not a list of method names. A param
+    that is a list or a dict (`blocks`, `attachments`) cannot survive a query
+    string: `requests` flattens a list of dicts into one repeated key per dict
+    *key*, so `blocks=[{"type": "section", "text": {...}}]` goes out as
+    `blocks=type&blocks=text` and the message arrives with every block gone.
+    """
+    retval = any(isinstance(value, (list, dict)) for value in params.values())
+    return retval
+
+
+def slack_call(method: str, token: str, timeout: int, **params) -> dict:
+    """One Web API call, raising `SlackApiError` on `ok: false`.
+
+    A write, or any call carrying a list or dict, goes as a JSON body; the
+    rest as a query string. Nothing here logs: the token is in the header and
+    the params are the message itself.
+    """
+    if method in _WRITE_METHODS or _needs_json_body(params):
+        resp = requests.post(
+            f"{SLACK_API}/{method}",
+            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+            json=params,
+            timeout=timeout,
+        )
+    else:
+        resp = requests.get(
+            f"{SLACK_API}/{method}",
+            headers={"Authorization": f"Bearer {token}"},
+            params=params,
+            timeout=timeout,
+        )
+    resp.raise_for_status()
+    body = resp.json()
+    if not isinstance(body, dict) or not body.get("ok"):
+        error = body.get("error") if isinstance(body, dict) else "unreadable response"
+        raise SlackApiError(f"{method}: {error}")
+    retval = body
+    return retval
+
+
+class SlackTransport:
+    """Where a message goes: an incoming webhook, or `chat.postMessage`.
+
+    `post()` takes the finished payload and returns the message `ts`, which is
+    `""` on the webhook path because Slack does not send one back. `can_edit`
+    says which kind this is, so a caller can decide what to promise a human
+    (buttons that will be tidied up, or buttons that cannot be).
+    """
+
+    def __init__(
+        self,
+        webhook_url: str = "",
+        bot_token: str = "",
+        channel_id: str = "",
+        timeout: int = 30,
+    ):
+        self.webhook_url = webhook_url
+        self.bot_token = bot_token
+        self.channel_id = channel_id
+        self.timeout = timeout
+
+    @property
+    def can_edit(self) -> bool:
+        retval = bool(self.bot_token)
+        return retval
+
+    def post(self, payload: dict) -> str:
+        if not self.bot_token:
+            resp = requests.post(
+                self.webhook_url,
+                json=payload,
+                headers={"Content-type": "application/json"},
+                timeout=self.timeout,
+            )
+            resp.raise_for_status()
+            retval = ""
+            return retval
+        body = slack_call(
+            "chat.postMessage", self.bot_token, self.timeout, channel=self.channel_id, **payload
+        )
+        retval = str(body.get("ts") or "")
+        return retval
+
+    def update(self, ts: str, payload: dict, timeout: int | None = None) -> None:
+        """Edit a message this transport posted. API path only.
+
+        A webhook transport raises rather than doing nothing: a caller only
+        reaches here holding a stored `ts`, which only the API path ever
+        produces, so arriving with a webhook is a bug and a message that
+        silently keeps its buttons is the worst way to learn about it.
+        """
+        if not self.can_edit:
+            raise RuntimeError(
+                "slack transport: a message posted through an incoming webhook has no ts "
+                "and cannot be edited; configure 'bot_token_env' and 'channel_id' instead"
+            )
+        slack_call(
+            "chat.update",
+            self.bot_token,
+            timeout if timeout is not None else self.timeout,
+            channel=self.channel_id,
+            ts=ts,
+            **payload,
+        )
+
+
+def transport_from_config(cfg: dict, label: str, timeout: int = 30) -> SlackTransport:
+    """Build the transport a destination or route block asks for.
+
+    Exactly one of `webhook_env` or `bot_token_env` + `channel_id`. Naming both
+    is refused rather than resolved by precedence: the two differ in whether
+    `username` is honoured and whether a message can be edited later, so a
+    config that names both is a question, not a preference.
+    """
+    webhook_env = cfg.get("webhook_env")
+    token_env = cfg.get("bot_token_env")
+    if webhook_env and token_env:
+        raise ValueError(
+            f"{label} names both 'webhook_env' and 'bot_token_env'; set one. A bot token "
+            "posts through chat.postMessage, which honours 'username'/'icon_emoji' and "
+            "returns a message ts; an incoming webhook does neither"
+        )
+    if not webhook_env and not token_env:
+        raise RuntimeError(
+            f"{label} needs either a 'webhook_env' or a 'bot_token_env' with a 'channel_id'"
+        )
+    if webhook_env:
+        webhook_url = os.environ.get(webhook_env)
+        if not webhook_url:
+            raise RuntimeError(f"{label} needs the webhook URL in ${webhook_env}")
+        retval = SlackTransport(webhook_url=webhook_url, timeout=timeout)
+        return retval
+    bot_token = os.environ.get(token_env)
+    if not bot_token:
+        raise RuntimeError(f"{label} needs the bot token in ${token_env}")
+    channel_id = cfg.get("channel_id")
+    if not channel_id or not isinstance(channel_id, str):
+        raise RuntimeError(
+            f"{label} needs a 'channel_id' next to 'bot_token_env' (a webhook carries its own "
+            "channel, chat.postMessage does not)"
+        )
+    retval = SlackTransport(bot_token=bot_token, channel_id=channel_id, timeout=timeout)
+    return retval
+
+
+def _as_transport(target: SlackTransport | str, timeout: int) -> SlackTransport:
+    if isinstance(target, SlackTransport):
+        retval = target
+        return retval
+    retval = SlackTransport(webhook_url=target, timeout=timeout)
+    return retval
+
+
 def post_message(
-    webhook_url: str,
+    target: SlackTransport | str,
     text: str,
     timeout: int = 30,
     footer: str = "",
     identity: SlackIdentity | None = None,
-) -> None:
+    blocks: list | None = None,
+) -> list[str]:
     """Convert `text` to mrkdwn and post it, split into several messages if long.
 
-    The single way out of this process to an incoming webhook. `footer` is
+    The single way out of this process to Slack. `target` is a `SlackTransport`
+    or, for a caller that has only ever had one, a webhook URL. `footer` is
     appended verbatim, after conversion, to every message posted, and a message
-    that had to be split carries a part marker.
+    that had to be split carries a part marker. Returns the `ts` of each message
+    posted, which is empty strings on the webhook path.
+
+    `blocks` posts one message carrying them, with the converted text as the
+    notification fallback and no splitting, because blocks carry their own
+    length handling.
+
+    Every payload is measured immediately before it goes out and refused if it
+    is over the limit: see `_check_assembled` for why that is worth one
+    comparison per message.
     """
+    transport = _as_transport(target, timeout)
     body = to_mrkdwn(text)
+    check_footer(footer)
     limit = SLACK_BLOCK_LIMIT - (len(footer) + 1 if footer else 0)
+    extra = identity.payload() if identity else {}
+    sender = _sender(transport, identity)
+    if blocks is not None:
+        payload = {"text": f"{body}\n{footer}" if footer else body, "blocks": blocks}
+        payload.update(extra)
+        # The blocks carry the content; this `text` is the notification
+        # fallback, which is not split and is held to the `text` limit rather
+        # than a block's.
+        _check_assembled(payload["text"], SLACK_TEXT_LIMIT, sender)
+        retval = [transport.post(payload)]
+        return retval
     parts = split_for_slack(body, limit)
     if len(parts) > 1:
         # Numbering costs characters, so the split is redone with room for it
         # rather than letting a marker push the last part over the limit.
         parts = _numbered(split_for_slack(body, limit - _MARKER_ROOM))
-    extra = identity.payload() if identity else {}
+    retval = []
     for part in parts:
         payload = {"text": f"{part}\n{footer}" if footer else part}
         payload.update(extra)
-        resp = requests.post(
-            webhook_url,
-            json=payload,
-            headers={"Content-type": "application/json"},
-            timeout=timeout,
-        )
-        resp.raise_for_status()
+        _check_assembled(payload["text"], SLACK_BLOCK_LIMIT, sender)
+        retval.append(transport.post(payload))
+    return retval
+
+
+def update_message(
+    transport: SlackTransport,
+    ts: str,
+    text: str = "",
+    blocks: list | None = None,
+    identity: SlackIdentity | None = None,
+    timeout: int | None = None,
+) -> None:
+    """Replace a posted message's text (and blocks) in place.
+
+    `blocks=[]` removes them, which is how a resolved proposal loses its
+    buttons. `text` is converted like any other message. The call always goes
+    as a JSON body (`chat.update` is a write), because `blocks` flattened into
+    a query string arrives as `blocks=type&blocks=text` and the message loses
+    every block without saying so.
+    """
+    payload: dict = {"text": to_mrkdwn(text)}
+    if blocks is not None:
+        payload["blocks"] = blocks
+    if identity:
+        payload.update(identity.payload())
+    transport.update(ts, payload, timeout)

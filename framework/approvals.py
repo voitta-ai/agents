@@ -101,8 +101,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-import requests
-
 from framework.config import CONFIG_FILENAME, ConfigError
 from framework.proposals import (
     STATUS_DONE,
@@ -115,11 +113,10 @@ from framework.proposals import (
     proposals_path,
 )
 from framework.registry import build_action
+# Moved to framework/slack.py (issue #86), where the whole posting path lives;
+# re-exported until the approvals path imports it from there directly.
+from framework.slack import SlackApiError, slack_call as _slack_call
 
-_SLACK_API = "https://slack.com/api"
-# Methods that write and therefore always take a JSON body, whatever this
-# particular call happens to pass. `_needs_json_body` catches the rest.
-_WRITE_METHODS = ("chat.postMessage", "chat.update", "chat.postEphemeral")
 _REPLY_RE = re.compile(r"^(do|skip)\s+(\S+)$")
 _DEFAULT_HOURS = 24
 
@@ -237,49 +234,6 @@ def load_approvals_config(workspace: str | Path) -> ApprovalsConfig:
 
 def _now_iso() -> str:
     retval = datetime.now(timezone.utc).isoformat(timespec="seconds")
-    return retval
-
-
-class SlackApiError(RuntimeError):
-    """Slack answered, but with `ok: false`."""
-
-
-def _needs_json_body(params: dict[str, Any]) -> bool:
-    """Whether these params have to go as a JSON body rather than a query string.
-
-    The rule is the shape of the payload, not a list of method names. A param
-    that is a list or a dict (`blocks`, `attachments`) cannot survive a query
-    string: `requests` flattens a list of dicts into one repeated key per dict
-    *key*, so `blocks=[{"type": "section", "text": {...}}]` goes out as
-    `blocks=type&blocks=text` and the message arrives with every block gone.
-    That is how `chat.update` was broken when it was added as a caller and the
-    branch here still only named `chat.postMessage` (issue #74 review).
-    """
-    retval = any(isinstance(value, (list, dict)) for value in params.values())
-    return retval
-
-
-def _slack_call(method: str, token: str, timeout: int, **params: Any) -> dict[str, Any]:
-    if method in _WRITE_METHODS or _needs_json_body(params):
-        resp = requests.post(
-            f"{_SLACK_API}/{method}",
-            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
-            json=params,
-            timeout=timeout,
-        )
-    else:
-        resp = requests.get(
-            f"{_SLACK_API}/{method}",
-            headers={"Authorization": f"Bearer {token}"},
-            params=params,
-            timeout=timeout,
-        )
-    resp.raise_for_status()
-    body = resp.json()
-    if not isinstance(body, dict) or not body.get("ok"):
-        error = body.get("error") if isinstance(body, dict) else "unreadable response"
-        raise SlackApiError(f"{method}: {error}")
-    retval = body
     return retval
 
 
