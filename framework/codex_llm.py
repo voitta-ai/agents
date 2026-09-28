@@ -347,8 +347,17 @@ class CodexLLM(CustomLLM):
         try:
             resp = httpx.post(_ENDPOINT, json=body,
                               headers=_headers(token, account_id), timeout=secs)
+        # Never litellm.APIConnectionError: the Router skips cooldown for any
+        # error whose text contains that name, so a hung or unreachable codex
+        # was dialled twice on every call (num_retries=1), each attempt paying
+        # the full rung timeout. A Timeout (408) and a 500 are what litellm
+        # raises for an HTTP rung in the same state, and both are cooled.
+        except httpx.TimeoutException as exc:
+            raise litellm.Timeout(
+                message=f"codex: {type(exc).__name__}",
+                model=model, llm_provider=PROVIDER)
         except httpx.HTTPError as exc:
-            raise litellm.APIConnectionError(
+            raise litellm.InternalServerError(
                 message=f"codex: {type(exc).__name__}",
                 llm_provider=PROVIDER, model=model)
         if resp.status_code != 200:

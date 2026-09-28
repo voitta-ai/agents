@@ -48,10 +48,10 @@ Budget parking. LiteLLM cools only on status (429/401/408/404), and budget
 exhaustion is neither: Anthropic answers a usage cap with 400, OpenRouter answers
 no-credit with 402. Fallback still covers the call, but the dead vendor would be
 re-dialled first on every run for as long as the cap lasts -- weeks, in the case
-that prompted shmobster's version. So a failure whose status is 400/402/403 and
-whose message names a spend problem (`_BUDGET_MARKERS`) parks that vendor: its
-expiry goes into `<workspace>/state/llm-parked.json`, and the Router is rebuilt
-without it until then. The expiry is the vendor's own "regain access on
+that prompted shmobster's version. So a 402, or a 400/403 whose message names a
+spend problem (`_BUDGET_MARKERS`), parks that vendor: its expiry goes into
+`<workspace>/state/llm-parked.json`, and the Router is rebuilt without it until
+then. The expiry is the vendor's own "regain access on
 YYYY-MM-DD" when it states one and the date is in the future (clamped to 31
 days, with the park line saying so), else `budget_park_sec` from now. The file
 is pruned on read, which is what brings a
@@ -177,10 +177,16 @@ class _Vendor:
 
 
 def is_budget_error(exc: BaseException) -> bool:
-    """A 4xx that names a spend problem. Status alone is not enough: 400 is also
-    'your request was malformed', and 402 is unambiguous but rare."""
+    """A 402, or a 400/403 that names a spend problem. A 402 needs no marker:
+    it has no other reading, and OpenRouter's most common one -- "This request
+    requires more credits, or fewer max_tokens ... can only afford N" -- names
+    none, so it was re-dialled on every call. A 400 still needs one, because it
+    is also 'your request was malformed'."""
     status = getattr(exc, "status_code", None)
-    if status not in (400, 402, 403):
+    if status == 402:
+        retval = True
+        return retval
+    if status not in (400, 403):
         retval = False
         return retval
     text = str(getattr(exc, "message", "") or str(exc)).lower()
