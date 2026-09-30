@@ -150,6 +150,50 @@ plugins that do not need them are unaffected.
   either: an unscored signal is left unmarked so the next run retries it, and
   that only works if the next run's window still contains it.
 
+## Composite plugins: `multi` source and `fanout` destination (issue #57)
+
+A plugin may itself be built from other plugins. Two ship: `multi`, a source
+holding several child sources, and `fanout`, a destination holding several child
+destinations. Both build their children through the same `build_source` /
+`build_destination` the runner uses, so any plugin works as a child of either
+without knowing it is one.
+
+Two rules matter for anyone writing a third composite.
+
+- **Carry the injected run-level keys down.** `agent run` injects `state_dir`
+  into the top-level source block and `_workspace` / `_root` into the scorer and
+  destination blocks. A factory sees only its own block, so a nested child sees
+  none of them unless the composite copies them into each child's block. Without
+  that, a `github-releases` child has nowhere to keep its fetch window and a
+  `digest` child cannot build its LLM client. A child that sets one of these
+  itself keeps its own value.
+- **Namespace what the children mint, and say that the namespace is load-bearing.**
+  Two child sources can legitimately produce the same `Signal.id` — for the
+  meetups agent, the `ics` and `websearch` children can both reach the same
+  chamber event, one by feed UID and one by URL. `multi` therefore prefixes every
+  id with the child's `name`, which makes the name part of the dedupe key: rename
+  a child and everything it produces is delivered again. That is why `name` is
+  required rather than defaulted to a position — a positional default shifts when
+  the list is reordered, and the resulting re-delivery is silent and delayed.
+  `fanout` needs no such key, because a destination mints no ids.
+
+Failure policy differs between the two, and the difference is not arbitrary.
+
+- `multi` fails the run on a child's failure by default, because a feed that
+  stops answering is the failure this repo has been bitten by twice. `optional:
+  true` on a child downgrades that to a stderr line and a `degraded=` count.
+  **Every child failing raises regardless**, however optional each one was: a
+  wholly dead source must never render as a quiet run. `optional` covers
+  `fetch()` only — a child that cannot be *built* is a misconfiguration that
+  would fail identically on every run, so it raises at construction.
+- `fanout` attempts **every** child before raising, on `send()` and `flush()`
+  alike, then raises naming all of the failures. Stopping at the first would let
+  one dead webhook silently cost the second channel its digest — and `flush()` is
+  where a digest child does its posting, so this is the difference between one
+  channel missing a digest and both missing it. A partial failure still fails the
+  run, so the next run re-delivers to every child including the ones that
+  succeeded: at-least-once, matching the runner's stated bias.
+
 ## The run loop (already implemented, `framework/runner.py`)
 
 ```

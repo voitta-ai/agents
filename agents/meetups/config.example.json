@@ -1,0 +1,75 @@
+{
+  "_comment": "Weekly in-person event discovery (issue #57), and the worked example of the three pieces that issue added: a 'multi' source over several feeds, a 'websearch' source that treats a search engine as a source, and a 'fanout' destination sending one digest to two channels. Placeholders only - copy into a workspace directory as config.json, outside any git checkout, and fill in real values. Secrets never live here: each feed URL and webhook URL is named as an env var, and the Brave key is read from the environment.",
+  "agent": "meetups",
+  "schedule": "0 17 * * 0",
+  "source": {
+    "type": "multi",
+    "_comment": "Each child is built exactly as a top-level source would be, and every id it produces is prefixed with the child's 'name'. That prefix is part of the dedupe key, so renaming a child re-delivers everything it produces - a name is a stable identifier, not a label. 'optional': true degrades a failed child to a stderr line and a degraded= count instead of failing the run; use it for one feed among many, never for the only way the agent sees anything. Every child failing still fails the run, however optional each one was.",
+    "sources": [
+      {
+        "name": "chamber",
+        "type": "ics",
+        "_comment": "A chamber of commerce that publishes an iCal feed. The URL is a bearer secret, so the ics source reads it only from the environment. Optional because one chamber among a dozen queries changes the digest's completeness, not its point. Two known limits, tracked on issue #59 rather than papered over here: the ics source windows to *tomorrow* only, which is wrong for a weekly digest that tiers events out to eight weeks, and it requires 'owner_email' to split MUST ATTEND from MAY CONSIDER - a concept a public chamber calendar does not have, where every event is somebody else's. Until #59 lands, this child reports tomorrow's chamber events and labels them all as personal commitments.",
+        "url_env": "MEETUPS_ICS_CHAMBER",
+        "owner_email": "you@example.com",
+        "timezone": "America/Los_Angeles",
+        "label": "Placeholder Chamber of Commerce",
+        "optional": true
+      },
+      {
+        "name": "web",
+        "type": "websearch",
+        "_comment": "Brave Search. 'freshness': 'pw' is Brave's past-week window, matching the weekly cadence. 'fetch_page': true appends each result page's visible text, because a listing's date, venue and cost are on the page and not in the snippet - but it is a plain GET with no JavaScript, so a client-rendered page yields the snippet only and says so in meta.page_error rather than failing. Measured caveat on query precision: a bare place name pulls in homonyms (a query naming a city returned a company with that city in its name), and 'site:' does not constrain geography, so expect the scorer to do the filtering and keep queries specific.",
+        "api_key_env": "BRAVE_API_KEY",
+        "count": 10,
+        "freshness": "pw",
+        "fetch_page": true,
+        "queries": [
+          "<city> small business owners networking event",
+          "<city> chamber of commerce mixer",
+          "site:eventbrite.com <city> small business",
+          "site:meetup.com <region> small business owners",
+          "site:lu.ma <city> business",
+          "<region> SBDC events"
+        ]
+      }
+    ]
+  },
+  "scorer": {
+    "type": "llm",
+    "_comment": "The rubric is the prompt: issue #57 deliberately adds no 'events' scorer, because what makes an event worth attending is taste that gets tuned by reading real output. No 'llm' block, so the deployment's shared waterfall applies.",
+    "prompt": "Score this event for someone who wants to meet owners of small non-technology businesses in person, to hear their operational problems first-hand. This is market research, not selling. Rate five dimensions 1-5 and reply with their sum (5-25) as the score: Audience (are attendees owners and operators of non-tech small businesses, rather than startup founders, developers, investors, or vendors selling to them), Topic (operations, running the business, or technology adoption for it), Credibility (does attending build local standing), Conversation (are these people plausibly helpable), Access (in person and within the configured region; anything online-only, outside the region, or already past scores 1). In reasons give one line per dimension, then the event's date, time, venue, cost and registration link if the text shows them, and say whether it recurs weekly or monthly.",
+    "max_chars": 6000
+  },
+  "destination": {
+    "type": "fanout",
+    "_comment": "The same digest to two channels. Each 'digest' child drafts independently, so the two messages will not be word-for-word identical - two LLM calls a week, accepted rather than worked around (a config needing byte-identical text should post once and let Slack share the message). Every child is attempted before a failure is raised, so one dead webhook does not cost the other channel its digest.",
+    "destinations": [
+      {
+        "type": "digest",
+        "webhook_env": "MEETUPS_SLACK_WEBHOOK_ONE",
+        "channel": "#channel-one",
+        "title": "Meetups this week",
+        "empty_message": "Meetups: no events found this week.",
+        "gate": false,
+        "show_scores": true,
+        "_comment": "'show_scores': true without any 'min_score' is what issue #57 added to the digest destination, and this config is why: the digest groups events into tiers by score and prints one reason line per rubric dimension, so the model must see both - but the tiering is the filter, so there is no threshold to gate on. Before that option, scores and reasons reached the model only when 'min_score' was set, and this digest would have been written from titles and URLs with the rubric silently discarded.",
+        "prompt": "Write this week's meetups digest in Markdown from the scored events below. Each carries a score out of 25 and one reason line per rubric dimension. Order: a 'Standing rooms' section first for anything recurring, listed once rather than once per occurrence; then 'This week's pick', the one or two best rooms with date, time, venue, score and registration link; then 'Dated events' grouped by tier, each line giving date, name, venue, cost, score, a one-line why, and the link. Leave out anything past, anything outside the configured region, and anything below the lowest tier. Registering is the reader's own click: propose, never register.",
+        "username": "Meetups",
+        "icon_emoji": ":round_pushpin:"
+      },
+      {
+        "type": "digest",
+        "webhook_env": "MEETUPS_SLACK_WEBHOOK_TWO",
+        "channel": "#channel-two",
+        "title": "Meetups this week",
+        "empty_message": "Meetups: no events found this week.",
+        "gate": false,
+        "show_scores": true,
+        "prompt": "Write this week's meetups digest in Markdown from the scored events below. Each carries a score out of 25 and one reason line per rubric dimension. Order: a 'Standing rooms' section first for anything recurring, listed once rather than once per occurrence; then 'This week's pick', the one or two best rooms with date, time, venue, score and registration link; then 'Dated events' grouped by tier, each line giving date, name, venue, cost, score, a one-line why, and the link. Leave out anything past, anything outside the configured region, and anything below the lowest tier. Registering is the reader's own click: propose, never register.",
+        "username": "Meetups",
+        "icon_emoji": ":round_pushpin:"
+      }
+    ]
+  }
+}

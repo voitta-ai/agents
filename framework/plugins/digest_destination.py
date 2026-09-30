@@ -83,14 +83,20 @@ WordPress publish step wants. `username` / `icon_emoji` / `icon_url` (issue
 #77) name this digest in the channel, so two digests posted seconds apart
 through one webhook do not read as one message.
 
+`show_scores` (issue #57) decides whether the model is shown each item's score
+and the scorer's reasons. Omitted, it follows `min_score`, which is exactly the
+behaviour #63 shipped. Set to true it shows them with no gate at all, for a
+digest that ranks and explains rather than filters — the meetups digest groups
+events into tiers by score, and its filter is the tiering, not a threshold.
+
 `min_score` (issue #63) drops low-scoring signals before the model ever sees
 them, for agents whose scorer is a filter rather than a ranking. Dropped items
 are not in the item count either, so a run that gates everything out reads as
 the quiet run it was. Signals are still marked seen: the gate says "not worth
 summarizing", not "look at this again next run". A gated run also shows the
-model each item's score and the scorer's reasons; an ungated one does not, so
-a digest that was running before this change reads exactly the prompt it
-always did.
+model each item's score and the scorer's reasons, and an ungated one does not
+unless `show_scores` says otherwise, so a digest that was running before
+either change reads exactly the prompt it always did.
 
 Contract: see docs/PLUGIN-CONTRACT.md.
 """
@@ -224,6 +230,7 @@ class DigestDestination:
         timeout: int = 30,
         fields: dict[str, str] | None = None,
         min_score: int = 0,
+        show_scores: bool | None = None,
         identity: SlackIdentity | None = None,
     ):
         self.transport = transport
@@ -238,6 +245,9 @@ class DigestDestination:
         self.timeout = timeout
         self.fields = fields or {}
         self.min_score = min_score
+        # None means "follow min_score", which is what every config written
+        # before this option existed gets. See `_render_items`.
+        self.show_scores = min_score > 0 if show_scores is None else show_scores
         self.identity = identity or SlackIdentity()
         self._buffered: list[ScoredSignal] = []
 
@@ -249,14 +259,24 @@ class DigestDestination:
     def _render_items(self) -> str:
         """The item list the model reads.
 
-        Scores and the scorer's reasons appear only when `min_score` gates the
-        run. A config with a gate is demonstrably using scores for something,
-        and showing them lets the model say which items cleared the bar; a
-        config without one gets the list it has always got, rather than a
-        prompt newly seasoned with whatever its scorer writes into `reasons`
-        ("matched keyword X", for the regex scorer).
+        Scores and the scorer's reasons are shown when `show_scores` says so,
+        which by default means "when `min_score` gates the run". That default is
+        the original behaviour (issue #63): a config with a gate is demonstrably
+        using scores for something, and showing them lets the model say which
+        items cleared the bar, while a config without one gets the list it has
+        always got rather than a prompt newly seasoned with whatever its scorer
+        writes into `reasons` ("matched keyword X", for the regex scorer).
+
+        `show_scores: true` unties the two (issue #57). An agent can want the
+        model to *rank and explain* without wanting it to *filter*: the meetups
+        digest groups events into tiers by score and prints one reason line per
+        rubric dimension, and it deliberately sets no `min_score`, because the
+        tiering is the filter. Before this option that config was impossible to
+        express — the scores it is built around would never have reached the
+        model, and the digest would have been written from titles and URLs with
+        the rubric silently discarded.
         """
-        show_scores = self.min_score > 0
+        show_scores = self.show_scores
         lines = []
         for scored in self._buffered[: self.max_signals]:
             sig = scored.signal
@@ -452,6 +472,13 @@ def build(cfg: dict) -> Destination:
                 f"{', '.join(sorted(_COMPUTED_FIELDS))}"
             )
 
+    show_scores = cfg.get("show_scores")
+    if show_scores is not None and not isinstance(show_scores, bool):
+        raise RuntimeError(
+            "digest destination's 'show_scores' must be true or false; omit it to "
+            "follow 'min_score' (shown when a gate is set), which is the default"
+        )
+
     llm = build_client(cfg, what="digest destination")
 
     retval = DigestDestination(
@@ -467,6 +494,7 @@ def build(cfg: dict) -> Destination:
         timeout=timeout,
         fields=fields,
         min_score=int(cfg.get("min_score", 0)),
+        show_scores=show_scores,
         identity=identity_from_config(cfg, "digest destination"),
     )
     return retval
