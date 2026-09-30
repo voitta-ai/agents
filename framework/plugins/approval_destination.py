@@ -15,14 +15,15 @@ Config block:
 
     "destination": {
       "type": "approval",
-      "webhook_env": "SOME_WEBHOOK",
+      "bot_token_env": "SOME_BOT_TOKEN",
+      "channel_id": "C0123456789",
       "wrap": {"type": "digest", "...": "the destination whose output becomes the proposal"},
       "actions": ["publish-post"],
       "timeout": 30
     }
 
 `wrap` is any destination block; it is built through the registry exactly as a
-top-level destination would be, so its own keys (and its own `webhook_env`,
+top-level destination would be, so its own keys (and its own transport,
 which it still needs to construct) are its business. It must define
 `render() -> dict` with at least `title` and `body_md`; the digest destination
 does (same getattr discovery the runner uses for `flush()`). Wrapping a
@@ -100,7 +101,6 @@ action is a matter for the proposal's own status, not for re-fetching signals.
 """
 from __future__ import annotations
 
-import os
 from pathlib import Path
 
 import requests
@@ -109,7 +109,14 @@ from framework.approval_buttons import proposal_blocks
 from framework.interfaces import Destination, ScoredSignal
 from framework.proposals import ProposalStore, proposals_path
 from framework.registry import build_destination, register_destination
-from framework.slack import SlackIdentity, identity_from_config, post_message, to_mrkdwn
+from framework.slack import (
+    SlackIdentity,
+    SlackTransport,
+    identity_from_config,
+    post_message,
+    to_mrkdwn,
+    transport_from_config,
+)
 
 
 class ApprovalDestination:
@@ -118,7 +125,7 @@ class ApprovalDestination:
         wrapped: Destination,
         actions: list[str],
         store: ProposalStore,
-        webhook_url: str,
+        transport: SlackTransport,
         timeout: int = 30,
         identity: SlackIdentity | None = None,
         buttons: bool = False,
@@ -134,7 +141,7 @@ class ApprovalDestination:
         self._render = render
         self._actions = actions
         self._store = store
-        self._webhook_url = webhook_url
+        self._transport = transport
         self._timeout = timeout
         self._identity = identity or SlackIdentity()
         self._buttons = buttons
@@ -144,7 +151,7 @@ class ApprovalDestination:
 
     def _post(self, text: str) -> None:
         post_message(
-            self._webhook_url, text, timeout=self._timeout, identity=self._identity
+            self._transport, text, timeout=self._timeout, identity=self._identity
         )
 
     def _post_buttons(self, text: str, proposal: dict) -> None:
@@ -167,7 +174,7 @@ class ApprovalDestination:
         }
         body.update(self._identity.payload())
         resp = requests.post(
-            self._webhook_url,
+            self._transport,
             json=body,
             headers={"Content-type": "application/json"},
             timeout=self._timeout,
@@ -219,14 +226,22 @@ class ApprovalDestination:
         self._store.add_all(reserved)
 
 
+# Transport: this destination posts through `SlackTransport` like every other
+# (issue #86). It used to take a raw webhook URL, which had two consequences
+# worth naming, because both were silent. Its proposal messages ignored the
+# `username`/`icon_emoji` it accepted and went out under whichever app owned the
+# webhook. And `buttons: true` could never have worked: Block Kit buttons have
+# to be tidied up once a proposal is decided, that edit is `chat.update`, and
+# `SlackTransport.update()` refuses a webhook-posted message because Slack
+# returns no `ts` for one -- pointing the caller at `bot_token_env` +
+# `channel_id`, which this build() then rejected. Accepting the same transport
+# config as the rest closes both.
+
+
 @register_destination("approval")
 def build(cfg: dict) -> Destination:
-    env_name = cfg.get("webhook_env")
-    if not env_name:
-        raise RuntimeError("approval destination needs a 'webhook_env'")
-    webhook_url = os.environ.get(env_name)
-    if not webhook_url:
-        raise RuntimeError(f"approval destination needs the webhook URL in ${env_name}")
+    timeout = int(cfg.get("timeout", 30))
+    transport = transport_from_config(cfg, "approval destination", timeout)
 
     wrap = cfg.get("wrap")
     if not isinstance(wrap, dict) or not wrap.get("type"):
@@ -256,8 +271,8 @@ def build(cfg: dict) -> Destination:
         wrapped=build_destination(wrap),
         actions=list(actions),
         store=ProposalStore(proposals_path(Path(workspace))),
-        webhook_url=webhook_url,
-        timeout=int(cfg.get("timeout", 30)),
+        transport=transport,
+        timeout=timeout,
         identity=identity_from_config(cfg, "approval destination"),
         buttons=bool(cfg.get("buttons", False)),
     )
