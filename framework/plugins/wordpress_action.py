@@ -28,6 +28,11 @@ Config keys:
                   `WORDPRESS_ACCESS_TOKEN`.
   - `categories`  list of category names; optional. Templated, see below.
   - `tags`        list of tag names; optional. Templated, see below.
+  - `excerpt`     the post's excerpt; optional, templated against the payload.
+                  Without it WordPress derives one from the opening words, which
+                  is what every feed reader and every RSS-driven integration then
+                  shows. A config that has drafted copy for that audience points
+                  this at it (e.g. `"{page_post}"`).
 
 `execute(payload, context)` reads `payload["title"]` and `payload["body_md"]`
 and returns `{"url": ..., "post_id": ...}` for later steps to template.
@@ -306,6 +311,7 @@ class WordPressPublishAction:
         token_env: str = _DEFAULT_TOKEN_ENV,
         categories: list[str] | None = None,
         tags: list[str] | None = None,
+        excerpt: str = "",
         timeout: int = 30,
     ):
         if not site:
@@ -319,6 +325,7 @@ class WordPressPublishAction:
         self.token_env = token_env
         self.categories = list(categories or [])
         self.tags = list(tags or [])
+        self.excerpt = excerpt
         self._timeout = timeout
 
     def execute(self, payload: dict[str, Any], context: dict[str, Any]) -> dict[str, Any]:
@@ -334,6 +341,20 @@ class WordPressPublishAction:
             "content": _markdown_to_blocks(payload["body_md"]),
             "status": self.mode,
         }
+        # The excerpt is what a feed reader -- and anything downstream of the
+        # site's RSS -- shows instead of the post. WordPress derives one from
+        # the opening words when none is given, which is fine on the site and
+        # wrong everywhere else: a syndicated post then leads with whatever
+        # sentence happened to come first. Templated like the taxonomy, so a
+        # config can point it at a field the digest drafted for that audience.
+        # A template that renders to nothing is left unset rather than sent as
+        # an empty string, which WordPress would take as "no excerpt" anyway but
+        # which would also silently hide a misnamed field.
+        if self.excerpt:
+            excerpt = render_template(self.excerpt, payload).strip()
+            if excerpt:
+                form["excerpt"] = excerpt
+
         categories = _taxonomy(self.categories, payload)
         if categories:
             form["categories"] = ",".join(categories)
@@ -386,6 +407,7 @@ def build(cfg: dict) -> Action:
         token_env=cfg.get("token_env", _DEFAULT_TOKEN_ENV),
         categories=cfg.get("categories"),
         tags=cfg.get("tags"),
+        excerpt=cfg.get("excerpt", ""),
         timeout=int(cfg.get("timeout", 30)),
     )
     return retval
