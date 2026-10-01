@@ -135,7 +135,10 @@ class SlackDestination:
 
         The reasons block follows the url, in both modes: it is two short lines
         that say why this signal scored what it did, which is exactly what a
-        batched list of ten is otherwise missing.
+        batched list of ten is otherwise missing. It is separated by a blank
+        line and set in italics, because it is the one part of the message the
+        agent wrote rather than quoted, and a reader skimming a channel has to
+        be able to tell those apart without re-reading.
         """
         sig = scored.signal
         body = sig.text
@@ -145,7 +148,13 @@ class SlackDestination:
         if sig.url:
             text += f"\n{sig.url}"
         if route.show_reasons and scored.reasons:
-            text += "\n" + "\n".join(f"• {reason}" for reason in scored.reasons)
+            # A blank line and italics, because the two halves of this message
+            # have different authors. Everything above is the poster's own
+            # words; everything below is ours about them. Run together on
+            # consecutive lines they read as one block, and an operator
+            # skimming a channel cannot tell which sentences to trust as
+            # quotation and which to read as judgement.
+            text += "\n\n" + "\n".join(f"• _{reason}_" for reason in scored.reasons)
         if self._drafter is not None and not compact:
             text += "\n\n" + self._draft_block(scored)
         return text
