@@ -173,13 +173,15 @@ class ApprovalDestination:
             "blocks": proposal_blocks(rendered, pid, action),
         }
         body.update(self._identity.payload())
-        resp = requests.post(
-            self._transport,
-            json=body,
-            headers={"Content-type": "application/json"},
-            timeout=self._timeout,
-        )
-        resp.raise_for_status()
+        # Through the transport, not a raw requests.post. This call site was
+        # written when the destination held a webhook URL, and posting the
+        # payload straight at it was the same thing. It is not any more: the
+        # transport may be a bot token plus a channel, and `post()` is what
+        # knows the difference. Passing the object to `requests.post` instead
+        # fails with `InvalidURL: Host '<SlackTransport object ...>'`, and only
+        # ever on the buttons path, which is why nothing caught it until a
+        # config turned buttons on.
+        self._transport.post(body)
 
     def flush(self) -> None:
         try:
