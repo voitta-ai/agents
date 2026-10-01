@@ -18,6 +18,8 @@ Later additions:
   - `llm` scorer         (issue #9)  - scores through the model waterfall
   - `approval` destination and `slack-post` action (issue #21)
   - `twitter-post` and `command` actions (issue #48)
+  - `multi` source, `fanout` destination, `websearch` source (issue #57) - the
+    composites, and a search engine as a source
 
 Why a table rather than eight import statements (issue #39). Importing every
 plugin unconditionally means one plugin's optional third-party dependency can
@@ -67,16 +69,19 @@ _PLUGIN_MODULES: dict[str, tuple[str, ...]] = {
     "approval_destination": ("approval",),
     "command_action": ("command",),
     "digest_destination": ("digest",),
+    "fanout_destination": ("fanout",),
     "github_org_source": ("github-org",),
     "github_releases_source": ("github-releases",),
     "ics_source": ("ics",),
     "llm_scorer": ("llm",),
+    "multi_source": ("multi",),
     "reddit_source": ("reddit",),
     "regex_scorer": ("regex",),
     "slack_destination": ("slack",),
     "slack_post_action": ("slack-post",),
     "slack_workspace_source": ("slack-workspace",),
     "twitter_action": ("twitter-post",),
+    "websearch_source": ("websearch",),
     "wordpress_action": ("wordpress-publish",),
 }
 
