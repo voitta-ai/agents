@@ -75,6 +75,8 @@ destination's job, not the framework's.
 from __future__ import annotations
 
 from framework.interfaces import Destination, ScoredSignal
+from framework.drafter import DEFAULT_SYSTEM, DraftError, Drafter, load_grounding
+from framework.llm import LLMError, build_client
 from framework.registry import register_destination
 from framework.slack import (
     SlackIdentity,
@@ -105,7 +107,13 @@ class _Route:
 
 
 class SlackDestination:
-    def __init__(self, routes: list[_Route], timeout: int = 30, mode: str = "stream"):
+    def __init__(
+        self,
+        routes: list[_Route],
+        timeout: int = 30,
+        mode: str = "stream",
+        drafter: Drafter | None = None,
+    ):
         if mode not in ("stream", "batch"):
             raise ValueError(f"slack destination: mode must be 'stream' or 'batch', got {mode!r}")
         # Highest bar first, so the first match wins and a hot signal is not
@@ -113,6 +121,7 @@ class SlackDestination:
         self._routes = sorted(routes, key=lambda r: r.min_score, reverse=True)
         self._timeout = timeout
         self._mode = mode
+        self._drafter = drafter
         self._buffered: dict[int, list[str]] = {}
 
     def _format(self, route: _Route, scored: ScoredSignal, compact: bool = False) -> str:
@@ -137,7 +146,30 @@ class SlackDestination:
             text += f"\n{sig.url}"
         if route.show_reasons and scored.reasons:
             text += "\n" + "\n".join(f"• {reason}" for reason in scored.reasons)
+        if self._drafter is not None and not compact:
+            text += "\n\n" + self._draft_block(scored)
         return text
+
+    def _draft_block(self, scored: ScoredSignal) -> str:
+        """The drafted sections, or a visible note saying why there are none.
+
+        A failed draft never costs the lead. The signal is the thing worth
+        having, and dropping a real lead because a second model call misfired
+        would be a bad trade -- but a lead that looked complete while silently
+        carrying no draft would be worse than either, so the reason is rendered
+        exactly where the draft would have been.
+        """
+        try:
+            drafted = self._drafter.draft(scored)
+        except (DraftError, LLMError) as exc:
+            retval = f"_draft unavailable — {str(exc)[:200]}_"
+            return retval
+        parts = []
+        for name, value in drafted.items():
+            label = name.replace("_", " ")
+            parts.append(f"*{label}*\n{value}")
+        retval = "\n\n".join(parts)
+        return retval
 
     def _post(self, route: _Route, text: str) -> None:
         post_message(
@@ -246,6 +278,76 @@ def _build_route(
     return retval
 
 
+_DRAFT_RESERVED = frozenset({"grounding", "max_grounding_chars", "prompt", "fields", "system",
+                            "max_signal_chars", "llm", "_comment", "_workspace", "_root"})
+
+
+def _build_drafter(cfg: dict) -> Drafter | None:
+    """The optional `drafter` block (issue #83), or None.
+
+    Only `mode: stream` renders a draft: a batched message is a compact list of
+    many signals, and a per-signal draft inside one would be unreadable and
+    would cost one model call per line of it.
+    """
+    block = cfg.get("drafter")
+    if block is None:
+        return None
+    if not isinstance(block, dict):
+        raise RuntimeError("slack destination: 'drafter' must be an object")
+    if cfg.get("mode", "stream") != "stream":
+        raise RuntimeError(
+            "slack destination: 'drafter' needs mode 'stream'; a batched message is a "
+            "compact list of many signals, and a draft per line would be unreadable"
+        )
+
+    prompt = block.get("prompt")
+    if not prompt or not isinstance(prompt, str):
+        raise RuntimeError("slack destination: 'drafter' needs a 'prompt'")
+
+    fields = block.get("fields")
+    if not isinstance(fields, dict) or not fields:
+        raise RuntimeError(
+            "slack destination: 'drafter' needs 'fields', an object of name -> "
+            "description written for the model"
+        )
+    bad = sorted(n for n, d in fields.items() if not isinstance(d, str) or not d.strip())
+    if bad:
+        raise RuntimeError(
+            f"slack destination: drafter fields {', '.join(bad)} need a non-empty description"
+        )
+
+    grounding_paths = block.get("grounding")
+    if not isinstance(grounding_paths, list) or not all(
+        isinstance(p, str) and p.strip() for p in grounding_paths
+    ):
+        raise RuntimeError(
+            "slack destination: 'drafter' needs 'grounding', a non-empty list of file "
+            "paths. A draft makes claims about us, and claims need provenance"
+        )
+    grounding = load_grounding(
+        grounding_paths,
+        int(block.get("max_grounding_chars", 60000)),
+        "slack destination drafter",
+    )
+
+    # The drafter's own chain if it names one, else the deployment's waterfall.
+    llm_cfg = dict(block)
+    for key in ("_workspace", "_root"):
+        if key in cfg and key not in llm_cfg:
+            llm_cfg[key] = cfg[key]
+    llm = build_client(llm_cfg, what="slack destination drafter")
+
+    retval = Drafter(
+        llm=llm,
+        grounding=grounding,
+        prompt=prompt,
+        fields=fields,
+        system=block.get("system") or DEFAULT_SYSTEM,
+        max_signal_chars=int(block.get("max_signal_chars", 4000)),
+    )
+    return retval
+
+
 @register_destination("slack")
 def build(cfg: dict) -> Destination:
     timeout = int(cfg.get("timeout", 30))
@@ -274,9 +376,12 @@ def build(cfg: dict) -> Destination:
             )
         ]
 
+    drafter = _build_drafter(cfg)
+
     retval = SlackDestination(
         routes=routes,
         timeout=timeout,
         mode=cfg.get("mode", "stream"),
+        drafter=drafter,
     )
     return retval

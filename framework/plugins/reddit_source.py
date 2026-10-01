@@ -115,6 +115,7 @@ class RedditSource:
         timeout: int = 15,
         limit_per_feed: int = 25,
         max_retries: int = 2,
+        include_rules: bool = False,
     ):
         self.subreddits = subreddits
         self.user_agent = user_agent
@@ -122,7 +123,12 @@ class RedditSource:
         self.timeout = timeout
         self.limit_per_feed = limit_per_feed
         self.max_retries = max_retries
+        self.include_rules = include_rules
         self.feed_errors: list[tuple[str, str]] = []
+        # Rules that could not be read. Separate from feed_errors because they
+        # degrade a lead rather than losing one, and must not count toward the
+        # all-feeds-failed check that turns a dead run into a raise.
+        self.rule_errors: list[tuple[str, str]] = []
 
     def _get(self, url: str) -> requests.Response | None:
         """GET with backoff on 429. Returns None if the feed stays unavailable."""
@@ -185,13 +191,44 @@ class RedditSource:
         )
         return retval
 
+    def _fetch_rules(self, subreddit: str) -> str:
+        """One subreddit's self-promotion rules, or "" if they cannot be read.
+
+        Deliberately NOT a run-failing error, unlike a failed feed. A feed that
+        fails means no leads; rules that fail to load mean a lead posted without
+        its community's rule attached, which is a degraded lead rather than a
+        missing one. It is recorded in `rule_errors` and the draft downstream
+        simply has one less input.
+        """
+        url = _RULES_URL.format(sub=subreddit)
+        try:
+            resp = requests.get(url, headers={"User-Agent": self.user_agent}, timeout=self.timeout)
+        except requests.RequestException as exc:
+            self.rule_errors.append((subreddit, f"{type(exc).__name__}: {exc}"))
+            return ""
+        if not resp.ok:
+            self.rule_errors.append((subreddit, f"{resp.status_code} {resp.reason}"))
+            return ""
+        try:
+            payload = resp.json()
+        except ValueError as exc:
+            self.rule_errors.append((subreddit, f"reply was not JSON: {exc}"))
+            return ""
+        retval = _promo_rules(payload)
+        return retval
+
     def fetch(self) -> list[Signal]:
         self.feed_errors = []
+        self.rule_errors = []
         signals: list[Signal] = []
         seen_ids: set[str] = set()
         attempted = 0
 
+        rules_by_sub: dict[str, str] = {}
+
         for subreddit, cfg in self.subreddits.items():
+            if self.include_rules:
+                rules_by_sub[subreddit] = self._fetch_rules(subreddit)
             searches = (cfg or {}).get("searches") or []
             urls = [_search_url(subreddit, s) for s in searches] or [_new_url(subreddit)]
             for url in urls:
@@ -202,6 +239,9 @@ class RedditSource:
                     if not signal.id or signal.id in seen_ids:
                         continue
                     seen_ids.add(signal.id)
+                    rules = rules_by_sub.get(subreddit)
+                    if rules:
+                        signal.meta["subreddit_rules"] = rules
                     signals.append(signal)
 
         # A totally failed run must not masquerade as a quiet one.
@@ -211,6 +251,43 @@ class RedditSource:
 
         retval = signals
         return retval
+
+
+_RULES_URL = "https://www.reddit.com/r/{sub}/about/rules.json"
+# Rule text that bears on whether we may mention ourselves at all. Matching on
+# the rule's own words rather than its number, because numbering differs per
+# subreddit and the relevant rule is rarely rule 1.
+_PROMO_WORDS = ("promot", "advertis", "solicit", "spam", "self-post", "selfpromo", "referral", "vendor")
+
+
+def _promo_rules(payload: dict) -> str:
+    """The self-promotion rules from an `about/rules.json` payload, as text.
+
+    Public and unauthenticated, which is the point: the draft that goes under a
+    lead has to obey the community's own rule rather than a generalisation about
+    what communities usually allow, and no credential is needed to read it.
+
+    Returns every rule whose title or description mentions promotion; if none
+    match, the short titles of all of them, because "this subreddit has rules and
+    none of them obviously covers this" is still better than silence for a human
+    about to post.
+    """
+    rules = payload.get("rules") or []
+    hits, titles = [], []
+    for rule in rules:
+        if not isinstance(rule, dict):
+            continue
+        short = str(rule.get("short_name") or "").strip()
+        desc = str(rule.get("description") or "").strip()
+        titles.append(short)
+        haystack = f"{short} {desc}".lower()
+        if any(word in haystack for word in _PROMO_WORDS):
+            hits.append(f"{short}: {desc}" if desc else short)
+    if hits:
+        retval = "\n".join(hits)
+        return retval
+    retval = ("no rule mentions promotion; all rules: " + "; ".join(t for t in titles if t)) if titles else ""
+    return retval
 
 
 def _normalize_subreddits(declared: object) -> dict[str, dict]:
@@ -246,5 +323,6 @@ def build(cfg: dict) -> Source:
         timeout=int(cfg.get("timeout", 15)),
         limit_per_feed=int(cfg.get("limit_per_feed", 25)),
         max_retries=int(cfg.get("max_retries", 2)),
+        include_rules=bool(cfg.get("include_rules", False)),
     )
     return retval
