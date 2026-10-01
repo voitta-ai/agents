@@ -13,7 +13,9 @@
       "hvac",
       "dentistry"
     ],
-    "delay_seconds": 2.0
+    "delay_seconds": 2.0,
+    "include_rules": true,
+    "_rules_comment": "include_rules fetches /r/<sub>/about/rules.json once per subreddit per run - public and unauthenticated - and attaches the rules bearing on self-promotion to each signal's meta as 'subreddit_rules'. The drafter below is shown them so a draft reply obeys the community's own rule rather than a generalisation about what communities usually allow. A failed rules fetch degrades a lead rather than losing one: it is recorded in rule_errors and does not count toward the all-feeds-failed check."
   },
   "scorer": {
     "type": "regex",
@@ -22,27 +24,90 @@
     "match": "presence",
     "floor": 0,
     "rules": [
-      {"pattern": "nightmare", "points": 10},
-      {"pattern": "frustrating", "points": 10},
-      {"pattern": "hate", "points": 10},
-      {"pattern": "struggle", "points": 10},
-      {"pattern": "drowning", "points": 10},
-      {"pattern": "overwhelmed", "points": 10},
-      {"pattern": "spending hours", "points": 10},
-      {"pattern": "waste of time", "points": 10},
-      {"pattern": "headache", "points": 10},
-      {"pattern": "tired of", "points": 10},
-      {"pattern": "fed up", "points": 10},
-      {"pattern": "better way", "points": 10},
-      {"pattern": "manual", "points": 10},
-      {"pattern": "spreadsheet", "points": 10},
-      {"pattern": "paperwork", "points": 10},
-      {"pattern": "chasing", "points": 10},
-      {"pattern": "behind on", "points": 10},
-      {"pattern": "falling behind", "points": 10},
-      {"pattern": "^[^\\n]*\\?|^(how do|why do|what do|anyone else)", "points": 15},
-      {"pattern": "!!!|ugh|smh|ffs", "points": 10},
-      {"pattern": "check out|we built|try our|dm me|link in", "points": -30}
+      {
+        "pattern": "nightmare",
+        "points": 10
+      },
+      {
+        "pattern": "frustrating",
+        "points": 10
+      },
+      {
+        "pattern": "hate",
+        "points": 10
+      },
+      {
+        "pattern": "struggle",
+        "points": 10
+      },
+      {
+        "pattern": "drowning",
+        "points": 10
+      },
+      {
+        "pattern": "overwhelmed",
+        "points": 10
+      },
+      {
+        "pattern": "spending hours",
+        "points": 10
+      },
+      {
+        "pattern": "waste of time",
+        "points": 10
+      },
+      {
+        "pattern": "headache",
+        "points": 10
+      },
+      {
+        "pattern": "tired of",
+        "points": 10
+      },
+      {
+        "pattern": "fed up",
+        "points": 10
+      },
+      {
+        "pattern": "better way",
+        "points": 10
+      },
+      {
+        "pattern": "manual",
+        "points": 10
+      },
+      {
+        "pattern": "spreadsheet",
+        "points": 10
+      },
+      {
+        "pattern": "paperwork",
+        "points": 10
+      },
+      {
+        "pattern": "chasing",
+        "points": 10
+      },
+      {
+        "pattern": "behind on",
+        "points": 10
+      },
+      {
+        "pattern": "falling behind",
+        "points": 10
+      },
+      {
+        "pattern": "^[^\\n]*\\?|^(how do|why do|what do|anyone else)",
+        "points": 15
+      },
+      {
+        "pattern": "!!!|ugh|smh|ffs",
+        "points": 10
+      },
+      {
+        "pattern": "check out|we built|try our|dm me|link in",
+        "points": -30
+      }
     ]
   },
   "destination": {
@@ -55,6 +120,22 @@
         "channel": "#<leads-channel>",
         "show_reasons": true
       }
-    ]
+    ],
+    "drafter": {
+      "_comment": "A second, grounded generation pass over an already-scored signal (issue #83). Deliberately NOT more fields on the scorer: a score is a judgement about the signal, a draft is a claim about us, and claims need provenance. A model asked to score and pitch in one call reaches for its own knowledge of the company to do the second half, which is exactly the failure this prevents. 'grounding' names the only documents a claim may rest on; they are read at build time, so a missing file fails at startup rather than producing an ungrounded draft on signal seventeen. A draft that cannot be produced never costs the lead: the reason is rendered where the draft would have been. Needs mode 'stream'.",
+      "grounding": [
+        "/absolute/path/to/offering-whitepaper.md",
+        "/absolute/path/to/niche-worksheet.md",
+        "/absolute/path/to/profile.md"
+      ],
+      "max_grounding_chars": 60000,
+      "prompt": "Draft a response to this post for a human to send. Rules, all binding: the reply goes publicly in the thread, never as a direct message. Help first - answer their actual problem, so the reply is useful even if they never contact us. At most one line about who we are, and no link in a first reply. Obey the subreddit's own self-promotion rule if one is shown above. Never claim a client, a result or a number that is not in the source documents. Pick exactly one offer and say why, citing a fact from the post.",
+      "fields": {
+        "solution": "Two or three sentences on how the capabilities in the source documents would address this specific problem. Capabilities only, no promises, nothing not in the documents.",
+        "offer": "Which of the offers in the source documents fits, named exactly as they name it.",
+        "offer_reason": "One sentence citing a fact from the post that makes that the right offer.",
+        "reply": "The draft reply itself, ready to paste. Plain text, no markdown headings, written as the human would say it."
+      }
+    }
   }
 }
