@@ -93,6 +93,7 @@ Contract: see docs/PLUGIN-CONTRACT.md.
 from __future__ import annotations
 
 import os
+import re
 from datetime import date, datetime, time, timedelta
 from datetime import timezone as dt_timezone
 from zoneinfo import ZoneInfo
@@ -114,6 +115,54 @@ _DECLINED_PARTSTATS = {"DECLINED"}
 # MAY CONSIDER. Wrongly promoting an unanswered invite to MUST is the worse
 # error, so absence never defaults to MUST.
 _ACCEPTED_PARTSTATS = {"ACCEPTED"}
+
+
+_WINDOW_RE = re.compile(r"^(\d+)\s*([dw])$")
+
+
+def parse_window(spec: str) -> tuple[int, int]:
+    """`window` -> (days_from_today_to_start, length_in_days).
+
+    `tomorrow` is the default and the original behaviour: the single day after
+    today, in the owner's zone. The others exist because a calendar is read for
+    more than one reason (issue #59, and #57's meetups agent):
+
+      tomorrow   (1, 1)   a reminder: what is on tomorrow
+      today      (0, 1)   what is on now
+      week       (0, 7)   today through the next six days
+      <N>d       (0, N)   an arbitrary horizon in days
+      <N>w       (0, N*7) the same in weeks
+
+    An arbitrary horizon is not decoration. A weekly events digest that tiers
+    events into "attend within 2 / 4 / 8 weeks" has to be shown eight weeks of
+    calendar, and `week` would silently hide everything past day seven -- the
+    digest would look complete while being wrong, which is the failure this
+    repo keeps guarding against.
+    """
+    # Only an absent key defaults. An explicit empty string is a typo, and
+    # silently reading it as "tomorrow" is the shape of bug this module exists
+    # to avoid: the window would be wrong and nothing would say so.
+    text = ("tomorrow" if spec is None else str(spec)).strip().lower()
+    if text == "tomorrow":
+        retval = (1, 1)
+        return retval
+    if text == "today":
+        retval = (0, 1)
+        return retval
+    if text == "week":
+        retval = (0, 7)
+        return retval
+    match = _WINDOW_RE.match(text)
+    if match:
+        count = int(match.group(1))
+        if count < 1:
+            raise ValueError(f"ics source: 'window' {spec!r} must cover at least one day")
+        retval = (0, count * (7 if match.group(2) == "w" else 1))
+        return retval
+    raise ValueError(
+        f"ics source: unknown 'window' {spec!r}; use 'tomorrow', 'today', 'week', "
+        "or a horizon like '14d' or '8w'"
+    )
 
 
 def _mailto(value: object) -> str:
@@ -180,8 +229,18 @@ def _event_span(
     return retval
 
 
-def _all_day_covers(start_date: date, end_date_exclusive: date, day: date) -> bool:
-    retval = start_date <= day < end_date_exclusive
+def _all_day_covers(
+    start_date: date, end_date_exclusive: date, win_start: date, win_end_exclusive: date
+) -> bool:
+    """Does an all-day event overlap the window at all?
+
+    Overlap, not containment, and over a range rather than a single day: a
+    three-day all-day event that begins before the window still falls inside
+    it, and once a window can be eight weeks long, "starts on day X" would
+    drop most of what the digest exists to list. Both ends half-open, matching
+    RFC 5545's exclusive DTEND and `_timed_overlaps`.
+    """
+    retval = start_date < win_end_exclusive and end_date_exclusive > win_start
     return retval
 
 
@@ -257,7 +316,10 @@ def _expand_calendar(
     """Every occurrence — single events, RRULE expansions, and
     RECURRENCE-ID overrides substituted in for the base occurrence they
     replace — that falls on tomorrow, as (component, start, end, all_day)."""
-    tomorrow = window_start.date()
+    win_start_date = window_start.date()
+    # `window_end` is the exclusive instant at midnight after the last day, so
+    # its date is already the exclusive end for all-day comparisons.
+    win_end_date = window_end.date()
     by_uid: dict[str, list[icalendar.Event]] = {}
     for component in cal.walk("VEVENT"):
         by_uid.setdefault(str(component.get("uid", "")), []).append(component)
@@ -274,7 +336,7 @@ def _expand_calendar(
                 continue  # this one instance was cancelled: drop it, like a decline
             start, end, all_day = _event_span(override, owner_tz)
             if all_day:
-                if _all_day_covers(start, end, tomorrow):
+                if _all_day_covers(start, end, win_start_date, win_end_date):
                     results.append((override, start, end, all_day))
             elif _timed_overlaps(start, end, window_start, window_end):
                 results.append((override, start, end, all_day))
@@ -291,7 +353,7 @@ def _expand_calendar(
             else:
                 start, end, all_day = _event_span(master, owner_tz)
                 if all_day:
-                    if _all_day_covers(start, end, tomorrow):
+                    if _all_day_covers(start, end, win_start_date, win_end_date):
                         results.append((master, start, end, all_day))
                 elif _timed_overlaps(start, end, window_start, window_end):
                     results.append((master, start, end, all_day))
@@ -330,6 +392,16 @@ def _classify(
          distribution list) -> may. Same reasoning as PARTSTAT-absent: never
          guess "must".
     """
+    if not owner_email:
+        # A feed with no owner: a public calendar (a chamber of commerce, a
+        # venue) where every event is somebody else's. The must/may split is
+        # meaningless there -- it asks "did YOU accept this", and there is no
+        # you -- and defaulting to "must" would label a stranger's event a
+        # personal commitment, which is exactly the wrong answer for an events
+        # digest (issue #57). So the split is simply not made, and nothing is
+        # dropped for being declined, because no decline can be ours.
+        retval = ("", "Public calendar event.")
+        return retval
     if not attendees:
         retval = ("must", "Personal calendar entry.")
         return retval
@@ -358,10 +430,19 @@ class ICSSource:
         tz: ZoneInfo,
         label: str = _DEFAULT_LABEL,
         timeout: int = 30,
+        window: str = "tomorrow",
+        dedupe: bool = True,
         now: datetime | None = None,
     ):
         self.url = url
         self.owner_email = owner_email.strip().lower()
+        self.window = window
+        self._offset_days, self._length_days = parse_window(window)
+        # Read by the runner through getattr, like `commit()`: False makes it
+        # skip the SeenStore for this source's signals. A window digest is not
+        # a stream -- it re-lists the same events every run on purpose -- and
+        # per-item dedupe turns the second run of a window into an empty one.
+        self.dedupe = dedupe
         self.tz = tz
         self.label = label
         self.timeout = timeout
@@ -376,11 +457,14 @@ class ICSSource:
         retval = resp.content
         return retval
 
-    def _tomorrow_window(self) -> tuple[datetime, datetime]:
+    def _window(self) -> tuple[datetime, datetime]:
+        """The half-open [start, end) instants the configured `window` names,
+        in the owner's zone. Midnight-aligned at both ends, so a window is a
+        whole number of local days however long it is."""
         now_local = self._now.astimezone(self.tz) if self._now is not None else datetime.now(self.tz)
-        tomorrow = now_local.date() + timedelta(days=1)
-        start = datetime.combine(tomorrow, time.min, tzinfo=self.tz)
-        retval = (start, start + timedelta(days=1))
+        first = now_local.date() + timedelta(days=self._offset_days)
+        start = datetime.combine(first, time.min, tzinfo=self.tz)
+        retval = (start, start + timedelta(days=self._length_days))
         return retval
 
     def parse(self, raw: bytes) -> list[Signal]:
@@ -408,7 +492,7 @@ class ICSSource:
                 "there is nothing scheduled."
             )
 
-        window_start, window_end = self._tomorrow_window()
+        window_start, window_end = self._window()
 
         signals: list[Signal] = []
         for component, start, end, all_day in _expand_calendar(cal, self.tz, window_start, window_end):
@@ -438,7 +522,9 @@ class ICSSource:
                         "start": start.isoformat(),
                         "end": end.isoformat(),
                         "all_day": all_day,
-                        "commitment": commitment,  # "must" | "may"
+                        # "must" | "may", or "" for an ownerless public feed
+                        # where the distinction does not exist.
+                        "commitment": commitment,
                         "reason": reason,
                         "organizer": organizer_email,
                         "is_organizer": bool(self.owner_email) and organizer_email == self.owner_email,
@@ -468,13 +554,12 @@ def build(cfg: dict) -> Source:
             "so it is never accepted from config"
         )
 
-    owner_email = cfg.get("owner_email") or os.environ.get("CALENDAR_OWNER_EMAIL")
-    if not owner_email:
-        raise RuntimeError(
-            "ics source needs 'owner_email' in config or CALENDAR_OWNER_EMAIL in env, to tell "
-            "MUST ATTEND apart from MAY CONSIDER — without it every invite would have to default "
-            "to MAY, which defeats the point of the split"
-        )
+    # Optional since #59/#57. With an owner the source splits MUST ATTEND from
+    # MAY CONSIDER; without one it reads a public calendar nobody owns and makes
+    # no such claim. Omitting it is a declaration, not an oversight, so it is not
+    # defaulted from the environment when the config says nothing -- an operator
+    # who wants the split states the address.
+    owner_email = cfg.get("owner_email") or os.environ.get("CALENDAR_OWNER_EMAIL") or ""
 
     tz_name = cfg.get("timezone")
     if not tz_name:
@@ -487,11 +572,23 @@ def build(cfg: dict) -> Source:
     except Exception as exc:
         raise RuntimeError(f"ics source: invalid 'timezone' {tz_name!r}: {exc}") from exc
 
+    window = cfg.get("window", "tomorrow")
+    try:
+        parse_window(window)
+    except ValueError as exc:
+        raise RuntimeError(str(exc)) from exc
+
+    dedupe = cfg.get("dedupe", True)
+    if not isinstance(dedupe, bool):
+        raise RuntimeError("ics source: 'dedupe' must be true or false")
+
     retval = ICSSource(
         url=url,
         owner_email=owner_email,
         tz=tz,
         label=cfg.get("label", _DEFAULT_LABEL),
         timeout=int(cfg.get("timeout", 30)),
+        window=window,
+        dedupe=dedupe,
     )
     return retval

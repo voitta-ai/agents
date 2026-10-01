@@ -9,9 +9,10 @@
       {
         "name": "chamber",
         "type": "ics",
-        "_comment": "A chamber of commerce that publishes an iCal feed. The URL is a bearer secret, so the ics source reads it only from the environment. Optional because one chamber among a dozen queries changes the digest's completeness, not its point. Two known limits, tracked on issue #59 rather than papered over here: the ics source windows to *tomorrow* only, which is wrong for a weekly digest that tiers events out to eight weeks, and it requires 'owner_email' to split MUST ATTEND from MAY CONSIDER - a concept a public chamber calendar does not have, where every event is somebody else's. Until #59 lands, this child reports tomorrow's chamber events and labels them all as personal commitments.",
+        "_comment": "A chamber of commerce that publishes an iCal feed. The URL is a bearer secret, so the ics source reads it only from the environment. 'window': '8w' because the digest tiers events out to eight weeks, and the default 'tomorrow' would show one day while the digest still read as complete. No 'owner_email': this is a public calendar nobody owns, so the MUST ATTEND / MAY CONSIDER split is not made and every event carries commitment '' rather than being labelled a personal commitment. 'dedupe': false because a window digest re-lists the same events every run by design, and per-item dedupe would make the second run of a window empty. Optional because one chamber among a dozen queries changes the digest's completeness, not its point.",
         "url_env": "MEETUPS_ICS_CHAMBER",
-        "owner_email": "you@example.com",
+        "window": "8w",
+        "dedupe": false,
         "timezone": "America/Los_Angeles",
         "label": "Placeholder Chamber of Commerce",
         "optional": true
