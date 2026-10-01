@@ -66,6 +66,16 @@ that drops signals by its own rules has to say so in its own logs. Naming the
 counter `sent` rather than `delivered` is the whole of the honesty available at
 this layer.
 
+A source may set `dedupe = False` (issue #59), read here with getattr like
+`commit()`. The SeenStore makes a *stream* safe -- each item is interesting
+once -- but a window digest is the other shape, re-listing "what is on this
+week" every run by design, and per-item dedupe turns its second run into an
+empty one. Such a source's signals are neither skipped as seen nor marked, so
+`new` stays 0 on every run and the store does not grow with items that will be
+re-fetched regardless. A digest on such a source should say "nothing new since
+the last run" only when it means it: an empty window and an exhausted store are
+different facts.
+
 `unscored` counts signals whose scorer raised `ScoreError`: a failure that
 belongs to that one signal (an LLM reply that could not be read even after a
 retry), not to the scorer as a whole. Aborting the run for it would let one
@@ -113,9 +123,25 @@ def run(
         signals = source.fetch()
         fetched = len(signals)
 
+        # A source may declare `dedupe = False` (issue #59). Discovered with
+        # getattr like `commit()`, so every existing source is unaffected.
+        #
+        # Why a source gets to say this. The SeenStore makes a *stream* safe:
+        # each item is interesting once. A window digest is the other shape --
+        # "what is on this week" re-lists the same events every run on purpose
+        # -- and per-item dedupe turns its second run into an empty one. That
+        # was measured, not theorised: a hand-run consumed a day's items, and
+        # the scheduled run then posted its empty line while the window itself
+        # was not empty. Repetition is prevented by the window moving, not by
+        # marking items seen.
+        #
+        # The signals are still never marked, so nothing accumulates in the
+        # store for a source that will re-fetch them anyway.
+        dedupe = bool(getattr(source, "dedupe", True))
+
         pending: list[str] = []
         for signal in signals:
-            if seen.has(signal.id):
+            if dedupe and seen.has(signal.id):
                 continue
             try:
                 scored = scorer.score(signal)
@@ -131,7 +157,8 @@ def run(
                 continue
             destination.send(scored)
             sent += 1
-            pending.append(signal.id)
+            if dedupe:
+                pending.append(signal.id)
         new = len(pending)
 
         flush = getattr(destination, "flush", None)

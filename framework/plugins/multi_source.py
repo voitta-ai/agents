@@ -146,6 +146,21 @@ class MultiSource:
         )
         return retval
 
+    @property
+    def dedupe(self) -> bool:
+        """False when any child says so (issue #59).
+
+        The runner's switch is per-run, not per-signal, so a `multi` holding one
+        window-shaped child and one stream-shaped child cannot honour both. It
+        resolves toward re-delivery: a duplicate in a digest is visible and
+        recoverable, whereas a window silently emptied by the store is the
+        failure `dedupe: false` exists to prevent, and it looks exactly like a
+        quiet week. Mixing the two shapes under one `multi` is worth avoiding
+        for that reason.
+        """
+        retval = all(bool(getattr(child, "dedupe", True)) for _n, _o, child in self.children)
+        return retval
+
     def commit(self) -> None:
         for name, _optional, child in self.children:
             commit = getattr(child, "commit", None)
