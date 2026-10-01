@@ -9,7 +9,7 @@ two ways in.
     "source": {
       "type": "multi",
       "sources": [
-        {"name": "chambersmc", "type": "ics", "url_env": "...", "optional": true},
+        {"name": "calendar", "type": "ics", "url_env": "...", "optional": true},
         {"name": "web", "type": "websearch", "queries": ["..."]}
       ]
     }

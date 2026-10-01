@@ -1,7 +1,7 @@
 """AgentMail source — email-inbox Source implementation (issue #12).
 
 Turns messages in an AgentMail inbox into Signals. Email is how several signal
-types reach us that have no usable API: Toptal job notifications, community
+types arrive with no usable API behind them: job-board notifications, community
 digests, calendar invitations. Forward them to an inbox and this becomes the
 ingestion path.
 
