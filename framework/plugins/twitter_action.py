@@ -16,10 +16,22 @@ a tweet announcing "None" is worse than no tweet.
 
 The rendered text is checked against the 280-character limit *before* any
 request goes out, and a longer text is an error, not a truncation. Truncating
-would post something the human did not approve. The check is a plain `len()`;
-X's own weighted count (URLs count as 23, some scripts as 2 per character) is
-not reproduced here. A text that passes `len()` and still exceeds X's count is
-rejected by the API with a 403, which is just as loud.
+would post something the human did not approve.
+
+The check counts URLs the way X does. Every link, whatever its length, is
+wrapped to t.co and counts as 23 characters, so a plain `len()` over-counts a
+text carrying a long URL and refuses tweets X would have accepted. That is not
+hypothetical: a release-notes announcement with a 208-character blurb and a
+95-character permalink measured 304 by `len()` and was refused, where X would
+have counted 232 and posted it. A false refusal is worse than it looks here,
+because this runs as a step of an approved action, after a human has read the
+text and after earlier steps have already published.
+
+What is still not reproduced is X's *other* weighting rule: some scripts
+(CJK and similar) count as 2 characters each. A text that passes this check and
+still exceeds X's count is rejected by the API with a 403, which is just as
+loud. The asymmetry is deliberate -- this check now errs toward letting the API
+have the final word, rather than toward refusing locally.
 
 Posting goes through the X API v2 (`POST /2/tweets`) with OAuth 1.0a user
 context: the tweet appears on the account that owns the access token. The
@@ -60,6 +72,8 @@ procedure (set the proposal back to `pending`) would post it a second time.
 """
 from __future__ import annotations
 
+import re
+
 import os
 import sys
 from typing import Any
@@ -73,6 +87,10 @@ from framework.templating import render_template
 
 TWEETS_URL = "https://api.x.com/2/tweets"
 TWEET_MAX_CHARS = 280
+# Every URL counts as this, whatever its real length: X wraps links to t.co.
+# https://developer.x.com/en/docs/counting-characters
+TCO_URL_CHARS = 23
+_URL_RE = re.compile(r"https?://\S+")
 
 _DEFAULT_ENV = {
     "api_key_env": "TWITTER_API_KEY",
@@ -120,6 +138,17 @@ def _tweet_id(resp: requests.Response) -> str:
     return retval
 
 
+def weighted_len(text: str) -> int:
+    """X's character count, for the URL rule only.
+
+    Each URL counts as `TCO_URL_CHARS` however long it is, because X rewrites
+    every link to a fixed-width t.co address. Nothing else is weighted here;
+    see the module docstring for what that leaves to the API.
+    """
+    retval = len(_URL_RE.sub("u" * TCO_URL_CHARS, text))
+    return retval
+
+
 class TwitterPostAction:
     def __init__(self, text: str, env_names: dict[str, str], timeout: int = 30):
         self._text = text
@@ -137,10 +166,12 @@ class TwitterPostAction:
 
     def execute(self, payload: dict[str, Any], context: dict[str, Any]) -> dict[str, Any]:
         text = render_template(self._text, payload)
-        if len(text) > TWEET_MAX_CHARS:
+        weighted = weighted_len(text)
+        if weighted > TWEET_MAX_CHARS:
             raise ValueError(
-                f"twitter-post: rendered text is {len(text)} characters, "
-                f"over the {TWEET_MAX_CHARS} limit; nothing was posted"
+                f"twitter-post: rendered text counts as {weighted} characters "
+                f"(X counts each URL as {TCO_URL_CHARS}), over the "
+                f"{TWEET_MAX_CHARS} limit; nothing was posted"
             )
         resp = requests.post(
             TWEETS_URL,
