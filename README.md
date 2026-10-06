@@ -256,6 +256,37 @@ restarts it whenever it exits -- a dropped connection or a slept laptop becomes
 a reconnect. It needs `pip install '.[approvals-buttons]'` (slack_sdk,
 websocket-client).
 
+#### Which Slack app the listener connects as
+
+**One Socket Mode consumer per Slack app.** Slack spreads an app's events and
+interactions across all of that app's open Socket Mode connections, and each
+one goes to only one of them. Whatever else connects with the same `xapp-`
+token takes a share of the traffic. The listener acks every envelope and keeps
+only button clicks, so anything else sent to it is dropped without a trace.
+
+- **Never use a chat agent's app.** If `app_token_env` names the app-level
+  token of a bot that answers `@`-mentions over Socket Mode, the listener
+  silently eats a share of those mentions. The bot sees nothing, logs nothing,
+  and its own connection stays healthy, so the miss looks random. This
+  happened: a listener on a chat agent's app dropped a share of its
+  mentions for a week before anyone traced it.
+- **Use one shared app for the agents' approvals,** not one app per agent. It
+  posts the cards (its bot token goes in `bot_token_env`, so the clicks come
+  back to the same app) and holds the one Socket Mode connection
+  (`app_token_env`). It must be invited to every approval channel. Create it
+  from [`docs/slack-app-manifest.yaml`](docs/slack-app-manifest.yaml), which
+  carries the full scope set.
+- **Only one workspace per app may set `"listen": true` today.** Each
+  `--listen` job is its own connection, and a click Slack hands to the wrong
+  agent's listener is refused as "wrong channel" or as an unknown proposal. The
+  polling pass still resolves it, but the button looks broken. Serving several
+  approval-enabled agents through one app needs a single listener that routes
+  each click to the agent that owns the proposal. Until that exists, enable
+  buttons on one agent per app and leave the rest on `do <id>` replies.
+
+An incoming webhook never receives anything, so webhooks can be shared freely.
+They do not count as consumers.
+
 The polling pass stays installed next to it, and is the reason a click that
 never arrives is not a lost proposal: `do <id>` still resolves it. Both paths
 take the same `pending -> running` claim, so a click racing a reply cannot run
