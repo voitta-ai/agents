@@ -29,6 +29,12 @@ with `KeepAlive` (framework/schedule.py) rather than an interval. Config:
 scope `connections:write`); it is read only by `--listen`. Both tokens are read
 from the environment by the name a config key gives, never written down here.
 
+That token must belong to an app nothing else connects with. Slack spreads an
+app's events across all of its Socket Mode connections, and `on_request` acks
+every envelope but keeps only clicks. Pointed at a chat bot's app, this
+listener silently swallows a share of that bot's mentions. See README, "Which
+Slack app the listener connects as".
+
 The polling pass is not replaced by this. A laptop asleep when someone clicks
 gets the interaction on reconnect, but a click that is never delivered at all
 leaves the proposal pending, and a `do <id>` reply still resolves it. Both

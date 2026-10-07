@@ -1,0 +1,49 @@
+# The shared agents Slack app: one app for every agent that asks for approval
+# in Slack (README, "Which Slack app the listener connects as").
+#
+#   api.slack.com/apps -> Create New App -> From an app manifest
+#   -> pick the workspace -> paste this.
+# Then:
+#   - Install to Workspace, copy the Bot User OAuth Token (xoxb-) into the env
+#     var that `approvals.bot_token_env` and the approval destination's
+#     `bot_token_env` name.
+#   - Basic Information -> App-Level Tokens -> Generate, scope connections:write
+#     -> copy (xapp-) into the env var `approvals.app_token_env` names.
+#   - Invite the bot into every approval channel: /invite @Agents
+#
+# Do not reuse the app of a bot that answers @-mentions over Socket Mode. Slack
+# spreads an app's events across every Socket Mode connection the app has, and
+# the listener acks and drops whatever is not a click.
+#
+# These bot scopes are the complete set the framework's bot-token calls need:
+#   chat:write             chat.postMessage (proposal cards, slack-post steps),
+#                          chat.update (rewriting a decided card)
+#   chat:write.customize   per-agent `username` / `icon_emoji` (#77)
+#   channels:history       the approvals polling pass reads `do <id>` replies
+#                          (conversations.history) in a public channel
+#   groups:history         the same in a private channel
+# Answering a click needs no scope: the ephemeral reply goes through the
+# interaction's response_url. No incoming-webhook scope: agents post with the
+# bot token, and that scope only adds a channel picker to every reinstall.
+display_information:
+  name: Agents
+  description: Approval cards and buttons for scheduled agents.
+features:
+  bot_user:
+    display_name: Agents
+    always_online: false
+oauth_config:
+  scopes:
+    bot:
+      - chat:write
+      - chat:write.customize
+      - channels:history
+      - groups:history
+settings:
+  # Socket Mode carries the button clicks: no public request URL, and no event
+  # subscriptions, since the listener acts on interactions only.
+  socket_mode_enabled: true
+  interactivity:
+    is_enabled: true
+  org_deploy_enabled: false
+  token_rotation_enabled: false
