@@ -195,6 +195,31 @@ class SlackDestination:
                 return route
         return None
 
+    def accepts(self, scored: ScoredSignal) -> bool:
+        """Whether any route would post this signal. No model call, no post.
+
+        For the `approval` destination's signal mode (issue #65), which gates
+        on this before it ranks and caps, so the drafter is only asked about
+        signals that will actually be proposed.
+        """
+        retval = self._route_for(scored) is not None
+        return retval
+
+    def render_signal(self, scored: ScoredSignal) -> dict | None:
+        """One signal as this destination would stream it, without posting it.
+
+        Returns `{"text", "footer"}` for the route it qualifies for, or None
+        when it qualifies for none. The text is exactly the streamed message,
+        draft included, so a lead looks the same whether it is posted plainly
+        or as a proposal (issue #65); the footer is kept apart because the
+        caller posts through its own transport and appends it itself.
+        """
+        route = self._route_for(scored)
+        if route is None:
+            return None
+        retval = {"text": self._format(route, scored), "footer": route.footer}
+        return retval
+
     def send(self, scored: ScoredSignal) -> None:
         route = self._route_for(scored)
         if route is None:

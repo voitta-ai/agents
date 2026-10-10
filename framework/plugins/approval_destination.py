@@ -98,6 +98,45 @@ The proposal is the delivery. The runner marks signals seen after `flush()`
 returns, and this `flush()` returns only once the proposal is on disk and
 announced, so the seen-store semantics need no change: an approved-then-failed
 action is a matter for the proposal's own status, not for re-fetching signals.
+
+**`mode: "signal"`** (issue #65). The default, `mode: "run"`, is everything
+above: one proposal per action per run, from the wrapped destination's whole
+rendered output. A lead agent needs one proposal per *lead*, so each can be
+approved or skipped on its own. In signal mode the wrapped destination is a
+`slack` destination and is never allowed to post: it is used for two things
+only, its gate (`accepts()`, its routes' `min_score`) and its rendering of one
+lead (`render_signal()`, draft and footer included). So a lead looks exactly as
+it did when the same block was the top-level destination, and moving an agent
+onto approvals changes what can be done with a lead, not how it reads.
+
+    "destination": {
+      "type": "approval",
+      "mode": "signal",
+      "bot_token_env": "SOME_BOT_TOKEN",
+      "channel_id": "C0123456789",
+      "buttons": true,
+      "max_proposals": 10,
+      "wrap": {"type": "slack", "routes": [{"min_score": 60}], "footer": "..."},
+      "actions": ["draft-application"]
+    }
+
+The wrapped block may leave out its transport: it never posts, so it inherits
+this block's `bot_token_env` / `channel_id` / `webhook_env` rather than making
+an operator name one it does not use.
+
+At `flush()` the signals the gate accepts are ranked by score and the top
+`max_proposals` (default 10) become proposals, one per configured action, each
+with its own message. The rest are not dropped silently: one closing message
+names how many were left out and lists their links. They are marked seen like
+every other signal, so that message is their only record. A run with nothing
+above the gate posts nothing at all, as a streaming lead agent does.
+
+Each proposal's payload is the lead itself, for an action to template from:
+`text`, `url`, `title` (the source's `meta.title`, else the first line of the
+text), `score`, `reasons`, `meta`, and `rendered`, the message as posted. The
+same announce-first, store-second rule holds across the whole run: every id is
+reserved, every message posted, and only then is anything stored, in one
+write.
 """
 from __future__ import annotations
 
@@ -118,6 +157,11 @@ from framework.slack import (
     transport_from_config,
 )
 
+MODE_RUN = "run"
+MODE_SIGNAL = "signal"
+_DEFAULT_MAX_PROPOSALS = 10
+_TRANSPORT_KEYS = ("webhook_env", "bot_token_env", "channel_id")
+
 
 class ApprovalDestination:
     def __init__(
@@ -129,24 +173,42 @@ class ApprovalDestination:
         timeout: int = 30,
         identity: SlackIdentity | None = None,
         buttons: bool = False,
+        mode: str = MODE_RUN,
+        max_proposals: int = _DEFAULT_MAX_PROPOSALS,
     ):
-        render = getattr(wrapped, "render", None)
-        if not callable(render):
+        needed = ("render",) if mode == MODE_RUN else ("accepts", "render_signal")
+        missing = [name for name in needed if not callable(getattr(wrapped, name, None))]
+        if missing:
+            example = "'digest'" if mode == MODE_RUN else "'slack'"
             raise RuntimeError(
-                "approval destination: the wrapped destination "
-                f"{type(wrapped).__name__} has no render(); only destinations "
-                "that can hand back their output (e.g. 'digest') can be wrapped"
+                f"approval destination: in mode {mode!r} the wrapped destination "
+                f"{type(wrapped).__name__} needs {', '.join(n + '()' for n in missing)}; "
+                f"wrap a destination that has it (e.g. {example})"
             )
         self._wrapped = wrapped
-        self._render = render
+        # Looked up once and called through these, as `render` always was: the
+        # Destination protocol declares none of the three.
+        self._render = getattr(wrapped, "render", None)
+        self._accepts = getattr(wrapped, "accepts", None)
+        self._render_signal = getattr(wrapped, "render_signal", None)
         self._actions = actions
         self._store = store
         self._transport = transport
         self._timeout = timeout
         self._identity = identity or SlackIdentity()
         self._buttons = buttons
+        self._mode = mode
+        self._max_proposals = max_proposals
+        self._signals: list[ScoredSignal] = []
 
     def send(self, scored: ScoredSignal) -> None:
+        if self._mode == MODE_SIGNAL:
+            # Held until flush(): the cap keeps the highest scores, which are
+            # only known once every signal is in. The wrapped destination never
+            # sees send(), so it cannot post.
+            if self._accepts(scored):
+                self._signals.append(scored)
+            return
         self._wrapped.send(scored)
 
     def _post(self, text: str) -> None:
@@ -183,7 +245,64 @@ class ApprovalDestination:
         # config turned buttons on.
         self._transport.post(body)
 
+    def _announce(self, title: str, body: str, reserved: list[dict]) -> None:
+        """Post one rendered item with the instructions for its proposals."""
+        if self._buttons:
+            # One message per proposal: the buttons carry a single proposal id,
+            # so two actions in one message would leave the second unclickable.
+            for proposal in reserved:
+                self._post_buttons(f"**{title}**\n\n{body}" if title else body, proposal)
+            return
+        lines = [
+            f'Proposal {p["id"]}: {p["action"]}. Reply "do {p["id"]}" or "skip {p["id"]}".'
+            for p in reserved
+        ]
+        # Instructions above the content rather than after it (see the note in
+        # the module docstring).
+        head = f"**{title}**\n\n" if title else ""
+        self._post(head + "\n".join(lines) + "\n\n" + body)
+
+    def _flush_signals(self) -> None:
+        ranked = sorted(self._signals, key=lambda s: s.score, reverse=True)
+        self._signals = []
+        kept = ranked[: self._max_proposals]
+        left_out = ranked[self._max_proposals :]
+        reserved_all: list[dict] = []
+        for scored in kept:
+            rendered = self._render_signal(scored)
+            if rendered is None:
+                continue
+            body = rendered["text"]
+            if rendered.get("footer"):
+                body += f"\n\n{rendered['footer']}"
+            sig = scored.signal
+            meta = sig.meta if isinstance(sig.meta, dict) else {}
+            title = meta.get("title") or (sig.text.strip().splitlines() or [""])[0]
+            payload = {
+                "text": sig.text,
+                "url": sig.url,
+                "title": title,
+                "score": scored.score,
+                "reasons": list(scored.reasons),
+                "meta": meta,
+                "rendered": body,
+            }
+            reserved = [self._store.reserve(action, payload) for action in self._actions]
+            self._announce("", body, reserved)
+            reserved_all.extend(reserved)
+        if left_out:
+            links = "\n".join(f"• [{s.score}] {s.signal.url}" for s in left_out)
+            self._post(
+                f"{len(left_out)} more signal(s) passed the gate but were not proposed "
+                f"this run (max_proposals is {self._max_proposals}):\n{links}"
+            )
+        if reserved_all:
+            self._store.add_all(reserved_all)
+
     def flush(self) -> None:
+        if self._mode == MODE_SIGNAL:
+            self._flush_signals()
+            return
         try:
             rendered = self._render()
         except Exception as exc:
@@ -210,21 +329,8 @@ class ApprovalDestination:
         # until every announcement is out: both modes announce first and store
         # second, in one write.
         reserved = [self._store.reserve(action, payload) for action in self._actions]
-        if self._buttons:
-            # One message per proposal: the buttons carry a single proposal id,
-            # so two actions in one message would leave the second unclickable.
-            for proposal in reserved:
-                self._post_buttons(f"**{title}**\n\n{body}", proposal)
-            self._store.add_all(reserved)
-            return
-
-        lines = [
-            f'Proposal {p["id"]}: {p["action"]}. Reply "do {p["id"]}" or "skip {p["id"]}".'
-            for p in reserved
-        ]
-        # Announce first, store second, and put the instructions above the
-        # digest rather than after it (see the note in the module docstring).
-        self._post(f"**{title}**\n\n" + "\n".join(lines) + "\n\n" + body)
+        # Announce first, store second.
+        self._announce(title, body, reserved)
         self._store.add_all(reserved)
 
 
@@ -269,6 +375,26 @@ def build(cfg: dict) -> Destination:
     if cfg.get("_root"):
         wrap["_root"] = cfg["_root"]
 
+    mode = cfg.get("mode", MODE_RUN)
+    if mode not in (MODE_RUN, MODE_SIGNAL):
+        raise RuntimeError(
+            f"approval destination: 'mode' must be {MODE_RUN!r} or {MODE_SIGNAL!r}, got {mode!r}"
+        )
+    max_proposals = cfg.get("max_proposals", _DEFAULT_MAX_PROPOSALS)
+    if isinstance(max_proposals, bool) or not isinstance(max_proposals, int) or max_proposals < 1:
+        raise RuntimeError(
+            f"approval destination: 'max_proposals' must be a positive integer, got {max_proposals!r}"
+        )
+    if mode == MODE_SIGNAL and not any(
+        key in wrap for key in ("webhook_env", "bot_token_env")
+    ) and not any(
+        key in route for route in wrap.get("routes") or [] if isinstance(route, dict)
+        for key in ("webhook_env", "bot_token_env")
+    ):
+        # The wrapped destination never posts in signal mode, but building it
+        # still builds its transports; lend it this block's.
+        wrap.update({key: cfg[key] for key in _TRANSPORT_KEYS if key in cfg})
+
     retval = ApprovalDestination(
         wrapped=build_destination(wrap),
         actions=list(actions),
@@ -277,5 +403,7 @@ def build(cfg: dict) -> Destination:
         timeout=timeout,
         identity=identity_from_config(cfg, "approval destination"),
         buttons=bool(cfg.get("buttons", False)),
+        mode=mode,
+        max_proposals=max_proposals,
     )
     return retval
