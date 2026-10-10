@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import html
 import re
+import sys
 import time
 from urllib.parse import quote
 
@@ -191,29 +192,49 @@ class RedditSource:
         )
         return retval
 
-    def _fetch_rules(self, subreddit: str) -> str:
-        """One subreddit's self-promotion rules, or "" if they cannot be read.
+    def _rules_for(self, subreddit: str, cfg: dict) -> str:
+        """The rules text to attach to this subreddit's signals ("" for none).
+
+        Hand-kept `rules` in the subreddit's config win and are used verbatim,
+        with no request: since about 2026-10 Reddit 403s every unauthenticated
+        JSON endpoint, rules.json included, while the RSS feeds still work
+        (issue #105). Without them, and with `include_rules` on, the rules are
+        fetched; a fetch that fails attaches _RULES_UNREADABLE rather than
+        nothing, because a draft that sees no rule includes the promotional
+        line, and a rule we could not read is not a rule that allows it.
+        """
+        configured = cfg.get("rules")
+        if isinstance(configured, str) and configured.strip():
+            return configured.strip()
+        if not self.include_rules:
+            return ""
+        fetched = self._fetch_rules(subreddit)
+        if fetched is None:
+            retval = _RULES_UNREADABLE.format(why=self.rule_errors[-1][1])
+            return retval
+        return fetched
+
+    def _fetch_rules(self, subreddit: str) -> str | None:
+        """One subreddit's self-promotion rules, or None if they cannot be read.
 
         Deliberately NOT a run-failing error, unlike a failed feed. A feed that
-        fails means no leads; rules that fail to load mean a lead posted without
-        its community's rule attached, which is a degraded lead rather than a
-        missing one. It is recorded in `rule_errors` and the draft downstream
-        simply has one less input.
+        fails means no leads; rules that fail to load mean a degraded lead
+        rather than a missing one. The failure is recorded in `rule_errors`.
         """
         url = _RULES_URL.format(sub=subreddit)
         try:
             resp = requests.get(url, headers={"User-Agent": self.user_agent}, timeout=self.timeout)
         except requests.RequestException as exc:
             self.rule_errors.append((subreddit, f"{type(exc).__name__}: {exc}"))
-            return ""
+            return None
         if not resp.ok:
             self.rule_errors.append((subreddit, f"{resp.status_code} {resp.reason}"))
-            return ""
+            return None
         try:
             payload = resp.json()
         except ValueError as exc:
             self.rule_errors.append((subreddit, f"reply was not JSON: {exc}"))
-            return ""
+            return None
         retval = _promo_rules(payload)
         return retval
 
@@ -227,8 +248,7 @@ class RedditSource:
         rules_by_sub: dict[str, str] = {}
 
         for subreddit, cfg in self.subreddits.items():
-            if self.include_rules:
-                rules_by_sub[subreddit] = self._fetch_rules(subreddit)
+            rules_by_sub[subreddit] = self._rules_for(subreddit, cfg or {})
             searches = (cfg or {}).get("searches") or []
             urls = [_search_url(subreddit, s) for s in searches] or [_new_url(subreddit)]
             for url in urls:
@@ -248,12 +268,23 @@ class RedditSource:
         if attempted and len(self.feed_errors) == attempted:
             detail = "; ".join(f"{url}: {why}" for url, why in self.feed_errors[:3])
             raise RuntimeError(f"reddit source: all {attempted} feed(s) failed — {detail}")
+        if self.rule_errors:
+            print(
+                f"reddit source: rules unreadable for {len(self.rule_errors)} subreddit(s), "
+                f"their leads treat self-promotion as forbidden — "
+                f"{'; '.join(f'{sub}: {why}' for sub, why in self.rule_errors)}",
+                file=sys.stderr,
+            )
 
         retval = signals
         return retval
 
 
 _RULES_URL = "https://www.reddit.com/r/{sub}/about/rules.json"
+_RULES_UNREADABLE = (
+    "This subreddit's rules could not be read ({why}). Treat self-promotion as "
+    "forbidden here: no line about who we are, no offer."
+)
 # Rule text that bears on whether we may mention ourselves at all. Matching on
 # the rule's own words rather than its number, because numbering differs per
 # subreddit and the relevant rule is rarely rule 1.
@@ -291,13 +322,15 @@ def _promo_rules(payload: dict) -> str:
 
 
 def _normalize_subreddits(declared: object) -> dict[str, dict]:
-    """Accept either the plain list form or the mapping-with-searches form.
+    """Accept either the plain list form or the mapping form.
 
         subreddits: [construction, smallbusiness]
 
         subreddits:
           construction:
             searches: [paperwork, invoicing]
+          smallbusiness:
+            rules: "No self-promotion: ..."   # hand-kept, attached verbatim
 
     The list form fetches /new.rss, which is the reliable path now that search
     feeds 403.
