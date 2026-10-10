@@ -41,7 +41,7 @@ from pathlib import Path
 from typing import Any
 
 from framework.interfaces import ScoredSignal
-from framework.llm import LLMClient
+from framework.llm import LLMClient, build_client
 
 _DECODER = json.JSONDecoder()
 
@@ -192,3 +192,72 @@ class Drafter:
                 )
             retval[name] = value.strip()
         return retval
+
+
+def drafter_inputs(block: dict, label: str) -> dict[str, Any]:
+    """A `drafter` block's validated inputs, grounding already read.
+
+    Everything a `Drafter` needs except its model client, which wants the
+    workspace and root that only the run (or, for an action, the approvals
+    pass) knows. Split out so a caller that learns those later can still fail
+    on a bad block, or an unreadable grounding file, when it is built.
+    """
+    prompt = block.get("prompt")
+    if not prompt or not isinstance(prompt, str):
+        raise RuntimeError(f"{label}: 'drafter' needs a 'prompt'")
+
+    fields = block.get("fields")
+    if not isinstance(fields, dict) or not fields:
+        raise RuntimeError(
+            f"{label}: 'drafter' needs 'fields', an object of name -> "
+            "description written for the model"
+        )
+    bad = sorted(n for n, d in fields.items() if not isinstance(d, str) or not d.strip())
+    if bad:
+        raise RuntimeError(f"{label}: drafter fields {', '.join(bad)} need a non-empty description")
+
+    grounding_paths = block.get("grounding")
+    if not isinstance(grounding_paths, list) or not all(
+        isinstance(p, str) and p.strip() for p in grounding_paths
+    ):
+        raise RuntimeError(
+            f"{label}: 'drafter' needs 'grounding', a non-empty list of file "
+            "paths. A draft makes claims about us, and claims need provenance"
+        )
+    grounding = load_grounding(
+        grounding_paths,
+        int(block.get("max_grounding_chars", 60000)),
+        f"{label} drafter",
+    )
+    retval = {
+        "grounding": grounding,
+        "prompt": prompt,
+        "fields": fields,
+        "system": block.get("system") or DEFAULT_SYSTEM,
+        "max_signal_chars": int(block.get("max_signal_chars", 4000)),
+    }
+    return retval
+
+
+def drafter_with_llm(
+    block: dict, inputs: dict[str, Any], label: str, workspace: Any, root: Any
+) -> Drafter:
+    """A `Drafter` from `drafter_inputs()`, with its model client built now.
+
+    The drafter's own chain if the block names one, else the deployment's
+    waterfall (framework/llm.py).
+    """
+    llm_cfg = dict(block)
+    if workspace and "_workspace" not in llm_cfg:
+        llm_cfg["_workspace"] = str(workspace)
+    if root and "_root" not in llm_cfg:
+        llm_cfg["_root"] = str(root)
+    llm = build_client(llm_cfg, what=f"{label} drafter")
+    retval = Drafter(llm=llm, **inputs)
+    return retval
+
+
+def build_drafter(block: dict, label: str, workspace: Any, root: Any) -> Drafter:
+    """Validate a `drafter` block, read its grounding and build its client."""
+    retval = drafter_with_llm(block, drafter_inputs(block, label), label, workspace, root)
+    return retval
