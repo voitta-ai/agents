@@ -133,6 +133,7 @@ class ApprovalsConfig:
         actions: dict[str, Any],
         timeout: int = 30,
         app_token: str = "",
+        listen_for: list[Path] | None = None,
     ):
         self.agent = agent
         self.workspace = workspace
@@ -143,6 +144,7 @@ class ApprovalsConfig:
         self.actions = actions
         self.timeout = timeout
         self.app_token = app_token
+        self.listen_for = listen_for or []
 
 
 def load_approvals_config(workspace: str | Path) -> ApprovalsConfig:
@@ -199,6 +201,20 @@ def load_approvals_config(workspace: str | Path) -> ApprovalsConfig:
                 f"(named by {config_path}: 'approvals.app_token_env')"
             )
 
+    # Other workspaces whose button clicks this workspace's listener also
+    # serves (issue #103): Slack hands an app's clicks to any of its Socket Mode
+    # connections, so every workspace posting cards through one app has to be
+    # served by the one listener that app has. Paths are relative to the
+    # workspaces root, i.e. sibling workspace names.
+    listen_for_raw = block.get("listen_for", [])
+    if not isinstance(listen_for_raw, list) or not all(
+        isinstance(w, str) and w.strip() for w in listen_for_raw
+    ):
+        raise ConfigError(
+            f"{config_path}: 'approvals.listen_for' must be a list of workspace names"
+        )
+    listen_for = [(workspace_path.parent / w).resolve() for w in listen_for_raw]
+
     trusted = block.get("trusted_user_ids")
     if not isinstance(trusted, list) or not trusted or not all(isinstance(u, str) for u in trusted):
         raise ConfigError(
@@ -228,6 +244,7 @@ def load_approvals_config(workspace: str | Path) -> ApprovalsConfig:
         actions=actions,
         timeout=int(block.get("timeout", 30)),
         app_token=app_token,
+        listen_for=listen_for,
     )
     return retval
 
