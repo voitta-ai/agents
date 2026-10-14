@@ -282,7 +282,7 @@ only button clicks, so anything else sent to it is dropped without a trace.
 
   ```json
   "approvals": {"listen": true, "app_token_env": "SOME_APP_TOKEN",
-                "listen_for": ["toptal-slack"], "...": "..."}
+                "listen_for": ["slack-workspace"], "...": "..."}
   ```
 
   A card's buttons carry `<workspace>/<proposal id>`, and the listener sends
