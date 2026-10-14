@@ -18,6 +18,7 @@ Later additions:
   - `llm` scorer         (issue #9)  - scores through the model waterfall
   - `approval` destination and `slack-post` action (issue #21)
   - `twitter-post` and `command` actions (issue #48)
+  - `slack-draft` action (issue #76) - the grounded drafter, run on approval
   - `multi` source, `fanout` destination, `websearch` source (issue #57) - the
     composites, and a search engine as a source
 
@@ -78,6 +79,7 @@ _PLUGIN_MODULES: dict[str, tuple[str, ...]] = {
     "reddit_source": ("reddit",),
     "regex_scorer": ("regex",),
     "slack_destination": ("slack",),
+    "slack_draft_action": ("slack-draft",),
     "slack_post_action": ("slack-post",),
     "slack_workspace_source": ("slack-workspace",),
     "twitter_action": ("twitter-post",),

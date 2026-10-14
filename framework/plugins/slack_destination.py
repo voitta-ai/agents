@@ -75,8 +75,8 @@ destination's job, not the framework's.
 from __future__ import annotations
 
 from framework.interfaces import Destination, ScoredSignal
-from framework.drafter import DEFAULT_SYSTEM, DraftError, Drafter, load_grounding
-from framework.llm import LLMError, build_client
+from framework.drafter import DraftError, Drafter, build_drafter
+from framework.llm import LLMError
 from framework.registry import register_destination
 from framework.slack import (
     SlackIdentity,
@@ -334,51 +334,7 @@ def _build_drafter(cfg: dict) -> Drafter | None:
             "compact list of many signals, and a draft per line would be unreadable"
         )
 
-    prompt = block.get("prompt")
-    if not prompt or not isinstance(prompt, str):
-        raise RuntimeError("slack destination: 'drafter' needs a 'prompt'")
-
-    fields = block.get("fields")
-    if not isinstance(fields, dict) or not fields:
-        raise RuntimeError(
-            "slack destination: 'drafter' needs 'fields', an object of name -> "
-            "description written for the model"
-        )
-    bad = sorted(n for n, d in fields.items() if not isinstance(d, str) or not d.strip())
-    if bad:
-        raise RuntimeError(
-            f"slack destination: drafter fields {', '.join(bad)} need a non-empty description"
-        )
-
-    grounding_paths = block.get("grounding")
-    if not isinstance(grounding_paths, list) or not all(
-        isinstance(p, str) and p.strip() for p in grounding_paths
-    ):
-        raise RuntimeError(
-            "slack destination: 'drafter' needs 'grounding', a non-empty list of file "
-            "paths. A draft makes claims about us, and claims need provenance"
-        )
-    grounding = load_grounding(
-        grounding_paths,
-        int(block.get("max_grounding_chars", 60000)),
-        "slack destination drafter",
-    )
-
-    # The drafter's own chain if it names one, else the deployment's waterfall.
-    llm_cfg = dict(block)
-    for key in ("_workspace", "_root"):
-        if key in cfg and key not in llm_cfg:
-            llm_cfg[key] = cfg[key]
-    llm = build_client(llm_cfg, what="slack destination drafter")
-
-    retval = Drafter(
-        llm=llm,
-        grounding=grounding,
-        prompt=prompt,
-        fields=fields,
-        system=block.get("system") or DEFAULT_SYSTEM,
-        max_signal_chars=int(block.get("max_signal_chars", 4000)),
-    )
+    retval = build_drafter(block, "slack destination", cfg.get("_workspace"), cfg.get("_root"))
     return retval
 
 

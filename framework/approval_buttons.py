@@ -142,12 +142,24 @@ def _sections(text: str) -> list[dict[str, Any]]:
     return retval
 
 
-def proposal_blocks(text: str, proposal_id: str, action: str) -> list[dict[str, Any]]:
-    """The proposal message: the rendered content, then the three buttons.
+def proposal_blocks(
+    text: str,
+    proposal_id: str,
+    action: str,
+    post_label: str = "Post",
+    draft_button: bool = True,
+) -> list[dict[str, Any]]:
+    """The proposal message: the rendered content, then the buttons.
 
     `text` is exactly what the webhook would have posted without buttons, so
     the content a human reads is the same either way and this stays out of the
     way of whatever builds it (issue #73 owns the Markdown-to-mrkdwn pass).
+
+    `post_label` renames the first button, which runs the action as
+    configured: "Post" is wrong for an action that drafts something for a
+    human to send (issue #76). `draft_button: false` leaves out Draft, which
+    only means anything for an action with a `wordpress-publish` step and is
+    refused for any other.
     """
     blocks = _sections(text)
     blocks.append(
@@ -170,16 +182,22 @@ def proposal_blocks(text: str, proposal_id: str, action: str) -> list[dict[str, 
                 {
                     "type": "button",
                     "action_id": ACTION_POST,
-                    "text": {"type": "plain_text", "text": "Post"},
+                    "text": {"type": "plain_text", "text": post_label},
                     "style": "primary",
                     "value": proposal_id,
                 },
-                {
-                    "type": "button",
-                    "action_id": ACTION_DRAFT,
-                    "text": {"type": "plain_text", "text": "Draft"},
-                    "value": proposal_id,
-                },
+                *(
+                    [
+                        {
+                            "type": "button",
+                            "action_id": ACTION_DRAFT,
+                            "text": {"type": "plain_text", "text": "Draft"},
+                            "value": proposal_id,
+                        }
+                    ]
+                    if draft_button
+                    else []
+                ),
                 {
                     "type": "button",
                     "action_id": ACTION_DISCARD,
@@ -228,7 +246,10 @@ def outcome_line(status: str, variant: str, user_id: str, when: str, detail: str
         retval = f":wastebasket: Discarded by {who} at {when}."
         return retval
     if status == STATUS_DONE:
-        verb = "Drafted" if variant == VARIANT_DRAFT else "Posted"
+        # "Approved", not "Posted": the first button runs whatever the action
+        # is, and for one that drafts something for a human to send, "Posted"
+        # would claim the very thing that did not happen.
+        verb = "Drafted" if variant == VARIANT_DRAFT else "Approved"
         retval = f":white_check_mark: {verb} by {who} at {when}. {detail}"
         return retval
     retval = f":x: Failed after {who} clicked at {when}. {detail}"

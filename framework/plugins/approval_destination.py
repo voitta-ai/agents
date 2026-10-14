@@ -49,6 +49,9 @@ action, since a button carries one proposal id. Turn it on together with
 holding the Socket Mode connection, the buttons render but no interaction is
 ever delivered. The reply path keeps working either way, and the reply grammar
 is repeated in the message's context line so it is still discoverable.
+`post_label` renames the Post button (an action that drafts for a human wants
+"Draft application", not "Post"), and `draft_button: false` drops the Draft
+button for an action with no WordPress step to draft (issue #76).
 
 Two behaviours worth knowing:
 
@@ -175,6 +178,8 @@ class ApprovalDestination:
         buttons: bool = False,
         mode: str = MODE_RUN,
         max_proposals: int = _DEFAULT_MAX_PROPOSALS,
+        post_label: str = "Post",
+        draft_button: bool = True,
     ):
         needed = ("render",) if mode == MODE_RUN else ("accepts", "render_signal")
         missing = [name for name in needed if not callable(getattr(wrapped, name, None))]
@@ -199,6 +204,8 @@ class ApprovalDestination:
         self._buttons = buttons
         self._mode = mode
         self._max_proposals = max_proposals
+        self._post_label = post_label
+        self._draft_button = draft_button
         self._signals: list[ScoredSignal] = []
 
     def send(self, scored: ScoredSignal) -> None:
@@ -232,7 +239,9 @@ class ApprovalDestination:
         rendered = to_mrkdwn(text)
         body: dict = {
             "text": f"{rendered}\n\nProposal {pid}: {action}.",
-            "blocks": proposal_blocks(rendered, pid, action),
+            "blocks": proposal_blocks(
+                rendered, pid, action, self._post_label, self._draft_button
+            ),
         }
         body.update(self._identity.payload())
         # Through the transport, not a raw requests.post. This call site was
@@ -405,5 +414,7 @@ def build(cfg: dict) -> Destination:
         buttons=bool(cfg.get("buttons", False)),
         mode=mode,
         max_proposals=max_proposals,
+        post_label=str(cfg.get("post_label") or "Post"),
+        draft_button=bool(cfg.get("draft_button", True)),
     )
     return retval
