@@ -276,13 +276,25 @@ only button clicks, so anything else sent to it is dropped without a trace.
   (`app_token_env`). It must be invited to every approval channel. Create it
   from [`docs/slack-app-manifest.yaml`](docs/slack-app-manifest.yaml), which
   carries the full scope set.
-- **Only one workspace per app may set `"listen": true` today.** Each
-  `--listen` job is its own connection, and a click Slack hands to the wrong
-  agent's listener is refused as "wrong channel" or as an unknown proposal. The
-  polling pass still resolves it, but the button looks broken. Serving several
-  approval-enabled agents through one app needs a single listener that routes
-  each click to the agent that owns the proposal. Until that exists, enable
-  buttons on one agent per app and leave the rest on `do <id>` replies.
+- **One listener per app, serving every workspace on it** (issue #103). Exactly
+  one workspace per app sets `"listen": true` and names the others in
+  `approvals.listen_for`, as sibling workspace names:
+
+  ```json
+  "approvals": {"listen": true, "app_token_env": "SOME_APP_TOKEN",
+                "listen_for": ["toptal-slack"], "...": "..."}
+  ```
+
+  A card's buttons carry `<workspace>/<proposal id>`, and the listener sends
+  each click to that workspace's own store, channel, trusted users, bot token
+  and actions; only the connection is shared. The other workspaces keep their
+  `approvals` block (channel, `bot_token_env`, `trusted_user_ids`) and their
+  polling pass, but set no `listen` and need no `app_token_env`. A second
+  `"listen": true` on the same app is a second connection, and Slack would split
+  the clicks between the two. A served workspace whose config does not load
+  stops the listener at startup. Cards posted before #103 carry a bare id; the
+  listener finds the one store that holds it, and refuses (pointing at
+  `do <id>`) if none or several do.
 
 An incoming webhook never receives anything, so webhooks can be shared freely.
 They do not count as consumers.

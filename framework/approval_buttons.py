@@ -75,6 +75,13 @@ anything can print them.
 A click is acted on only if it came from the configured `channel_id` and from
 a user in `trusted_user_ids`; either check failing is an ephemeral refusal and
 nothing else.
+
+One listener serves every workspace that posts cards through its app (issue
+#103): the listening workspace names the others in `approvals.listen_for`, each
+button's value is `<workspace>/<proposal id>`, and `route_block_action` hands
+the click to that workspace's store and config, where the channel and trust
+checks above are that workspace's own. Slack would split clicks between two
+connections on one app, so a second listener is never the answer.
 """
 from __future__ import annotations
 
@@ -86,6 +93,7 @@ import requests
 
 from framework.approvals import (
     ApprovalsConfig,
+    load_approvals_config,
     _now_iso,
     _run_steps,
     _slack_call,
@@ -93,6 +101,7 @@ from framework.approvals import (
     human_time,
     steps_detail,
 )
+from framework.config import ConfigError
 from framework.proposals import (
     ProposalStore,
     proposals_path,
@@ -148,6 +157,7 @@ def proposal_blocks(
     action: str,
     post_label: str = "Post",
     draft_button: bool = True,
+    ref: str | None = None,
 ) -> list[dict[str, Any]]:
     """The proposal message: the rendered content, then the buttons.
 
@@ -160,7 +170,13 @@ def proposal_blocks(
     human to send (issue #76). `draft_button: false` leaves out Draft, which
     only means anything for an action with a `wordpress-publish` step and is
     refused for any other.
+
+    `ref` is what each button carries back to the listener, normally
+    `<workspace>/<proposal id>`, so one listener can serve every workspace that
+    posts through the same app (issue #103). Without it the bare id is used,
+    which is what every card posted before #103 carries.
     """
+    value = ref or proposal_id
     blocks = _sections(text)
     blocks.append(
         {
@@ -184,7 +200,7 @@ def proposal_blocks(
                     "action_id": ACTION_POST,
                     "text": {"type": "plain_text", "text": post_label},
                     "style": "primary",
-                    "value": proposal_id,
+                    "value": value,
                 },
                 *(
                     [
@@ -192,7 +208,7 @@ def proposal_blocks(
                             "type": "button",
                             "action_id": ACTION_DRAFT,
                             "text": {"type": "plain_text", "text": "Draft"},
-                            "value": proposal_id,
+                            "value": value,
                         }
                     ]
                     if draft_button
@@ -203,7 +219,7 @@ def proposal_blocks(
                     "action_id": ACTION_DISCARD,
                     "text": {"type": "plain_text", "text": "Discard"},
                     "style": "danger",
-                    "value": proposal_id,
+                    "value": value,
                 },
             ],
         }
@@ -327,8 +343,94 @@ class SlackResponder:
             raise _sanitised("ephemeral reply", exc) from None
 
 
+def split_ref(value: str) -> tuple[str | None, str]:
+    """A button value as (workspace name or None, proposal id).
+
+    `<workspace>/<id>` since issue #103; a bare id on every card posted before
+    it. A workspace name is a directory name, so it cannot contain the `/`.
+    """
+    if "/" in value:
+        workspace, proposal_id = value.rsplit("/", 1)
+        retval = (workspace, proposal_id)
+        return retval
+    retval = (None, value)
+    return retval
+
+
+class Route:
+    """One workspace a listener serves: its config, its store, its responder."""
+
+    def __init__(self, cfg: ApprovalsConfig):
+        self.cfg = cfg
+        self.store = ProposalStore(proposals_path(cfg.workspace))
+        self.responder = SlackResponder(cfg.bot_token, cfg.timeout)
+
+
+def route_block_action(routes: dict[str, Route], payload: dict[str, Any]) -> tuple[str, str]:
+    """Send one click to the workspace that owns its proposal (issue #103).
+
+    Returns (agent name for the log line, summary). A `<workspace>/<id>` value
+    goes to that workspace, or is refused if this listener does not serve it.
+    A bare id, from a card posted before values carried the workspace, goes to
+    the one store that holds it; held by none or by several, it is refused and
+    the `do <id>` reply path is named, which still works.
+    """
+    any_route = next(iter(routes.values()))
+    actions = payload.get("actions") or []
+    if not actions or actions[0].get("action_id") not in (ACTION_POST, ACTION_DRAFT, ACTION_DISCARD):
+        # Nothing to route; the handler says why it is ignored.
+        retval = (any_route.cfg.agent, handle_block_action(
+            any_route.cfg, any_route.store, payload, any_route.responder
+        ))
+        return retval
+    workspace, proposal_id = split_ref(str(actions[0].get("value") or ""))
+    response_url = str(payload.get("response_url") or "")
+    user_id = str((payload.get("user") or {}).get("id") or "")
+    if workspace is not None:
+        route = routes.get(workspace)
+        if route is None:
+            any_route.responder.ephemeral(
+                response_url,
+                f"Proposal {proposal_id} belongs to '{workspace}', which this listener "
+                f"does not serve (add it to 'approvals.listen_for'). Nothing ran; "
+                f"reply \"do {proposal_id}\" in its approval channel instead.",
+            )
+            retval = (any_route.cfg.agent,
+                      f"proposal={proposal_id} verdict=refused user={user_id} "
+                      f"(workspace {workspace!r} not served)")
+            return retval
+    else:
+        holders = [r for r in routes.values() if r.store.get(proposal_id) is not None]
+        if len(holders) == 1 or len(routes) == 1:
+            route = holders[0] if holders else any_route
+        else:
+            where = (
+                f"is in {len(holders)} of this listener's workspaces, so the click "
+                "cannot tell which"
+                if holders
+                else "is in none of this listener's workspaces"
+            )
+            any_route.responder.ephemeral(
+                response_url,
+                f"Proposal {proposal_id} {where}. Nothing ran; reply "
+                f"\"do {proposal_id}\" in the approval channel instead.",
+            )
+            retval = (any_route.cfg.agent,
+                      f"proposal={proposal_id} verdict=refused user={user_id} "
+                      f"(bare id in {len(holders)} workspaces)")
+            return retval
+    retval = (route.cfg.agent, handle_block_action(
+        route.cfg, route.store, payload, route.responder, proposal_id=proposal_id
+    ))
+    return retval
+
+
 def handle_block_action(
-    cfg: ApprovalsConfig, store: ProposalStore, payload: dict[str, Any], responder: Any
+    cfg: ApprovalsConfig,
+    store: ProposalStore,
+    payload: dict[str, Any],
+    responder: Any,
+    proposal_id: str | None = None,
 ) -> str:
     """Act on one button click; return the one-line summary for the log.
 
@@ -346,7 +448,8 @@ def handle_block_action(
         retval = f"ignored: unknown action_id {action_id!r}"
         return retval
 
-    proposal_id = str(action.get("value") or "")
+    if proposal_id is None:
+        proposal_id = split_ref(str(action.get("value") or ""))[1]
     user_id = str((payload.get("user") or {}).get("id") or "")
     response_url = str(payload.get("response_url") or "")
     channel = str((payload.get("channel") or {}).get("id") or "")
@@ -492,8 +595,7 @@ def run_listener(cfg: ApprovalsConfig) -> int:
             "pip install '.[approvals-buttons]' (slack_sdk, websocket-client)"
         ) from exc
 
-    store = ProposalStore(proposals_path(cfg.workspace))
-    responder = SlackResponder(cfg.bot_token, cfg.timeout)
+    routes = listener_routes(cfg)
     client = SocketModeClient(app_token=cfg.app_token)
 
     def on_request(socket_client, request: Any) -> None:
@@ -508,17 +610,18 @@ def run_listener(cfg: ApprovalsConfig) -> int:
         if payload.get("type") != "block_actions":
             return
         try:
-            summary = handle_block_action(cfg, store, payload, responder)
+            agent, summary = route_block_action(routes, payload)
         except Exception as exc:
             # One bad interaction must not take the listener down: the next
             # click, and the polling pass, still work. The proposal is left
             # wherever the claim put it, which `stuck=N` reports.
             print(f"agent: interaction failed: {type(exc).__name__}: {exc}", file=sys.stderr)
             return
-        print(f"agent={cfg.agent} {summary} at={_now_iso()}", flush=True)
+        print(f"agent={agent} {summary} at={_now_iso()}", flush=True)
 
     client.socket_mode_request_listeners.append(on_request)
-    print(f"agent={cfg.agent} listening for approval clicks (socket mode)", flush=True)
+    served = ", ".join(sorted(routes))
+    print(f"agent={cfg.agent} listening for approval clicks (socket mode) for {served}", flush=True)
     try:
         # Inside the try: a rejected app token fails the handshake here, and
         # launchd restarts this job (KeepAlive), so the socket has to be closed
@@ -530,6 +633,28 @@ def run_listener(cfg: ApprovalsConfig) -> int:
     finally:
         client.close()
     retval = 0
+    return retval
+
+
+def listener_routes(cfg: ApprovalsConfig) -> dict[str, Route]:
+    """This workspace plus every one it names in `approvals.listen_for`.
+
+    Keyed by workspace directory name, which is what a card's button value
+    carries. Each served workspace keeps its own channel, trusted users, bot
+    token and actions; only the app-level token, and so the one connection, is
+    shared. A served workspace that does not load stops the listener at start,
+    rather than refusing its clicks one at a time later.
+    """
+    routes = {cfg.workspace.name: Route(cfg)}
+    for path in cfg.listen_for:
+        try:
+            other = load_approvals_config(path)
+        except ConfigError as exc:
+            raise ListenerError(f"approvals.listen_for: {path.name}: {exc}") from exc
+        if path.name in routes:
+            raise ListenerError(f"approvals.listen_for: {path.name} is listed twice")
+        routes[path.name] = Route(other)
+    retval = routes
     return retval
 
 

@@ -180,6 +180,7 @@ class ApprovalDestination:
         max_proposals: int = _DEFAULT_MAX_PROPOSALS,
         post_label: str = "Post",
         draft_button: bool = True,
+        workspace_name: str = "",
     ):
         needed = ("render",) if mode == MODE_RUN else ("accepts", "render_signal")
         missing = [name for name in needed if not callable(getattr(wrapped, name, None))]
@@ -206,6 +207,7 @@ class ApprovalDestination:
         self._max_proposals = max_proposals
         self._post_label = post_label
         self._draft_button = draft_button
+        self._workspace_name = workspace_name
         self._signals: list[ScoredSignal] = []
 
     def send(self, scored: ScoredSignal) -> None:
@@ -240,7 +242,14 @@ class ApprovalDestination:
         body: dict = {
             "text": f"{rendered}\n\nProposal {pid}: {action}.",
             "blocks": proposal_blocks(
-                rendered, pid, action, self._post_label, self._draft_button
+                rendered,
+                pid,
+                action,
+                self._post_label,
+                self._draft_button,
+                # Where the click is routed: one listener can serve several
+                # workspaces on one app (issue #103).
+                f"{self._workspace_name}/{pid}" if self._workspace_name else None,
             ),
         }
         body.update(self._identity.payload())
@@ -416,5 +425,6 @@ def build(cfg: dict) -> Destination:
         max_proposals=max_proposals,
         post_label=str(cfg.get("post_label") or "Post"),
         draft_button=bool(cfg.get("draft_button", True)),
+        workspace_name=Path(workspace).name,
     )
     return retval
