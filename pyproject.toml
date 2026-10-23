@@ -28,7 +28,14 @@ approvals-buttons = ["slack_sdk>=3.27", "websocket-client>=1.7"]
 agent = "framework.cli:main"
 
 [build-system]
-requires = ["setuptools>=61"]
+# setuptools 77 is the first release that understands the PEP 639 license
+# fields above: `license` as a bare SPDX expression and `license-files`. On
+# 61 through 76 the build fails outright with "`project.license` must be valid
+# exactly by one definition", because those versions accept only the older
+# table forms, {text = "..."} or {file = "..."}. Checked against 75.8.0, which
+# fails, and 77.0.3 and 80.9.0, which both build and emit
+# `License-Expression: MIT` with the LICENSE file in the wheel.
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
