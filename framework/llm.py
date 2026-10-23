@@ -49,7 +49,10 @@ exhaustion is neither: Anthropic answers a usage cap with 400, OpenRouter answer
 no-credit with 402. Fallback still covers the call, but the dead vendor would be
 re-dialled first on every run for as long as the cap lasts -- weeks, in the case
 that prompted shmobster's version. So a 402, or a 400/403 whose message names a
-spend problem (`_BUDGET_MARKERS`), parks that vendor: its expiry goes into
+spend problem (`_BUDGET_MARKERS`), parks that vendor -- except a 402 that says
+the request itself was too large (`_REQUEST_SIZED_402`), which means the account
+still has credit and a smaller call still works, so only that call fails. Parking
+puts an expiry into
 `<workspace>/state/llm-parked.json`, and the Router is rebuilt without it until
 then. The expiry is the vendor's own "regain access on
 YYYY-MM-DD" when it states one and the date is in the future (clamped to 31
@@ -135,6 +138,12 @@ _BUDGET_MARKERS = (
     "payment required",
 )
 
+# A 402 whose text says a smaller request would be affordable. OpenRouter's
+# reads "This request requires more credits, or fewer max_tokens. You requested
+# up to 16000 tokens, but can only afford 1200." The vendor is not exhausted and
+# must not be parked; only this call fails.
+_REQUEST_SIZED_402 = ("fewer max_tokens", "can only afford")
+
 # Anthropic states when access returns: "You will regain access on 2026-09-01".
 _REGAIN_DATE = re.compile(r"regain access on (\d{4})-(\d{2})-(\d{2})")
 
@@ -178,18 +187,26 @@ class _Vendor:
 
 def is_budget_error(exc: BaseException) -> bool:
     """A 402, or a 400/403 that names a spend problem. A 402 needs no marker:
-    it has no other reading, and OpenRouter's most common one -- "This request
-    requires more credits, or fewer max_tokens ... can only afford N" -- names
-    none, so it was re-dialled on every call. A 400 still needs one, because it
-    is also 'your request was malformed'."""
+    it has no other reading, and OpenRouter's unqualified one names none, so it
+    was re-dialled on every call. A 400 still needs one, because it is also
+    'your request was malformed'.
+
+    The exception is a 402 that says the request itself was too large
+    (`_REQUEST_SIZED_402`). That one is not exhaustion: the account has credit,
+    this call just asked for more tokens than it covers, and a smaller call on
+    the same vendor still succeeds. Parking the vendor on it would retire a rung
+    that still works -- and on the last rung of the waterfall there is nothing
+    below to fall to, so an oversized digest step would take every smaller call
+    down with it for the whole park window. Such a call fails over without
+    parking, which is what the pre-park behaviour did correctly."""
     status = getattr(exc, "status_code", None)
+    text = str(getattr(exc, "message", "") or str(exc)).lower()
     if status == 402:
-        retval = True
+        retval = not any(marker in text for marker in _REQUEST_SIZED_402)
         return retval
     if status not in (400, 403):
         retval = False
         return retval
-    text = str(getattr(exc, "message", "") or str(exc)).lower()
     retval = any(marker in text for marker in _BUDGET_MARKERS)
     return retval
 
