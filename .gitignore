@@ -13,3 +13,12 @@ agents/*/.seen-*.json
 # proposals store written by the approval destination (issue #21) when the
 # config dir doubles as the workspace; workspaces proper live outside the checkout
 agents/*/state/
+
+# Session notes and handoffs (issue #68). Untracked, but NOT ignored before
+# this line, so a `git add -A` would have committed them: they describe the
+# live deployment -- workspace names, channel ids, launchd labels -- which is
+# exactly what must never reach a public repo.
+.claude/
+
+# setuptools build tree
+build/
