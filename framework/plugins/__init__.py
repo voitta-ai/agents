@@ -21,6 +21,8 @@ Later additions:
   - `slack-draft` action (issue #76) - the grounded drafter, run on approval
   - `multi` source, `fanout` destination, `websearch` source (issue #57) - the
     composites, and a search engine as a source
+  - `signal-messenger` destination (issue #120) - Signal, through the
+    `signal-cli` binary against an account this deployment owns
 
 Why a table rather than eight import statements (issue #39). Importing every
 plugin unconditionally means one plugin's optional third-party dependency can
@@ -78,6 +80,7 @@ _PLUGIN_MODULES: dict[str, tuple[str, ...]] = {
     "multi_source": ("multi",),
     "reddit_source": ("reddit",),
     "regex_scorer": ("regex",),
+    "signal_destination": ("signal-messenger",),
     "slack_destination": ("slack",),
     "slack_draft_action": ("slack-draft",),
     "slack_post_action": ("slack-post",),
