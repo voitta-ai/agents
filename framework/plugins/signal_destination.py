@@ -32,7 +32,12 @@ from __future__ import annotations
 
 from framework.interfaces import Destination, ScoredSignal
 from framework.registry import register_destination
-from framework.signal_messenger import SignalTransport, post_message, transport_from_config
+from framework.signal_messenger import (
+    SignalTransport,
+    check_footer,
+    post_message,
+    transport_from_config,
+)
 
 _LABEL = "signal-messenger destination"
 
@@ -101,6 +106,11 @@ def build(cfg: dict) -> Destination:
     footer = cfg.get("footer", "")
     if not isinstance(footer, str):
         raise RuntimeError(f"{_LABEL}: 'footer' must be a string")
+    # Here rather than only at send time: a footer too long to leave room for a
+    # message is knowable before the run fetches, scores or asks a model
+    # anything, and left unchecked it turns one scored signal into thousands of
+    # one-character Signal messages. The same guard `slack_destination` makes.
+    check_footer(footer, f"{_LABEL}: 'footer'")
 
     retval = SignalDestination(
         transport=transport,

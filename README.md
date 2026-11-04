@@ -504,7 +504,10 @@ never written in config: a `config.example.json` in this repo is public.
 
 The dependency is the `signal-cli` binary (`brew install signal-cli`), not a
 Python package, so there is no optional extra to install — a missing binary
-fails when the destination is built, naming it.
+fails when the destination is built, naming it. That is all the build checks:
+an unregistered account or a group id this account is not in costs a subprocess
+and the account lock to verify, so it is left to fail on the first send rather
+than on every run that sends nothing.
 
 **Signal takes plain text plus styled ranges, not markup.** Everything this
 repo sends goes through `framework/signal_messenger.py::post_message`, which is
@@ -520,13 +523,21 @@ as on Slack. There is no link style — Signal linkifies bare URLs itself — so
 **Offsets are UTF-16 code units, not characters.** signal-cli's own help says
 so in capitals, and it matters: an emoji is two units, so a message with one
 ahead of a bold word would otherwise style the wrong letters. `_units()` is the
-only place that counts.
+only place that counts — including the split, because measuring the split in
+code points and the limit in units is a disagreement that reaches 2x on emoji
+and refuses messages that fit.
 
-A message over Signal's 2000-character limit is split into several in order,
+A message over Signal's 2000-unit limit is split into several in order,
 numbered `(part 2 of 3)`, exactly as the Slack path splits on a block limit —
 and for the same reason, since another message can arrive between the parts.
-The split happens while the text is still Markdown, because a style range
-cannot be reopened across messages.
+A style range cannot be reopened across messages, so the message is rendered
+once and the text and its ranges are split together: a bold span that straddles
+a boundary becomes a bold range at the end of one part and another at the start
+of the next. A footer is appended after the rendering and never converted,
+which is the contract the Slack path states — a standing compliance line means
+the characters it was written with. A footer long enough to leave no room for
+content is refused where the config is read, before the run has paid for a
+fetch or an LLM call.
 
 Two things this destination deliberately does not do. It has no `routes`: the
 hot/firehose split is a Slack channel pattern, and a Signal group is somebody's

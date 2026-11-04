@@ -16,8 +16,11 @@ through the `signal-cli` binary, rather than borrowing a conversational agent's
 account and depending on its relay.
 
 There is no Python dependency to install, so there is no optional extra: the
-dependency is the `signal-cli` binary, checked for when the transport is built
-so a missing one fails at startup rather than on signal seventeen.
+dependency is the `signal-cli` binary, whose presence on PATH is checked when
+the transport is built. That is all that is checked there. An account that is
+not registered, or a group id this account is not a member of, costs a
+subprocess and the account lock to verify, so it is left to fail on the first
+send rather than on every run that sends nothing.
 
 ## Signal has no markup, it has ranges
 
@@ -25,14 +28,20 @@ Slack takes marked-up text. Signal takes **plain text plus a list of styled
 ranges**, passed as `--text-style start:length:STYLE`. So `to_signal()` returns
 both: the text with every marker removed, and the ranges that reproduce them.
 
-Two consequences worth knowing:
+Two consequences shaped the code:
 
 - **Offsets are UTF-16 code units, not characters**, which signal-cli's own
   help says in capitals. An emoji is two units, so a message with one emoji
   before a bold word would bold the wrong letters if offsets were counted in
-  Python characters. `_units` is the only place that counts.
-- **A range cannot be reopened across messages.** A long message is split
-  first, while it is still Markdown, and each part is converted on its own.
+  Python characters. `_units` is the only place that counts, including the
+  split: measuring the split in code points and the limit in units is a
+  disagreement that grows to 2x on emoji, and it refuses messages that fit.
+- **A range cannot be reopened across messages.** So a long message is
+  rendered *once*, and the text and its ranges are split together: a bold span
+  that straddles a part boundary becomes a bold range at the end of one part
+  and another at the start of the next. Splitting the Markdown first would have
+  been simpler and cuts a `**` in half when a single line is longer than the
+  limit, leaving the markers visible and the span unstyled.
 
 The styles Signal accepts are BOLD, ITALIC, STRIKETHROUGH, MONOSPACE and
 SPOILER — verified against signal-cli 0.14.9, which rejects anything else with
@@ -43,6 +52,10 @@ Headings become bold lines and list markers become bullets, the same choices
 
 `__x__` is deliberately not bold, matching `slack.py`: what this repo posts is
 full of `__init__`, and `**bold**` is how anyone here writes bold.
+
+A footer is appended after the conversion and never rendered, which is the
+contract `slack.py` states: a standing compliance line means the characters it
+was written with.
 """
 from __future__ import annotations
 
@@ -52,15 +65,13 @@ import re
 import shutil
 import subprocess
 
-from framework.slack import split_for_slack as _split_paragraphs
-
-# Signal's own per-message limit. A longer message is split into several, in
-# order, the way `slack.py` splits on its block limit.
+# Signal's own per-message limit, in UTF-16 code units. A longer message is
+# split into several, in order, the way `slack.py` splits on its block limit.
 SIGNAL_MESSAGE_LIMIT = 2000
 
 BULLET = "•"
 
-# Room kept back for `_(part 12 of 34)_` plus its newline, so numbering a part
+# Room kept back for `(part 12 of 34)` plus its newline, so numbering a part
 # can never push it over the limit. The same reservation `slack.py` makes.
 _MARKER_ROOM = 24
 
@@ -88,10 +99,17 @@ _ITALIC_STAR_RE = re.compile(r"(?<![\w*])\*(\S(?:[^*\n]*\S)?)\*(?![\w*])")
 # One underscore each side, never two. See the module docstring.
 _ITALIC_UNDER_RE = re.compile(r"(?<![\w_])_(?!_)(\S(?:[^_\n]*\S)?)_(?!_)(?![\w])")
 
+# Anything that looks like a phone number, for the scrubber. signal-cli reports
+# a failed send to a group by naming the member it could not reach.
+_NUMBER_RE = re.compile(r"\+\d{7,15}")
+
 # Tried in order at each position; the earliest match in the line wins, and a
-# tie goes to the pattern listed first. Code spans and links come before the
-# emphasis rules so that `*` inside a URL or a code span is left alone.
+# tie goes to the pattern listed first. A backslash escape comes first so that
+# `\*literal\*` is neither emphasised nor left with its backslashes: the escape
+# consumes both markers before any emphasis rule can pair them. Code spans and
+# links come next so that `*` inside a URL or a code span is left alone.
 _INLINE_RULES: tuple[tuple[re.Pattern[str], str | None], ...] = (
+    (_ESCAPE_RE, None),
     (_CODE_SPAN_RE, MONOSPACE),
     (_LINK_RE, None),
     (_AUTOLINK_RE, None),
@@ -115,12 +133,45 @@ class SignalCliError(RuntimeError):
 def _units(text: str) -> int:
     """Length in UTF-16 code units, which is what Signal counts.
 
-    The one place this repo counts offsets for Signal. Python's `len` counts
-    code points, so an emoji (two units) ahead of a styled span would shift
-    every range after it by one and style the wrong characters.
+    The one place this repo counts for Signal, for both the style offsets and
+    the message limit. Python's `len` counts code points, so an emoji (two
+    units) ahead of a styled span would shift every range after it by one and
+    style the wrong characters.
     """
     retval = len(text.encode("utf-16-le")) // 2
     return retval
+
+
+# The longest footer that still leaves room for the message it rides on. A
+# footer rides on every part, costing its length plus the newline before it,
+# and a split message also carries a part marker. See `check_footer`.
+MAX_FOOTER_UNITS = SIGNAL_MESSAGE_LIMIT - _MARKER_ROOM - 2
+
+
+def check_footer(
+    footer: str, label: str = "signal footer", limit: int = SIGNAL_MESSAGE_LIMIT
+) -> None:
+    """Refuse a footer that leaves no room for the message it rides on.
+
+    Without this the arithmetic in `post_message` runs out of room and then
+    goes negative, and a splitter given a non-positive limit emits one
+    character per part: a single scored signal becomes thousands of Signal
+    messages, each one of them under the limit, so nothing downstream objects
+    and the run reports success. `slack.py` refuses the same shape for the same
+    reason, and is checked where the config is read so it fails before the run
+    has paid for a fetch or an LLM call.
+
+    `limit` is Signal's own unless a caller is posting under a smaller one, in
+    which case the room a footer may take shrinks with it: a check against the
+    constant would pass a footer that leaves the caller's limit nothing.
+    """
+    room = limit - _MARKER_ROOM - 2
+    if _units(footer) > room:
+        raise ValueError(
+            f"{label} is {_units(footer)} UTF-16 units, which leaves no room for content "
+            f"under {'Signal' if limit == SIGNAL_MESSAGE_LIMIT else 'this caller'}'s "
+            f"{limit}-unit limit"
+        )
 
 
 class _Builder:
@@ -155,17 +206,6 @@ class _Builder:
             self.ranges.append((start, length, name))
 
 
-def _numbered(parts: list[str]) -> list[str]:
-    total = len(parts)
-    retval = [f"{part}\n_(part {i} of {total})_" for i, part in enumerate(parts, 1)]
-    return retval
-
-
-def _unescape(text: str) -> str:
-    retval = _ESCAPE_RE.sub(r"\1", text)
-    return retval
-
-
 def _link_text(match: re.Match[str]) -> str:
     """`[label](url)` as Signal shows it: the label, then the URL in brackets.
 
@@ -197,13 +237,13 @@ def _inline(text: str, out: _Builder) -> None:
             if best is None or found.start() < best[0]:
                 best = (found.start(), found, style)
         if best is None:
-            out.write(_unescape(text[position:]))
+            out.write(text[position:])
             return
         start, match, style = best
-        out.write(_unescape(text[position:start]))
+        out.write(text[position:start])
         mark = out.mark()
         if style is None:
-            out.write(_unescape(_link_text(match) if match.re is _LINK_RE else match.group(1)))
+            out.write(_link_text(match) if match.re is _LINK_RE else match.group(1))
         elif style in _RECURSIVE:
             _inline(match.group(1), out)
             out.style(mark, style)
@@ -262,6 +302,118 @@ def to_signal(text: str) -> tuple[str, list[tuple[int, int, str]]]:
     return retval
 
 
+def _segments(text: str, sep: str, base: int = 0) -> list[tuple[str, int]]:
+    """Each piece of `text` split on `sep`, with its UTF-16 offset in the whole.
+
+    The offsets are the point: a part's styles are the ranges that fall inside
+    it, so a split has to say where each piece came from.
+    """
+    retval = []
+    offset = base
+    for piece in text.split(sep):
+        retval.append((piece, offset))
+        offset += _units(piece) + _units(sep)
+    return retval
+
+
+def _cut(text: str, offset: int, limit: int) -> list[tuple[str, int]]:
+    """Cut inside a line, on a code-point boundary, when nothing coarser fits.
+
+    A code point is never split, so a surrogate pair cannot be halved into two
+    messages of invalid text.
+    """
+    retval: list[tuple[str, int]] = []
+    current = ""
+    start = offset
+    for char in text:
+        if current and _units(current) + _units(char) > limit:
+            retval.append((current, start))
+            start += _units(current)
+            current = ""
+        current += char
+    if current:
+        retval.append((current, start))
+    return retval
+
+
+def _pack(pieces: list[tuple[str, int]], sep: str, limit: int, finer) -> list[tuple[str, int]]:
+    """Greedily join `pieces` into parts of at most `limit` units.
+
+    A piece too long on its own is handed to `finer`, which splits it on the
+    next boundary down.
+    """
+    parts: list[tuple[str, int]] = []
+    current: tuple[str, int] | None = None
+    for piece, offset in pieces:
+        if current is not None:
+            candidate = f"{current[0]}{sep}{piece}"
+            if _units(candidate) <= limit:
+                current = (candidate, current[1])
+                continue
+            parts.append(current)
+            current = None
+        if _units(piece) <= limit:
+            current = (piece, offset)
+            continue
+        parts.extend(finer(piece, offset, limit))
+    if current is not None:
+        parts.append(current)
+    retval = parts
+    return retval
+
+
+def _split_units(text: str, limit: int) -> list[tuple[str, int]]:
+    """`text` in parts of at most `limit` UTF-16 units, each with its offset.
+
+    Paragraph boundaries first, then line boundaries, then inside a line only
+    when one line is itself longer than the limit. Never truncates.
+    """
+    if limit < 1:
+        raise SignalCliError(
+            f"signal message split asked for parts of {limit} units; "
+            "a footer or a marker has eaten the whole message"
+        )
+    if _units(text) <= limit:
+        retval = [(text, 0)]
+        return retval
+
+    def lines(piece: str, offset: int, room: int) -> list[tuple[str, int]]:
+        inner = _pack(_segments(piece, "\n", offset), "\n", room, _cut)
+        return inner
+
+    retval = _pack(_segments(text, "\n\n"), "\n\n", limit, lines)
+    return retval
+
+
+def _clip(
+    ranges: list[tuple[int, int, str]], start: int, length: int
+) -> list[tuple[int, int, str]]:
+    """The styles covering `[start, start + length)`, rebased on that part.
+
+    A range that straddles the boundary is kept on both sides, clipped to each:
+    Signal has no way to reopen a style in the next message, so the two halves
+    of a bold span are two bold ranges.
+    """
+    retval = []
+    for range_start, range_length, style in ranges:
+        low = max(range_start, start)
+        high = min(range_start + range_length, start + length)
+        if high > low:
+            retval.append((low - start, high - low, style))
+    return retval
+
+
+def _as_text(value: object) -> str:
+    """Whatever a subprocess attribute holds, as a string."""
+    if value is None:
+        retval = ""
+    elif isinstance(value, bytes):
+        retval = value.decode("utf-8", "replace")
+    else:
+        retval = str(value)
+    return retval
+
+
 class SignalTransport:
     """Where a Signal message goes: one group, through the `signal-cli` binary.
 
@@ -283,15 +435,29 @@ class SignalTransport:
         self.timeout = timeout
 
     def _scrub(self, text: str) -> str:
-        """Keep the account number out of anything we raise or log."""
-        retval = text.replace(self.account, "<account>") if self.account else text
+        """Keep the account, the group and any phone number out of what we raise.
+
+        Both the account and the group id are named by environment variable
+        rather than written in config because each identifies a private
+        conversation -- so neither belongs in a failure either. signal-cli
+        echoes the group id back on a bad-group error, and names the member it
+        could not reach when a send to a group fails, and what this raises
+        reaches logs, CI output and issue paste-ins.
+        """
+        retval = text
+        for secret, placeholder in ((self.account, "<account>"), (self.group_id, "<group>")):
+            if secret:
+                retval = retval.replace(secret, placeholder)
+        retval = _NUMBER_RE.sub("<number>", retval)
         return retval
 
     def send(self, text: str, ranges: list[tuple[int, int, str]]) -> int:
         """Send one already-rendered message. Returns its Signal timestamp.
 
-        That timestamp *is* the message id in Signal — the counterpart of a
-        Slack `ts`, and the only handle an edit could later be made with.
+        That timestamp *is* the message id in Signal -- the counterpart of a
+        Slack `ts`, and the only handle an edit could later be made with. A
+        zero means the message went out and signal-cli did not say which one it
+        was; see below.
 
         The text goes in on stdin rather than in `argv`: a digest is longer than
         a comfortable argument, and a message full of quotes and `$(...)` must
@@ -319,22 +485,43 @@ class SignalTransport:
                 timeout=self.timeout,
             )
         except subprocess.TimeoutExpired as exc:
+            # Not `from exc`: TimeoutExpired renders the whole argv, which
+            # holds `-a <number>` and `-g <group>`, and this exception reaches
+            # an uncaught traceback. Whatever signal-cli managed to say is
+            # worth keeping, scrubbed, because at the default timeout on a
+            # multi-part message it is the only clue which part hung.
+            said = self._scrub(_as_text(exc.stderr) or _as_text(exc.stdout)).strip()[-800:]
             raise SignalCliError(
-                f"signal-cli did not answer within {self.timeout}s"
-            ) from exc
+                f"{self.binary} did not answer within {self.timeout}s"
+                + (f"; it had said: {said}" if said else "")
+            ) from None
         if done.returncode != 0:
             tail = self._scrub((done.stderr or done.stdout or "").strip())[-800:]
             raise SignalCliError(f"signal-cli exited {done.returncode}: {tail}")
-        try:
-            body = json.loads(done.stdout or "{}")
-            retval = int(body["timestamp"])
-        except (ValueError, KeyError, TypeError) as exc:
-            # A zero exit with no timestamp means it was probably delivered and
-            # we cannot say which message it was, so this does not fail the
-            # send -- the same call this repo makes for a tweet that returns 2xx
-            # without an id.
-            raise SignalCliError(self._scrub(f"signal-cli: no timestamp in reply: {exc}")) from exc
-        return retval
+        # Read line by line: signal-cli's `--output=json` is line-oriented on
+        # other commands, so a second line one day must not discard a timestamp
+        # that was on the first.
+        for line in (done.stdout or "").splitlines():
+            if not line.strip():
+                continue
+            try:
+                body = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(body, dict) and "timestamp" in body:
+                try:
+                    retval = int(body["timestamp"])
+                    return retval
+                except (TypeError, ValueError):
+                    break
+        # A zero exit means signal-cli accepted the message and handed it to
+        # Signal. If its output does not say which message, that is a reply
+        # shape this code does not know -- not a failed send. Raising here
+        # would abort the run *after* delivery, leave the signal unmarked, and
+        # post it again on the next run: a permanent duplicate for a parsing
+        # question. So this returns 0, meaning delivered, id unknown, the same
+        # call this repo makes for a tweet that returns 2xx without an id.
+        return 0
 
 
 def transport_from_config(cfg: dict, label: str, timeout: int = 120) -> SignalTransport:
@@ -378,27 +565,50 @@ def post_message(
 ) -> list[int]:
     """Post Markdown to Signal, splitting it if it is too long.
 
-    Returns the timestamp of every message sent, in order. The footer rides on
-    each part, as it does on Slack, because a standing line that appears on only
-    the last part of three is a line a reader can miss.
+    Returns the timestamp of every message sent, in order; a zero is a message
+    that went out under an id signal-cli did not report. The footer rides on
+    each part, as it does on Slack, because a standing line that appears on
+    only the last part of three is a line a reader can miss -- and it is
+    appended after the conversion, so it arrives as the characters it was
+    written with.
     """
-    room = limit - (len(footer) + 1 if footer else 0)
-    parts = _split_paragraphs(text, limit=room)
-    if len(parts) > 1:
-        # Numbering costs characters, so the split is redone with room for the
-        # marker rather than letting it push the last part over the limit.
-        parts = _numbered(_split_paragraphs(text, limit=room - _MARKER_ROOM))
-    timestamps = []
-    for part in parts:
-        rendered, ranges = to_signal(f"{part}\n{footer}" if footer else part)
-        if _units(rendered) > limit:
-            # The split works on Markdown and the markers are then removed, so
-            # a part can only come out shorter than it went in. Arriving here
-            # means the arithmetic is wrong, and Signal would reject or truncate
-            # rather than say so.
+    check_footer(footer, limit=limit)
+    rendered, ranges = to_signal(text)
+    tail = f"\n{footer}" if footer else ""
+    room = limit - _units(tail)
+    pieces = _split_units(rendered, room)
+    if len(pieces) > 1:
+        # Numbering costs units, so the split is redone with room for the
+        # marker rather than letting it push a part over the limit.
+        pieces = _split_units(rendered, room - _MARKER_ROOM)
+    total = len(pieces)
+    timestamps: list[int] = []
+    for number, (piece, offset) in enumerate(pieces, 1):
+        body = piece
+        styles = _clip(ranges, offset, _units(piece))
+        if total > 1:
+            marker = f"\n(part {number} of {total})"
+            styles.append((_units(body) + 1, _units(marker) - 1, ITALIC))
+            body += marker
+        body += tail
+        if _units(body) > limit:
+            # Every reservation above -- the footer, the marker, the join
+            # between paragraphs -- is arithmetic that can be wrong. This
+            # measures the assembled part instead of predicting it, so a slip
+            # is a loud failure naming the size rather than a message Signal
+            # rejects or truncates without saying so.
             raise SignalCliError(
-                f"signal message part is {_units(rendered)} units, over the {limit} limit"
+                f"signal message part {number} of {total} assembled to {_units(body)} "
+                f"units, over the {limit}-unit limit; refusing to send it"
             )
-        timestamps.append(transport.send(rendered, ranges))
+        try:
+            timestamps.append(transport.send(body, styles))
+        except SignalCliError as exc:
+            if timestamps:
+                raise SignalCliError(
+                    f"part {number} of {total} failed after {len(timestamps)} of them "
+                    f"reached the group, which now holds an incomplete message: {exc}"
+                ) from exc
+            raise
     retval = timestamps
     return retval
