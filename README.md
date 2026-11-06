@@ -471,6 +471,80 @@ The bot needs `chat:write`, plus `chat:write.customize` for the name and icon,
 and it has to be in the channel `channel_id` names. A route may carry its own
 `channel_id` under one destination-level `bot_token_env`.
 
+### Signal is a second interface, on an account of its own
+
+A `signal-messenger` destination posts a scored signal to a Signal group
+(issue #120), so an agent's output can land on a phone rather than in a
+channel:
+
+```json
+"destination": {
+  "type": "signal-messenger",
+  "account_env": "AGENTS_SIGNAL_ACCOUNT",
+  "group_id_env": "AGENTS_SIGNAL_GROUP_LEADS",
+  "min_score": 10
+}
+```
+
+**The type is `signal-messenger`, not `signal`.** The `approval` destination
+already has a `mode: "signal"`, meaning one proposal per `Signal` — the
+dataclass every source emits — and in a config that holds both, a destination
+called `signal` reads as that one.
+
+**It needs a Signal account this deployment owns.** One process owns a Signal
+account at a time: `signal-cli`'s daemon holds it, and nothing else can open it
+concurrently — the same shape as one Socket Mode consumer per Slack app. So
+these agents register their own number rather than borrowing a conversational
+agent's account and depending on its relay. Register it once with
+`signal-cli register --captcha <token>` (the token comes from
+`signalcaptchas.org/registration/generate.html`, is valid for minutes, and must
+be used from the same external IP as the browser that solved it), then
+`signal-cli verify <code>`. The number and the group id are named by env var,
+never written in config: a `config.example.json` in this repo is public.
+
+The dependency is the `signal-cli` binary (`brew install signal-cli`), not a
+Python package, so there is no optional extra to install — a missing binary
+fails when the destination is built, naming it. That is all the build checks:
+an unregistered account or a group id this account is not in costs a subprocess
+and the account lock to verify, so it is left to fail on the first send rather
+than on every run that sends nothing.
+
+**Signal takes plain text plus styled ranges, not markup.** Everything this
+repo sends goes through `framework/signal_messenger.py::post_message`, which is
+to Signal what `framework/slack.py` is to Slack: code that builds a message
+writes Markdown, and one place renders it. `to_signal()` returns the text with
+every marker removed and the `(start, length, STYLE)` ranges that reproduce
+them, which go out as `--text-style`. Signal accepts BOLD, ITALIC,
+STRIKETHROUGH, MONOSPACE and SPOILER, and rejects anything else with
+`Invalid style:`. Headings become bold lines and list markers become bullets,
+as on Slack. There is no link style — Signal linkifies bare URLs itself — so
+`[label](url)` renders as `label (url)` and the URL stays visible.
+
+**Offsets are UTF-16 code units, not characters.** signal-cli's own help says
+so in capitals, and it matters: an emoji is two units, so a message with one
+ahead of a bold word would otherwise style the wrong letters. `_units()` is the
+only place that counts — including the split, because measuring the split in
+code points and the limit in units is a disagreement that reaches 2x on emoji
+and refuses messages that fit.
+
+A message over Signal's 2000-unit limit is split into several in order,
+numbered `(part 2 of 3)`, exactly as the Slack path splits on a block limit —
+and for the same reason, since another message can arrive between the parts.
+A style range cannot be reopened across messages, so the message is rendered
+once and the text and its ranges are split together: a bold span that straddles
+a boundary becomes a bold range at the end of one part and another at the start
+of the next. A footer is appended after the rendering and never converted,
+which is the contract the Slack path states — a standing compliance line means
+the characters it was written with. A footer long enough to leave no room for
+content is refused where the config is read, before the run has paid for a
+fetch or an LLM call.
+
+Two things this destination deliberately does not do. It has no `routes`: the
+hot/firehose split is a Slack channel pattern, and a Signal group is somebody's
+phone. And it does not take a digest — `digest` picks its transport at
+construction, in Slack's shape, so sending one to Signal is a separate piece of
+work.
+
 ### Secrets live in the environment, never in config
 
 Each destination names the env var holding its credential (`webhook_env`,
