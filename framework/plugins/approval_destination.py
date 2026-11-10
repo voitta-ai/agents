@@ -147,6 +147,7 @@ from pathlib import Path
 
 import requests
 
+from framework.action_page import TOKEN_FIELD, action_url, base_url_for, mint_token
 from framework.approval_buttons import proposal_blocks
 from framework.interfaces import Destination, ScoredSignal
 from framework.proposals import ProposalStore, proposals_path
@@ -181,6 +182,7 @@ class ApprovalDestination:
         post_label: str = "Post",
         draft_button: bool = True,
         workspace_name: str = "",
+        action_base_url: str = "",
     ):
         needed = ("render",) if mode == MODE_RUN else ("accepts", "render_signal")
         missing = [name for name in needed if not callable(getattr(wrapped, name, None))]
@@ -208,6 +210,7 @@ class ApprovalDestination:
         self._post_label = post_label
         self._draft_button = draft_button
         self._workspace_name = workspace_name
+        self._action_base_url = action_base_url
         self._signals: list[ScoredSignal] = []
 
     def send(self, scored: ScoredSignal) -> None:
@@ -253,6 +256,11 @@ class ApprovalDestination:
             ),
         }
         body.update(self._identity.payload())
+        # The `ts` is kept on the proposal (which `add_all` is about to store)
+        # so that a verdict arriving from the action page can edit this card
+        # instead of leaving live buttons on a closed lead. The webhook
+        # transport returns "", and then there is nothing to edit and the link
+        # path posts a separate outcome message instead.
         # Through the transport, not a raw requests.post. This call site was
         # written when the destination held a webhook URL, and posting the
         # payload straight at it was the same thing. It is not any more: the
@@ -261,7 +269,25 @@ class ApprovalDestination:
         # fails with `InvalidURL: Host '<SlackTransport object ...>'`, and only
         # ever on the buttons path, which is why nothing caught it until a
         # config turned buttons on.
-        self._transport.post(body)
+        ts = self._transport.post(body)
+        if ts:
+            proposal["card_ts"] = str(ts)
+
+    def _link(self, proposal: dict) -> str:
+        """Mint this proposal's action link, or "" when none is configured.
+
+        The token goes on the reserved proposal, which `add_all` writes, so a
+        link that was announced is always one the page can resolve -- and a run
+        that dies between announcing and storing leaves a link that resolves to
+        nothing rather than to the wrong lead (issue #124).
+        """
+        retval = ""
+        if not self._action_base_url or not self._workspace_name:
+            return retval
+        token = mint_token()
+        proposal[TOKEN_FIELD] = token
+        retval = action_url(self._action_base_url, self._workspace_name, token)
+        return retval
 
     def _announce(self, title: str, body: str, reserved: list[dict]) -> None:
         """Post one rendered item with the instructions for its proposals."""
@@ -269,12 +295,21 @@ class ApprovalDestination:
             # One message per proposal: the buttons carry a single proposal id,
             # so two actions in one message would leave the second unclickable.
             for proposal in reserved:
+                # Deliberately no action link on a card that has buttons. The
+                # buttons do the same job in Slack and better, and the token is
+                # a bearer capability: putting it in the message would store it
+                # in Slack, in push notifications and in email digests, and
+                # `_update` would re-post it verbatim when a button resolves
+                # the proposal. A token still gets minted, because the link
+                # goes out on the other surface.
+                self._link(proposal)
                 self._post_buttons(f"**{title}**\n\n{body}" if title else body, proposal)
             return
-        lines = [
-            f'Proposal {p["id"]}: {p["action"]}. Reply "do {p["id"]}" or "skip {p["id"]}".'
-            for p in reserved
-        ]
+        lines = []
+        for p in reserved:
+            link = self._link(p)
+            line = f'Proposal {p["id"]}: {p["action"]}. Reply "do {p["id"]}" or "skip {p["id"]}"'
+            lines.append(f"{line}, or act on it here: {link}" if link else f"{line}.")
         # Instructions above the content rather than after it (see the note in
         # the module docstring).
         head = f"**{title}**\n\n" if title else ""
@@ -308,14 +343,20 @@ class ApprovalDestination:
             reserved = [self._store.reserve(action, payload) for action in self._actions]
             self._announce("", body, reserved)
             reserved_all.extend(reserved)
+        # Stored before the `left_out` notice, which is the one post here that
+        # announces no proposal and so depends on nothing being stored. It used
+        # to come first, and a webhook failure on a purely informational "3
+        # more signals were not proposed" message discarded every proposal
+        # already announced above it -- up to `max_proposals` cards and links,
+        # all of them dead on arrival.
+        if reserved_all:
+            self._store.add_all(reserved_all)
         if left_out:
             links = "\n".join(f"• [{s.score}] {s.signal.url}" for s in left_out)
             self._post(
                 f"{len(left_out)} more signal(s) passed the gate but were not proposed "
                 f"this run (max_proposals is {self._max_proposals}):\n{links}"
             )
-        if reserved_all:
-            self._store.add_all(reserved_all)
 
     def flush(self) -> None:
         if self._mode == MODE_SIGNAL:
@@ -426,5 +467,9 @@ def build(cfg: dict) -> Destination:
         post_label=str(cfg.get("post_label") or "Post"),
         draft_button=bool(cfg.get("draft_button", True)),
         workspace_name=Path(workspace).name,
+        # Read from this workspace's own `approvals.action_page.base_url`
+        # rather than from a key of this block: the listener reads it from
+        # there, and two keys for one value is one of them going stale.
+        action_base_url=base_url_for(workspace) or "",
     )
     return retval
