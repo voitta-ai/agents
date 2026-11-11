@@ -441,6 +441,22 @@ def _stuck_text(proposal: dict[str, Any]) -> str:
     done = ", ".join(
         f"{r['type']} {r['status']}" for r in proposal.get("results") or []
     ) or "none"
+    if proposal.get("claimed_via") == "link":
+        # The pid on a link claim is the listener's, which is still alive and
+        # serving: an operator told to check it finds a healthy process and
+        # concludes the report is wrong. Age is the only evidence here, and it
+        # is weaker evidence -- steps slow enough to pass the stale bound are
+        # reachable, so this says what is known rather than asserting the
+        # request is dead.
+        retval = (
+            f":warning: Proposal {pid} ({proposal['action']}) has been 'running' since "
+            f"{proposal.get('claimed_at')}, claimed by the action page in the listener "
+            f"(pid {proposal.get('claimed_pid')}, which is still serving). Steps recorded "
+            f"as done: {done}. Either its steps are still running or the request died; "
+            "nothing here will re-run it, so check the listener's log before editing the "
+            "proposals store."
+        )
+        return retval
     retval = (
         f":warning: Proposal {pid} ({proposal['action']}) is stuck in 'running': an approvals "
         f"pass claimed it at {proposal.get('claimed_at')} (pid {proposal.get('claimed_pid')}) "
@@ -476,12 +492,28 @@ def _resolved_elsewhere(cfg: ApprovalsConfig, store: ProposalStore) -> int:
     cutoff = time.time() - cfg.hours * 3600
     retval = 0
     try:
-        resolved = store.with_status(STATUS_DONE) + store.with_status(STATUS_SKIPPED)
-    except Exception:
+        # `failed` too: a link or button verdict whose steps failed is
+        # recorded as `failed` with a `decided_via`, and counting only the two
+        # happy statuses left exactly the case an operator most needs to see
+        # printed as `failed=0 ... elsewhere=0`. `failed` in this line counts
+        # only this pass's own work, so without this the listener's failures
+        # appeared nowhere at all.
+        resolved = (
+            store.with_status(STATUS_DONE)
+            + store.with_status(STATUS_SKIPPED)
+            + store.with_status(STATUS_FAILED)
+        )
+    except Exception as exc:
         # This runs inside the `finally` that prints the summary line, which is
         # printed unconditionally. A raise here would replace whatever actually
         # went wrong with a failure to count, so an unreadable store costs the
-        # count and nothing else.
+        # count and nothing else. The line says so, because `elsewhere=-1` on
+        # its own is indistinguishable from a counting bug.
+        print(
+            f"agent={cfg.agent} could not count what was resolved elsewhere "
+            f"(elsewhere=-1): {type(exc).__name__}: {exc}",
+            file=sys.stderr,
+        )
         retval = -1
         return retval
     for proposal in resolved:

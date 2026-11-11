@@ -613,6 +613,19 @@ def run_listener(cfg: ApprovalsConfig) -> int:
     if page_server is not None and not cfg.app_token:
         # Page only. There is no socket to hold, so this thread does the
         # blocking the Socket Mode client would otherwise do.
+        #
+        # Said out loud, because this branch is also where a typo lands. The
+        # start-up gate above accepts a missing `app_token` as soon as an
+        # `action_page` is configured, and nothing validates unknown keys in
+        # the `approvals` block -- so `app_token_evn`, or the key dropped in an
+        # edit, used to exit 2 with a clear message and now serves the page
+        # forever with every Block Kit button in the channel dead.
+        print(
+            f"agent={cfg.agent} WARNING: no 'approvals.app_token_env', so Socket Mode is "
+            "off and no button on any card will be served -- only the link page is "
+            "running. If that is not deliberate, check that key.",
+            file=sys.stderr,
+        )
         served = ", ".join(sorted(routes))
         print(f"agent={cfg.agent} serving approval links for {served}", flush=True)
         try:

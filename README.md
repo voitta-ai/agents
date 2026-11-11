@@ -429,8 +429,14 @@ What bounds it:
   do the same job there and better, and putting the token in the message would
   store it in Slack, in push notifications and in email digests, and re-post it
   verbatim when a button resolves the proposal. A card with no buttons
-  (`buttons: false`) does carry the link, because then it is the only way a
-  Slack reader can act.
+  (`buttons: false`) does carry the link. Not because a Slack reader needs it --
+  the same line already says `Reply "do pX" or "skip pX"`, which is the reply
+  path and needs no token -- but because that message is also how the lead
+  reaches somebody who is *not* in Slack, which is the whole reason the page
+  exists. It is a real cost knowingly taken: the token is then in Slack's
+  message history, its push notifications, its email digests and its search
+  index, and it stays valid until the proposal is resolved. Set `buttons: true`
+  for a channel where everyone can click, and no token is written.
 - Nothing records a `decided_by` for a link verdict. The other two paths store
   the Slack user id that acted; a link has no identity behind it, and a value
   there would read as an actor in the store. `decided_via: "link"` is the whole
@@ -475,12 +481,32 @@ One connection per response removes the whole class, including the paths
 `BaseHTTPRequestHandler` answers by itself where there is nothing to drain
 from. `Transfer-Encoding` is refused outright for the same reason.
 
-And concurrency is capped (64 connections, 15s per connection). Enough held
-connections therefore make the page briefly unavailable rather than exhausting
-the machine's threads -- which would take the Socket Mode listener in the same
-process down with it. Service returns on its own as the timeouts expire. A
+And concurrency is capped at 64 connections. Enough held connections therefore
+make the page unavailable rather than exhausting the machine's threads -- which
+would take the Socket Mode listener in the same process down with it. A
 per-client cap would be the usual answer and is the wrong one here: behind a
 proxy every connection arrives from the proxy.
+
+The 15-second handler timeout is **not** a request deadline, and this was
+measured rather than assumed: it is a per-socket-operation timeout, so a client
+that sends one byte every ten seconds resets it on every byte and holds its
+slot for as long as it likes. An idle connection is reclaimed after 15s; a
+trickling one is not. Sixty-four of those hold every slot and the person who
+needs to approve something gets a refused connection until they stop. The cap
+still does its real job -- the listener in the same process survives -- but the
+page does not recover on its own while a slow client is deliberate about it.
+This is accepted rather than solved, for the same reason as the per-client cap:
+the fix is a request deadline the standard library does not offer here, and the
+page is reachable only from loopback or a private tunnel.
+
+An unauthenticated request is also not free. Every request reads the whole
+store once under the store's lock, before any credential check -- a bogus token
+costs the same read as a real one -- and that is the same lock the Slack button
+path and the `agent approvals` pass take. Flooding the page therefore slows
+those down: measured on a 547 KB store, 64 concurrent bogus-token requests took
+a `transition()` from 10ms to 494ms at the 95th percentile. One read per
+request rather than two is what the code does now; the rest is the same
+accepted exposure as above.
 
 ### Drafting several things at once: `digest` fields
 

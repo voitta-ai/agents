@@ -115,6 +115,7 @@ import os
 import secrets
 import sys
 import threading
+from time import monotonic as _monotonic
 from hashlib import sha256
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -260,14 +261,22 @@ def base_url_for(workspace: str | os.PathLike) -> str | None:
     return retval
 
 
-def find_by_token(store: Any, token: str) -> dict[str, Any] | None:
-    """The proposal whose `link_token` is `token`, compared in constant time.
+def find_by_token(store: Any, token: str) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
+    """The proposal whose `link_token` is `token`, and the snapshot it came from.
 
     Reads the whole store rather than keeping a token index: the store is one
     small JSON file per workspace and an index is another thing that can
     disagree with the proposals it describes.
+
+    The snapshot is returned because `siblings()` needs the same proposals and
+    used to take the store's exclusive lock a second time for them. That lock
+    is the one the Slack button path and the polling pass also take, so two
+    locked reads per request -- both of them before any credential check, so a
+    bogus token paid the same cost -- let an unauthenticated flood slow the
+    other paths by a factor of fifty at the 95th percentile on a store of a
+    few hundred KB. One read per request is the cheap half of that fix.
     """
-    retval = None
+    retval: tuple[dict[str, Any] | None, list[dict[str, Any]]] = (None, [])
     # `compare_digest` on `str` raises TypeError unless both sides are ASCII,
     # and the path arrives decoded as iso-8859-1, so any raw byte >= 0x80 in
     # the token segment would reach it. A real token is urlsafe base64 and so
@@ -276,10 +285,12 @@ def find_by_token(store: Any, token: str) -> dict[str, Any] | None:
         return retval
     with store._locked():  # noqa: SLF001 - the store's own read path, under its lock
         data = store._read()  # noqa: SLF001
-    for proposal in data["proposals"]:
+    proposals = data["proposals"]
+    retval = (None, proposals)
+    for proposal in proposals:
         held = proposal.get(TOKEN_FIELD)
         if isinstance(held, str) and secrets.compare_digest(held, token):
-            retval = proposal
+            retval = (proposal, proposals)
             break
     return retval
 
@@ -297,6 +308,50 @@ def _form_token_ok(link_token: str, given: str) -> bool:
 def _esc(value: Any) -> str:
     retval = html.escape(str(value), quote=True)
     return retval
+
+
+def _path_without_token(path: str) -> str:
+    """A request path with its last segment replaced, for logging.
+
+    The last segment is the token, which is the credential, so no log line may
+    carry it -- that is why the handler's own `log_message` is silenced. The
+    rest of the path is what an operator needs to tell a prefix problem from
+    an unknown workspace.
+    """
+    parts = urlparse(path).path.strip("/").split("/")
+    if len(parts) < 2:
+        retval = "/" + "/".join(parts)
+        return retval
+    retval = "/" + "/".join(parts[:-1] + ["<token>"])
+    return retval
+
+
+_MISS_REPORT_SECONDS = 60
+_misses = [0, 0.0]                         # count since the last line, time of that line
+_misses_lock = threading.Lock()
+
+
+def _count_miss(path: str) -> None:
+    """Tally a request that resolved to nothing, and say so periodically.
+
+    A healthy page used to print nothing but the startup line until somebody
+    posted a verdict: GETs, 404s and unknown workspaces were all silent, so
+    "every tap is missing" and "nobody has tapped yet" produced identical
+    output -- which is how a wrong `base_url`, a path a proxy mangles, or a
+    workspace left out of `listen_for` stay invisible. One line a minute is
+    enough to tell those apart without turning a flood into a log of its own.
+    """
+    with _misses_lock:
+        _misses[0] += 1
+        now = _monotonic()
+        if now - _misses[1] < _MISS_REPORT_SECONDS:
+            return
+        count, _misses[0], _misses[1] = _misses[0], 0, now
+    print(
+        f"agent: action-page served {count} request(s) that resolved to nothing "
+        f"in the last {_MISS_REPORT_SECONDS}s; most recent {_path_without_token(path)}",
+        file=sys.stderr,
+    )
 
 
 def _safe_link(url: Any) -> str:
@@ -355,7 +410,36 @@ def _page(title: str, body: str) -> bytes:
     return retval
 
 
-def siblings(store: Any, proposal: dict[str, Any]) -> list[dict[str, Any]]:
+def proposal_content(payload: dict[str, Any]) -> str:
+    """The text a human approved, whichever of the two payload shapes holds it.
+
+    The destination records one of two shapes. `signal` mode assembles the
+    blurb itself and stores it under `rendered`; `run` mode -- which is the
+    default -- stores what the agent's `render()` returned, whose content key
+    is `body_md` with the footer alongside it. The page read only `rendered`,
+    so every `run`-mode proposal rendered "(no content recorded)" above live
+    verdict buttons and the recipient was asked to approve something they
+    could not see. `_retract_card` had the same gap, where the empty string
+    became a Slack section block that `chat.update` refuses, leaving live the
+    buttons the retraction exists to remove.
+
+    Returns "" when the payload carries no content at all, which is a caller's
+    decision to handle rather than this function's to paper over.
+    """
+    retval = str(
+        payload.get("rendered") or payload.get("body_md") or payload.get("text") or ""
+    )
+    footer = payload.get("footer")
+    if retval and footer:
+        # `run` mode keeps the footer beside the body, and the card a human
+        # saw in Slack has them joined. `signal` mode has already joined them
+        # into `rendered` and carries no separate footer, so this adds nothing
+        # there rather than duplicating it.
+        retval += f"\n\n{footer}"
+    return retval
+
+
+def siblings(proposals: list[dict[str, Any]], proposal: dict[str, Any]) -> list[dict[str, Any]]:
     """Other proposals for the same lead: one per configured action.
 
     A config with two actions announces one lead carrying two links. Both pages
@@ -368,12 +452,7 @@ def siblings(store: Any, proposal: dict[str, Any]) -> list[dict[str, Any]]:
     url = (proposal.get("payload") or {}).get("url")
     if not url:
         return retval
-    try:
-        with store._locked():  # noqa: SLF001
-            data = store._read()  # noqa: SLF001
-    except Exception:
-        return retval
-    for other in data["proposals"]:
+    for other in proposals:
         if other.get("id") == proposal.get("id"):
             continue
         if (other.get("payload") or {}).get("url") == url:
@@ -385,11 +464,11 @@ def render_proposal(
     cfg: ApprovalsConfig,
     page: ActionPageConfig,
     proposal: dict[str, Any],
-    store: Any = None,
+    proposals: list[dict[str, Any]] | None = None,
 ) -> bytes:
     """The GET page: the lead, then the verdicts. Reads nothing, changes nothing."""
     payload = proposal.get("payload") or {}
-    blurb = str(payload.get("rendered") or payload.get("text") or "(no content recorded)")
+    blurb = proposal_content(payload) or "(no content recorded)"
     lead = str(payload.get("title") or proposal["id"])
     action = str(proposal.get("action") or "")
     # The action is in the heading, not only in the grey line, because with
@@ -399,7 +478,7 @@ def render_proposal(
     token = str(proposal.get(TOKEN_FIELD) or "")
     status = str(proposal.get("status") or "")
 
-    kin = siblings(store, proposal) if store is not None else []
+    kin = siblings(proposals, proposal) if proposals else []
     kin_note = ""
     if kin:
         rows = ", ".join(
@@ -447,7 +526,13 @@ def render_proposal(
     retval = _page(
         title,
         head
-        + f'<form method="post" action="{_esc(action_path(cfg.workspace.name, token))}">'
+        # No `action`, so the form posts to the URL this page was fetched
+        # from. A root-relative action discarded any path a reverse proxy
+        # serves the page under -- the deployment the README describes, and
+        # the documented `base_url` carries a path -- which left the GET
+        # working and the POST going somewhere nothing listens. Posting to the
+        # current URL is correct under every proxy shape.
+        + '<form method="post">'
         + fields
         + controls
         + "</form>"
@@ -492,10 +577,17 @@ def _tell_slack(cfg: ApprovalsConfig, store: Any, proposal_id: str, text: str) -
         if now:
             try:
                 store.transition(proposal_id, now, now, slack_mirrored=False)
-            except Exception:
-                # The store is the thing that is broken; the stderr line above
-                # is then the only record, which is why it carries the id.
-                pass
+            except Exception as inner:
+                # The store is the thing that is broken, which is a bigger
+                # problem than the Slack failure above and used to be silent:
+                # the only line printed named Slack, so an operator read it as
+                # "Slack is down" and never learned the store was unwritable
+                # and the `slack_mirrored` marker never landed.
+                print(
+                    f"agent={cfg.agent} action-page could not mark proposal={proposal_id} "
+                    f"unmirrored; the store is unwritable: {type(inner).__name__}: {inner}",
+                    file=sys.stderr,
+                )
     return retval
 
 
@@ -522,7 +614,12 @@ def _retract_card(route: Any, proposal: dict[str, Any], line: str) -> bool:
     from framework.approval_buttons import outcome_blocks
 
     payload = proposal.get("payload") or {}
-    content = str(payload.get("rendered") or payload.get("text") or "")
+    # A section block's text must be 1-3000 characters, so empty content makes
+    # `chat.update` answer `invalid_blocks` and the buttons stay live on a
+    # closed lead. Removing the buttons matters more than the content does, so
+    # a payload with nothing in it is still retracted, with the gap stated on
+    # the card rather than hidden.
+    content = proposal_content(payload) or "(content not recorded)"
     try:
         route.responder.update(
             cfg.channel_id, ts, f"{content}\n\n{line}", outcome_blocks(to_mrkdwn(content), line)
@@ -704,8 +801,11 @@ class ActionPageHandler(BaseHTTPRequestHandler):
         # `protocol_version` later cannot silently reopen the smuggling class.
         self.close_connection = True
 
-    def _route(self) -> tuple[Any, dict[str, Any], str] | None:
-        """(route, proposal, token) for this request's path, or None.
+    def _route(self) -> tuple[Any, dict[str, Any], str, list[dict[str, Any]]] | None:
+        """(route, proposal, token, store snapshot) for this request's path, or None.
+
+        The snapshot travels with the proposal so that one locked read of the
+        store serves both the token lookup and the other-proposals note.
 
         Never raises. `_route` runs before the handlers' own `try`, so an
         exception here reaches `socketserver.handle_error` and prints a full
@@ -717,35 +817,54 @@ class ActionPageHandler(BaseHTTPRequestHandler):
         try:
             retval = self._route_inner()
         except Exception as exc:
-            print(f"agent: action-page route failed: {type(exc).__name__}", file=sys.stderr)
+            # The message, not just the type. This is the one failure here
+            # that is systematic rather than per-request -- an unreadable or
+            # hand-edited store turns every link in the group into the same
+            # "may have been mistyped" page -- and it was the only place in
+            # this module that dropped the message. The path is reported with
+            # its last segment removed, because that segment is the token.
+            print(
+                f"agent: action-page route failed for {_path_without_token(self.path)}: "
+                f"{type(exc).__name__}: {exc}",
+                file=sys.stderr,
+            )
             retval = None
         return retval
 
-    def _route_inner(self) -> tuple[Any, dict[str, Any], str] | None:
+    def _route_inner(self) -> tuple[Any, dict[str, Any], str, list[dict[str, Any]]] | None:
         parts = urlparse(self.path).path.strip("/").split("/")
-        if len(parts) != 3 or f"/{parts[0]}" != PATH_PREFIX:
+        # The last three segments, not the only three: a reverse proxy that
+        # preserves the path serves this under whatever prefix `base_url`
+        # carries, and an exact arity match 404'd every one of those requests.
+        # A longer path grants nothing -- the token is still the whole
+        # credential, and an unknown one is still a miss.
+        if len(parts) < 3 or f"/{parts[-3]}" != PATH_PREFIX:
             retval = None
             return retval
+        parts = parts[-3:]
         route = getattr(self.server, "routes", {}).get(parts[1])
         if route is None:
             retval = None
             return retval
-        proposal = find_by_token(route.store, parts[2])
-        retval = None if proposal is None else (route, proposal, parts[2])
+        proposal, proposals = find_by_token(route.store, parts[2])
+        retval = None if proposal is None else (route, proposal, parts[2], proposals)
         return retval
 
     def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler's name
         found = self._route()
         if found is None:
+            _count_miss(self.path)
             self._send(404, _not_found())
             return
-        route, proposal, _ = found
+        route, proposal, _, proposals = found
         page = getattr(self.server, "page")
-        self._send(200, render_proposal(route.cfg, page, proposal, route.store))
+        self._send(200, render_proposal(route.cfg, page, proposal, proposals))
 
     def do_HEAD(self) -> None:  # noqa: N802
         # Some previewers send HEAD first. Same safety as GET and no body.
         found = self._route()
+        if found is None:
+            _count_miss(self.path)
         self._send(200 if found else 404, b"")
 
     def _body(self) -> bytes | None:
@@ -782,8 +901,18 @@ class ActionPageHandler(BaseHTTPRequestHandler):
         return retval
 
     @staticmethod
-    def _fail_open_claim(route: Any, proposal_id: str, exc: Exception) -> None:
-        """Close a claim this request made, after the request itself blew up."""
+    def _fail_open_claim(route: Any, proposal_id: str, exc: Exception) -> str:
+        """Close a claim this request made, after the request itself blew up.
+
+        Returns the status the proposal is left in, because the page has to
+        say which of three things happened and the CAS alone cannot tell them
+        apart. It misses both when the request raised before claiming -- the
+        proposal is still `pending`, nothing ran -- and when the request
+        already wrote a terminal status, where the steps really did run. The
+        page used to assert the middle case unconditionally, so a human was
+        told their decision had failed and not to retry when in fact nothing
+        had been recorded at all.
+        """
         try:
             if route.store.transition(
                 proposal_id, STATUS_RUNNING, STATUS_FAILED,
@@ -794,15 +923,24 @@ class ActionPageHandler(BaseHTTPRequestHandler):
                     f"(closed after an error; steps may have run) at={_now_iso()}",
                     flush=True,
                 )
+                return STATUS_FAILED
+            retval = str((route.store.get(proposal_id) or {}).get("status") or "")
+            print(
+                f"agent={route.cfg.agent} action-page left proposal={proposal_id} "
+                f"status={retval or 'unknown'} after the error above (no claim to close)",
+                file=sys.stderr,
+            )
+            return retval
         except Exception as inner:
             # Nothing further is possible: the store is what is broken. The
             # stderr line above names the proposal, which is what a human
             # needs to go and look.
             print(
                 f"agent={route.cfg.agent} action-page could not close "
-                f"proposal={proposal_id}: {type(inner).__name__}",
+                f"proposal={proposal_id}: {type(inner).__name__}: {inner}",
                 file=sys.stderr,
             )
+            return ""
 
     def do_POST(self) -> None:  # noqa: N802
         raw = self._body()
@@ -810,9 +948,10 @@ class ActionPageHandler(BaseHTTPRequestHandler):
             return
         found = self._route()
         if found is None:
+            _count_miss(self.path)
             self._send(404, _not_found())
             return
-        route, proposal, token = found
+        route, proposal, token, _ = found
         fields = parse_qs(raw.decode("utf-8", "replace"))
         if not _form_token_ok(token, (fields.get("form_token") or [""])[0]):
             self._send(
@@ -843,15 +982,25 @@ class ActionPageHandler(BaseHTTPRequestHandler):
                 f"proposal={proposal['id']}: {type(exc).__name__}: {exc}",
                 file=sys.stderr,
             )
-            self._fail_open_claim(route, proposal["id"], exc)
+            state = self._fail_open_claim(route, proposal["id"], exc)
+            if state == STATUS_FAILED:
+                note = (
+                    "The decision was recorded as failed. Some of its steps may already "
+                    "have run, so check before trying again rather than tapping twice."
+                )
+            elif state in (STATUS_DONE, STATUS_SKIPPED):
+                note = (
+                    "The decision itself went through and its steps ran; what failed came "
+                    "afterwards, telling the other places about it. Do not tap again."
+                )
+            else:
+                note = (
+                    "Nothing was recorded and nothing ran -- the error came before the "
+                    "decision was taken. This lead is still open and can be acted on again."
+                )
             self._send(
                 500,
-                _page(
-                    "That did not work",
-                    '<h1>That did not work</h1><p class="note">The decision was recorded as '
-                    "failed. Some of its steps may already have run, so check before trying "
-                    "again rather than tapping twice.</p>",
-                ),
+                _page("That did not work", f'<h1>That did not work</h1><p class="note">{note}</p>'),
             )
             return
         print(f"agent={route.cfg.agent} {summary} at={_now_iso()}", flush=True)
@@ -861,12 +1010,14 @@ class ActionPageHandler(BaseHTTPRequestHandler):
 class _BoundedHTTPServer(ThreadingHTTPServer):
     """`ThreadingHTTPServer` with a ceiling on concurrent connections.
 
-    The handler's `timeout` bounds how long any one connection can hold a
-    thread, which is what stops a slow client holding one open forever. It does
-    not bound how MANY arrive: the mixin spawns a thread per connection with no
-    limit, so a flood from a single host exhausts the laptop's threads -- and
-    with them the Socket Mode listener in the same process and anything else
-    sharing the machine.
+    The handler's `timeout` is per socket operation, not per request: it
+    reclaims an *idle* connection after 15s, but a client that sends one byte
+    every ten seconds resets it on every byte and keeps its thread for as long
+    as it cares to. Nothing here bounds how long one connection lasts, so what
+    this class bounds is how many of them there can be: the mixin spawns a
+    thread per connection with no limit, so a flood from a single host
+    exhausts the laptop's threads -- and with them the Socket Mode listener in
+    the same process and anything else sharing the machine.
 
     The ceiling converts that into a bounded, visible refusal, which is a
     better failure but is still one: enough held connections make the page

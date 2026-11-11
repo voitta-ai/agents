@@ -320,7 +320,6 @@ class ApprovalDestination:
         self._signals = []
         kept = ranked[: self._max_proposals]
         left_out = ranked[self._max_proposals :]
-        reserved_all: list[dict] = []
         for scored in kept:
             rendered = self._render_signal(scored)
             if rendered is None:
@@ -342,15 +341,19 @@ class ApprovalDestination:
             }
             reserved = [self._store.reserve(action, payload) for action in self._actions]
             self._announce("", body, reserved)
-            reserved_all.extend(reserved)
-        # Stored before the `left_out` notice, which is the one post here that
-        # announces no proposal and so depends on nothing being stored. It used
-        # to come first, and a webhook failure on a purely informational "3
-        # more signals were not proposed" message discarded every proposal
-        # already announced above it -- up to `max_proposals` cards and links,
-        # all of them dead on arrival.
-        if reserved_all:
-            self._store.add_all(reserved_all)
+            # Stored per signal, immediately after its own announcement. The
+            # batch-wide write below only closed this class for the `left_out`
+            # notice: a transport failure on the third signal still discarded
+            # the first two, whose cards and links were already in the channel
+            # and would resolve to nothing for the rest of their lives. The
+            # token is minted inside `_announce`, so storing before it is not
+            # available without splitting the two.
+            self._store.add_all(reserved)
+        # Every signal is stored in the loop above, as it is announced, so
+        # nothing is left to write here. Storing the batch at this point was
+        # what made a failure anywhere in the loop -- or in the purely
+        # informational `left_out` notice below -- discard proposals whose
+        # cards and links were already in the channel.
         if left_out:
             links = "\n".join(f"• [{s.score}] {s.signal.url}" for s in left_out)
             self._post(
