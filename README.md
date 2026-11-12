@@ -712,14 +712,20 @@ STRIKETHROUGH, MONOSPACE and SPOILER, and rejects anything else with
 as on Slack. There is no link style — Signal linkifies bare URLs itself — so
 `[label](url)` renders as `label (url)` and the URL stays visible.
 
-**Offsets are UTF-16 code units, not characters.** signal-cli's own help says
-so in capitals, and it matters: an emoji is two units, so a message with one
-ahead of a bold word would otherwise style the wrong letters. `_units()` is the
-only place that counts — including the split, because measuring the split in
-code points and the limit in units is a disagreement that reaches 2x on emoji
-and refuses messages that fit.
+**Offsets are UTF-16 code units, the limit is UTF-8 bytes.** signal-cli's own
+help says the first in capitals, and it matters: an emoji is two units, so a
+message with one ahead of a bold word would otherwise style the wrong letters.
+The limit is the other unit — `ServiceConfig.MAX_MESSAGE_SIZE_BYTES` is 2000
+and `ManagerImpl` tests it as `Utf8.size(messageText())` — so `_units()` counts
+offsets, `_bytes()` counts capacity, and no function mixes them: in `_cut()`
+the fit test is bytes while the offset it carries forward is units. Counting
+capacity in units under-counts every non-ASCII character, and the bullet this
+renderer writes is one unit and three bytes. That mistake is quiet rather than
+loud: past 2000 bytes signal-cli does not refuse the message, it truncates the
+text and attaches the remainder as a file, so the send succeeds and the reader
+gets a cut message with the styled tail inside an attachment.
 
-A message over Signal's 2000-unit limit is split into several in order,
+A message over Signal's 2000-byte limit is split into several in order,
 numbered `(part 2 of 3)`, exactly as the Slack path splits on a block limit —
 and for the same reason, since another message can arrive between the parts.
 A style range cannot be reopened across messages, so the message is rendered
