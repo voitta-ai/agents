@@ -134,6 +134,7 @@ class ApprovalsConfig:
         timeout: int = 30,
         app_token: str = "",
         listen_for: list[Path] | None = None,
+        action_page: Any = None,
     ):
         self.agent = agent
         self.workspace = workspace
@@ -145,6 +146,10 @@ class ApprovalsConfig:
         self.timeout = timeout
         self.app_token = app_token
         self.listen_for = listen_for or []
+        # An `ActionPageConfig` or None. Typed loosely because
+        # framework/action_page.py imports this module, so naming its type
+        # here would be a cycle; the loader builds it.
+        self.action_page = action_page
 
 
 def load_approvals_config(workspace: str | Path) -> ApprovalsConfig:
@@ -215,6 +220,22 @@ def load_approvals_config(workspace: str | Path) -> ApprovalsConfig:
         )
     listen_for = [(workspace_path.parent / w).resolve() for w in listen_for_raw]
 
+    # The link surface (issue #124). Absent is the normal case: every
+    # deployment before #124 approves in Slack only. Imported here rather than
+    # at module scope because action_page.py imports this module for the claim
+    # and the step runner.
+    try:
+        from framework.action_page import load_action_page
+    except ImportError as exc:
+        # This function is documented to raise ConfigError, and its callers --
+        # `cli.py`'s handler and `listener_routes`, which names the workspace
+        # that failed -- catch only that. A broken module here would otherwise
+        # surface as a bare traceback from the one place built to explain
+        # itself.
+        raise ConfigError(f"the action page module could not be imported: {exc}") from exc
+
+    action_page = load_action_page(block, config_path)
+
     trusted = block.get("trusted_user_ids")
     if not isinstance(trusted, list) or not trusted or not all(isinstance(u, str) for u in trusted):
         raise ConfigError(
@@ -245,6 +266,7 @@ def load_approvals_config(workspace: str | Path) -> ApprovalsConfig:
         timeout=int(block.get("timeout", 30)),
         app_token=app_token,
         listen_for=listen_for,
+        action_page=action_page,
     )
     return retval
 
@@ -288,6 +310,12 @@ def read_replies(cfg: ApprovalsConfig) -> dict[str, dict[str, str]]:
         }
     return retval
 
+
+# How long a claim made by the action page may sit `running` before a pass
+# calls it stuck. Short, because the pid test cannot apply to it (see
+# `_is_stuck`) and the handler that made the claim either finished in
+# milliseconds or is not coming back.
+_LINK_CLAIM_STALE_SECONDS = 900
 
 DRAFTABLE_STEP = "wordpress-publish"
 VARIANT_POST = "post"
@@ -413,6 +441,22 @@ def _stuck_text(proposal: dict[str, Any]) -> str:
     done = ", ".join(
         f"{r['type']} {r['status']}" for r in proposal.get("results") or []
     ) or "none"
+    if proposal.get("claimed_via") == "link":
+        # The pid on a link claim is the listener's, which is still alive and
+        # serving: an operator told to check it finds a healthy process and
+        # concludes the report is wrong. Age is the only evidence here, and it
+        # is weaker evidence -- steps slow enough to pass the stale bound are
+        # reachable, so this says what is known rather than asserting the
+        # request is dead.
+        retval = (
+            f":warning: Proposal {pid} ({proposal['action']}) has been 'running' since "
+            f"{proposal.get('claimed_at')}, claimed by the action page in the listener "
+            f"(pid {proposal.get('claimed_pid')}, which is still serving). Steps recorded "
+            f"as done: {done}. Either its steps are still running or the request died; "
+            "nothing here will re-run it, so check the listener's log before editing the "
+            "proposals store."
+        )
+        return retval
     retval = (
         f":warning: Proposal {pid} ({proposal['action']}) is stuck in 'running': an approvals "
         f"pass claimed it at {proposal.get('claimed_at')} (pid {proposal.get('claimed_pid')}) "
@@ -435,6 +479,57 @@ def _pid_alive(pid: Any) -> bool:
     return retval
 
 
+def _resolved_elsewhere(cfg: ApprovalsConfig, store: ProposalStore) -> int:
+    """Proposals resolved by a button or a link inside the `hours` window.
+
+    This pass counts what *it* did, so a proposal resolved by a click or a tap
+    between two passes simply stopped being `pending` and left no trace in any
+    line an operator reads -- `approvals=0 executed=0 ... stuck=0`, a quiet
+    agent, while the listener was working through leads. The count is derived
+    from the store rather than tracked, so it needs no new state and double
+    counts nothing: the same window the reply path already reads.
+    """
+    cutoff = time.time() - cfg.hours * 3600
+    retval = 0
+    try:
+        # `failed` too: a link or button verdict whose steps failed is
+        # recorded as `failed` with a `decided_via`, and counting only the two
+        # happy statuses left exactly the case an operator most needs to see
+        # printed as `failed=0 ... elsewhere=0`. `failed` in this line counts
+        # only this pass's own work, so without this the listener's failures
+        # appeared nowhere at all.
+        resolved = (
+            store.with_status(STATUS_DONE)
+            + store.with_status(STATUS_SKIPPED)
+            + store.with_status(STATUS_FAILED)
+        )
+    except Exception as exc:
+        # This runs inside the `finally` that prints the summary line, which is
+        # printed unconditionally. A raise here would replace whatever actually
+        # went wrong with a failure to count, so an unreadable store costs the
+        # count and nothing else. The line says so, because `elsewhere=-1` on
+        # its own is indistinguishable from a counting bug.
+        print(
+            f"agent={cfg.agent} could not count what was resolved elsewhere "
+            f"(elsewhere=-1): {type(exc).__name__}: {exc}",
+            file=sys.stderr,
+        )
+        retval = -1
+        return retval
+    for proposal in resolved:
+        if proposal.get("decided_via") not in ("button", "link"):
+            continue
+        when = proposal.get("resolved")
+        if not when:
+            continue
+        try:
+            if datetime.fromisoformat(when).timestamp() >= cutoff:
+                retval += 1
+        except ValueError:
+            continue
+    return retval
+
+
 def _is_stuck(cfg: ApprovalsConfig, proposal: dict[str, Any]) -> bool:
     """A `running` proposal whose claiming pass is gone, or too old to trust.
 
@@ -445,10 +540,22 @@ def _is_stuck(cfg: ApprovalsConfig, proposal: dict[str, Any]) -> bool:
     `hours` window is stuck regardless of what that pid is doing now.
     """
     claimed_at = proposal.get("claimed_at")
-    too_old = True
+    age = None
     if claimed_at:
         age = time.time() - datetime.fromisoformat(claimed_at).timestamp()
-        too_old = age > cfg.hours * 3600
+    too_old = True if age is None else age > cfg.hours * 3600
+
+    # A claim made by the action page (issue #124) records the *listener's*
+    # pid, which outlives any one request by design, so `_pid_alive` is always
+    # true for it and the pid test -- the thing that detects a pass dying
+    # mid-steps -- can never fire. Judge those on age alone, and on a much
+    # shorter clock than `hours`: a request that has held a claim for a quarter
+    # of an hour is not still working, and waiting out a 24-hour window to say
+    # so means a lead whose steps really ran sits unreported for a day.
+    if proposal.get("claimed_via") == "link":
+        retval = True if age is None else age > _LINK_CLAIM_STALE_SECONDS
+        return retval
+
     retval = too_old or not _pid_alive(proposal.get("claimed_pid"))
     return retval
 
@@ -564,7 +671,8 @@ def run_approvals(cfg: ApprovalsConfig) -> int:
     finally:
         print(
             f"agent={cfg.agent} status={status} approvals={pending} "
-            f"executed={executed} skipped={skipped} failed={failed} stuck={stuck}"
+            f"executed={executed} skipped={skipped} failed={failed} stuck={stuck} "
+            f"elsewhere={_resolved_elsewhere(cfg, store)}"
         )
     retval = 0
     return retval

@@ -316,6 +316,198 @@ channel's history. Resolve what is pending before moving an agent to a new
 approval channel, or edit `state/proposals.json` and let the next run propose
 them again.
 
+### A link instead of Slack: the action page
+
+Both paths above need a Slack account in the agent's workspace. The people who
+decide on leads are not all in Slack and do not all want to be, which is the
+reason Signal became a second interface at all. So a proposal can also carry a
+link: a blurb goes to whatever surface the person reads, the link opens a page
+with the same verdicts the buttons offer, and the decision happens there
+(issue #124).
+
+```json
+"approvals": {
+  "channel_id": "C0123456789",
+  "bot_token_env": "SOME_BOT_TOKEN",
+  "trusted_user_ids": ["U0123456789"],
+  "action_page": {
+    "base_url": "https://example.invalid/leads",
+    "bind": "127.0.0.1",
+    "port": 8731,
+    "post_label": "Draft outreach"
+  }
+}
+```
+
+`base_url` is how the link reads to whoever receives it, which is not
+necessarily how the process is reached: a tunnel or a reverse proxy sits in
+between, so the two are separate keys and nothing guesses. It is the only one a
+posting run needs; `bind` and `port` are read by the listener that serves the
+page. `post_label` renames the first verdict, for the same reason the card can.
+A workspace with no `action_page` behaves exactly as before and posts no link.
+
+The page is served by the same long-running process as the buttons:
+
+```
+agent approvals --listen --workspace <workspaces-root>/<agent-name>
+```
+
+`--listen` now needs *either* an app-level token (for buttons) or an
+`action_page` (for links), or both. A deployment that wants only links needs no
+Slack app, no app token and no Socket Mode.
+
+**The surfaces do not need reconciling, because there is only one of them.**
+The same lead announced to a Slack channel and a Signal group is one proposal
+with one link, so resolving it resolves it everywhere by construction. There is
+no cross-surface state to converge, no window in which two surfaces both act,
+and no half-closed item. A further surface -- email, SMS, a web digest -- needs
+only to render a blurb and a URL, and needs no way to send a decision back,
+which is what made approving from Signal expensive (that is issue #121, a
+receive loop on an account only one process can hold; a link needs none of it).
+
+A tap, a button click and a `do <id>` reply all take the proposal through the
+same `pending -> running` claim, so no two of them can run the steps. Verified
+against this implementation: eight concurrent taps on one link run the action
+exactly once and tell the other seven the proposal is already spoken for, and a
+tap is refused for a proposal the polling pass has already claimed, in both
+directions.
+
+Resolving from the page **edits the Block Kit card in place**, so a lead closed
+by a link does not keep live buttons in Slack. That needs the message `ts`,
+which only the API transport returns, so a card posted through a webhook gets a
+separate outcome message instead. Clicking a stale card was always safe -- the
+claim refuses it -- but a reader scrolling the channel had no way to tell the
+lead was decided, which is the kind of thing that erodes trust in the channel
+rather than breaking anything.
+
+Two reporting consequences of a second process resolving proposals:
+
+- `agent approvals` prints `elsewhere=N`, the proposals a button or a link
+  resolved inside the `hours` window. Without it a pass reports
+  `approvals=0 executed=0 ... stuck=0` -- a quiet agent -- while the listener
+  works through leads in a different log.
+- A claim made by the page records `claimed_via: "link"`, and the stuck check
+  treats a live pid as proving nothing for those. The pid it records is the
+  *listener's*, which outlives any one request by design, so the test that
+  catches a polling pass dying mid-steps could never fire for a link claim: a
+  tap whose steps ran and then failed to be written sat invisible for the whole
+  `hours` window. Link claims are judged on age alone, with a 15-minute bound,
+  and a request that raises after claiming closes the proposal as failed on its
+  way out rather than leaving it `running`.
+
+#### The URL is the credential
+
+This is the part to decide deliberately. The reply path trusts a Slack user id
+and so does the button path; a link has no identity behind it. Whoever holds
+the URL can act, and in a group chat that means every member, anyone who joins
+later and scrolls back, and any device backup. Choose it for a group whose
+members would all have been in `trusted_user_ids` anyway.
+
+What bounds it:
+
+- The link carries its own 32-byte `secrets.token_urlsafe` token, compared with
+  `secrets.compare_digest` -- **not** the proposal id, which is short by design
+  (a counter plus three random base-36 characters: ample against someone typing
+  `do p10` into a channel, nowhere near enough for something reachable over
+  HTTP).
+- A token resolves exactly one proposal, never the store, and is useless
+  against any other lead.
+- Single use falls out of the claim: the first verdict moves the proposal off
+  `pending`, and every later request is told what it already is. There is no
+  separate "token spent" state to get out of step.
+- A miss returns one identical page whether the token is wrong or the workspace
+  is not served, so the page is not an oracle for guessing tokens.
+- The token must not leak outward. The page sends `Referrer-Policy:
+  no-referrer` and marks links `rel="noreferrer noopener"`, because the blurb is
+  about somebody else's web page and a plain anchor would hand the token to that
+  site in the `Referer` header. The default request logging is turned off, since
+  the request line contains the token. It is still in the reader's browser
+  history and in the logs of whatever the request passes through, so `base_url`
+  should point at something private -- a tailnet address, or a tunnel you
+  control, not a public host.
+- **No link is written onto a Slack card that already has buttons.** The buttons
+  do the same job there and better, and putting the token in the message would
+  store it in Slack, in push notifications and in email digests, and re-post it
+  verbatim when a button resolves the proposal. A card with no buttons
+  (`buttons: false`) does carry the link. Not because a Slack reader needs it --
+  the same line already says `Reply "do pX" or "skip pX"`, which is the reply
+  path and needs no token -- but because that message is also how the lead
+  reaches somebody who is *not* in Slack, which is the whole reason the page
+  exists. It is a real cost knowingly taken: the token is then in Slack's
+  message history, its push notifications, its email digests and its search
+  index, and it stays valid until the proposal is resolved. Set `buttons: true`
+  for a channel where everyone can click, and no token is written.
+- Nothing records a `decided_by` for a link verdict. The other two paths store
+  the Slack user id that acted; a link has no identity behind it, and a value
+  there would read as an actor in the store. `decided_via: "link"` is the whole
+  truth, and for a group of several people that is all the audit trail there
+  is -- which is part of what is being chosen.
+
+#### A GET must never act
+
+This is the correctness condition for the whole design, not a preference.
+Signal, Slack and iMessage all build link previews by fetching the URL **from
+the recipient's device**. A link whose GET resolves the proposal would be
+resolved by the message rendering on somebody's phone, before a human has read
+it -- the same mechanism that made "unsubscribe" links unusable for a decade,
+courtesy of corporate mail scanners.
+
+So `GET` and `HEAD` render and change nothing; only `POST` resolves. The POST
+carries a form token the GET minted, which also stops a third-party page
+driving a verdict on a reader's behalf. A restart of the listener between the
+GET and the POST invalidates that token and the page says to reload: the cost of
+keeping no server-side session.
+
+The blurb is a scraped post, which is to say attacker-controlled text. It is
+HTML-escaped and rendered as preformatted text, the only anchor is the lead's
+own URL after an `http`/`https` scheme check, and no Markdown becomes markup --
+a stored cross-site scripting bug on a page that resolves proposals would hand
+over both the token and the verdict.
+
+#### This is not an internet-facing server
+
+`bind` defaults to loopback and a non-loopback bind prints a warning at
+startup, because the page has no authentication beyond the link token and no
+rate limiting worth the name. Put it behind a tailnet or a tunnel you control.
+
+Two properties are worth knowing rather than discovering. Responses are
+HTTP/1.0, so every one closes its connection: with keep-alive, any handler that
+answers *without* reading the request body becomes a request-smuggling
+primitive, because the unread bytes are parsed as the next request on that
+connection -- an adversarial review got a POST to a nonexistent token to
+execute a verdict framed in its body, and the same trick through a connection-
+pooling proxy returns the next victim's page, which contains their link token.
+One connection per response removes the whole class, including the paths
+`BaseHTTPRequestHandler` answers by itself where there is nothing to drain
+from. `Transfer-Encoding` is refused outright for the same reason.
+
+And concurrency is capped at 64 connections. Enough held connections therefore
+make the page unavailable rather than exhausting the machine's threads -- which
+would take the Socket Mode listener in the same process down with it. A
+per-client cap would be the usual answer and is the wrong one here: behind a
+proxy every connection arrives from the proxy.
+
+The 15-second handler timeout is **not** a request deadline, and this was
+measured rather than assumed: it is a per-socket-operation timeout, so a client
+that sends one byte every ten seconds resets it on every byte and holds its
+slot for as long as it likes. An idle connection is reclaimed after 15s; a
+trickling one is not. Sixty-four of those hold every slot and the person who
+needs to approve something gets a refused connection until they stop. The cap
+still does its real job -- the listener in the same process survives -- but the
+page does not recover on its own while a slow client is deliberate about it.
+This is accepted rather than solved, for the same reason as the per-client cap:
+the fix is a request deadline the standard library does not offer here, and the
+page is reachable only from loopback or a private tunnel.
+
+An unauthenticated request is also not free. Every request reads the whole
+store once under the store's lock, before any credential check -- a bogus token
+costs the same read as a real one -- and that is the same lock the Slack button
+path and the `agent approvals` pass take. Flooding the page therefore slows
+those down: measured on a 547 KB store, 64 concurrent bogus-token requests took
+a `transition()` from 10ms to 494ms at the 95th percentile. One read per
+request rather than two is what the code does now; the rest is the same
+accepted exposure as above.
+
 ### Drafting several things at once: `digest` fields
 
 An action whose steps publish a post *and* announce it needs more than one

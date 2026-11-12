@@ -101,6 +101,7 @@ from framework.approvals import (
     human_time,
     steps_detail,
 )
+from framework.action_page import ActionPageError, PATH_PREFIX, serve_action_page
 from framework.config import ConfigError
 from framework.proposals import (
     ProposalStore,
@@ -581,21 +582,72 @@ def run_listener(cfg: ApprovalsConfig) -> int:
     state of its own: every decision goes through the same store and the same
     claim as the polling pass, so stopping it loses nothing but the buttons.
     """
-    if not cfg.app_token:
+    if not cfg.app_token and cfg.action_page is None:
         raise ListenerError(
-            "approvals --listen needs an app-level token: set 'approvals.app_token_env' "
-            "in the workspace config to the name of the variable holding it (xapp-...)"
+            "approvals --listen needs something to listen on: 'approvals.app_token_env' "
+            "for Slack buttons (xapp-...), 'approvals.action_page' for the link page "
+            "(issue #124), or both. Without either there is nothing to hold open and the "
+            "polling pass already resolves replies."
         )
+
+    routes = listener_routes(cfg)
+
+    # Started before the Slack connection: a port already in use should fail
+    # now, not after the handshake, and a deployment that serves only the page
+    # never reaches the Socket Mode branch at all.
+    page_server = None
+    if cfg.action_page is not None:
+        page = cfg.action_page
+        try:
+            page_server = serve_action_page(routes, page)
+        except ActionPageError as exc:
+            # One error type for everything that stops `--listen`, so the CLI
+            # prints it as a config problem rather than a traceback.
+            raise ListenerError(str(exc)) from exc
+        print(
+            f"agent={cfg.agent} action page on {page.bind}:{page.port} "
+            f"(links are written as {page.base_url}{PATH_PREFIX}/<workspace>/<token>)",
+            flush=True,
+        )
+
+    if page_server is not None and not cfg.app_token:
+        # Page only. There is no socket to hold, so this thread does the
+        # blocking the Socket Mode client would otherwise do.
+        #
+        # Said out loud, because this branch is also where a typo lands. The
+        # start-up gate above accepts a missing `app_token` as soon as an
+        # `action_page` is configured, and nothing validates unknown keys in
+        # the `approvals` block -- so `app_token_evn`, or the key dropped in an
+        # edit, used to exit 2 with a clear message and now serves the page
+        # forever with every Block Kit button in the channel dead.
+        print(
+            f"agent={cfg.agent} WARNING: no 'approvals.app_token_env', so Socket Mode is "
+            "off and no button on any card will be served -- only the link page is "
+            "running. If that is not deliberate, check that key.",
+            file=sys.stderr,
+        )
+        served = ", ".join(sorted(routes))
+        print(f"agent={cfg.agent} serving approval links for {served}", flush=True)
+        try:
+            _block_forever()
+        except KeyboardInterrupt:
+            print(f"agent={cfg.agent} listener stopped", flush=True)
+        finally:
+            page_server.shutdown()
+        retval = 0
+        return retval
+
     try:
         from slack_sdk.socket_mode import SocketModeClient
         from slack_sdk.socket_mode.response import SocketModeResponse
     except ImportError as exc:
+        if page_server is not None:
+            page_server.shutdown()
         raise ListenerError(
             "approvals --listen needs the Socket Mode client: "
             "pip install '.[approvals-buttons]' (slack_sdk, websocket-client)"
         ) from exc
 
-    routes = listener_routes(cfg)
     client = SocketModeClient(app_token=cfg.app_token)
 
     def on_request(socket_client, request: Any) -> None:
@@ -632,6 +684,8 @@ def run_listener(cfg: ApprovalsConfig) -> int:
         print(f"agent={cfg.agent} listener stopped", flush=True)
     finally:
         client.close()
+        if page_server is not None:
+            page_server.shutdown()
     retval = 0
     return retval
 
