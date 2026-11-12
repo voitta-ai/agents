@@ -750,6 +750,14 @@ was still in flight at the deadline, which includes a retry of a message still
 in flight. Only `200` returns; both others raise, so a caller that marks a
 signal delivered when the send returns can never mark one that did not arrive.
 
+A `200` whose status is `queued` means the gateway did not honour the wait at
+all -- an older build. That is a hard failure here rather than a pending one,
+because the gateway writes its idempotency entry when it accepts a message and
+only the wait loop ever reports a later status: the entry keeps saying
+`queued`, so every resubmit of that key replays the same answer until it
+expires and then sends a second copy. Retrying cannot resolve what a gateway
+build has to.
+
 A `200` carries no Signal timestamp. Its status is `sent`, `delivered`, `read`
 or `deleted` -- a retry arriving after Signal has acked sees `delivered` or
 `read`, and `deleted` is a message that went out and was then deleted -- and
@@ -778,7 +786,14 @@ the vendor waterfall landed on to its reasons, and the destination renders
 those reasons into the message. A different rung would mean a different key,
 and the part that already reached the group would be posted again -- the one
 outcome the key exists to prevent. Each part goes under
-`<signal id>#<number>-of-<total>`, and the total is in there deliberately: a
+`<signal id>@<footer digest>#<number>-of-<total>`. The footer digest is there
+because the gateway namespaces its idempotency store by consumer, not by
+destination: two destinations sharing one token and one conversation are one
+consumer to it, so the same signal would otherwise key identically from both,
+and the second one's message would come back as a replay of the first --
+reported as delivered, never sent. It is a mitigation, not an answer: give
+each agent its own gateway consumer and token, which is what that namespacing
+is for. The total is in there deliberately too: a
 key naming only the part number would match across runs that split
 differently, and the worse direction of that is silent. A retry whose text
 shortened into one part would carry the old part 1's key, the gateway would
