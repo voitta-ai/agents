@@ -715,6 +715,7 @@ the account and serves every agent behind one daemon:
     "url": "http://127.0.0.1:<port>",
     "conversation": "<alias>",
     "token_file": "<workspace>/gateway-token",
+    "label": "<the label the gateway prefixes, or omitted>",
     "wait_s": 10
   },
   "min_score": 10
@@ -763,9 +764,17 @@ already in flight rather than sending a second copy. The cap is the gateway's,
 30 seconds; a larger number in config is refused here rather than silently
 clamped there.
 
-A label, if the gateway is configured to prefix one, costs its bytes out of
-the same 2000 — so `limit` belongs to the transport, and the footer is checked
-against the transport's limit rather than Signal's.
+**`label` mirrors the gateway's own setting and has to match it.** The prefix
+is applied by the gateway from its `consumers.<name>.label`, and it re-checks
+the length *after* prefixing, so those bytes come out of the same 2000. No
+endpoint reports that value back, which makes this the one field here that
+duplicates state we do not own: a label set there and omitted here means every
+full-size part is refused with `422 too_long`, because the arithmetic looks
+correct from this side. So a 422 naming `too_long` says that explicitly rather
+than relaying the gateway's message — a mismatched label is the only thing that
+explains it. A label longer here than there is merely wasteful. `limit` belongs
+to the transport for this reason, and the footer is checked against the
+transport's limit rather than Signal's.
 
 **Signal takes plain text plus styled ranges, not markup.** Everything this
 repo sends goes through `framework/signal_messenger.py::post_message`, which is

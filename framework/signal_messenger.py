@@ -487,6 +487,12 @@ class Transport(Protocol):
     """
 
     limit: int
+    # Whether a resubmitted part is deduplicated by the far side. False for
+    # signal-cli, which has nothing to deduplicate against, so a retry after
+    # a partial send posts the earlier parts a second time. `post_message`
+    # tells a caller which of those two situations it is in rather than
+    # asserting the safe one for both.
+    idempotent: bool
 
     def send(self, text: str, ranges: list[tuple[int, int, str]]) -> int | str:
         """Send one rendered message; return the handle it is addressed by.
@@ -521,6 +527,7 @@ class SignalTransport:
         self.binary = binary
         self.timeout = timeout
         self.limit = SIGNAL_MESSAGE_LIMIT
+        self.idempotent = False
 
     def _scrub(self, text: str) -> str:
         """Keep the account, the group and any phone number out of what we raise.
@@ -643,9 +650,18 @@ class GatewayTransport:
         self.wait_s = wait_s
         self.timeout = timeout
         self._token = token
+        self.idempotent = True
         # A label is prepended by the gateway to every message it sends, so
         # its bytes are not available to the body. `_bytes` and not `len`,
         # for the reason the whole module says.
+        #
+        # This value only *mirrors* the gateway's: the prefix comes from its
+        # own `consumers.<name>.label`, no endpoint reports that back, and the
+        # gateway re-checks the length after prefixing. So a label configured
+        # there and missing here means every full-size part is refused with
+        # 422 `too_long` -- which `send` names as a likely cause, because the
+        # arithmetic looks right from this side and the mismatch is the only
+        # thing that explains it.
         self.limit = SIGNAL_MESSAGE_LIMIT - (_bytes(f"{label}: ") if label else 0)
 
     def _scrub(self, text: str) -> str:
@@ -662,7 +678,7 @@ class GatewayTransport:
         retval = _NUMBER_RE.sub("<number>", retval)
         return retval
 
-    def _key(self, text: str) -> str:
+    def _key(self, text: str, ranges: list[tuple[int, int, str]]) -> str:
         """An idempotency key for this exact message to this conversation.
 
         Derived from the content, so the retry a `SignalSendPending` asks for
@@ -672,12 +688,14 @@ class GatewayTransport:
         under different emphasis.
         """
         material = json.dumps(
-            [self.conversation, self.label, text], ensure_ascii=False, sort_keys=True
+            [self.conversation, self.label, text, ranges],
+            ensure_ascii=False,
+            sort_keys=True,
         )
         retval = hashlib.sha256(material.encode("utf-8")).hexdigest()
         return retval
 
-    def send(self, text: str, ranges: list[tuple[int, int, str]]) -> int:
+    def send(self, text: str, ranges: list[tuple[int, int, str]]) -> int | str:
         """Send one rendered message, waiting for Signal to take it.
 
         Returns the gateway's `message_id` on a 200. Raises on anything else,
@@ -707,7 +725,7 @@ class GatewayTransport:
                     ],
                 }
             ],
-            "idempotency_key": self._key(text),
+            "idempotency_key": self._key(text, ranges),
             "wait_s": self.wait_s,
         }
         try:
@@ -730,6 +748,20 @@ class GatewayTransport:
                 f"signal gateway queued the message but Signal had not taken it within "
                 f"{self.wait_s}s; it is not delivered and not failed, so it stays unmarked "
                 f"and the next run resubmits it: {tail}"
+            )
+        if response.status_code == 422 and "too_long" in tail:
+            # The arithmetic on this side reserved room for `self.label`. If
+            # the gateway still finds the part too long, the label it is
+            # actually configured with is longer than the one named here --
+            # it re-checks after prefixing, and nothing reports its value
+            # back, so this is the one failure worth explaining rather than
+            # relaying.
+            raise SignalGatewayError(
+                f"signal gateway refused a part as too long although this side split at "
+                f"{self.limit} bytes, reserving room for the label {self.label!r}. The "
+                f"gateway prefixes its own consumers.<name>.label and re-checks the length "
+                f"afterwards, so that label is probably longer than this one, or set when "
+                f"this config has none: {tail}"
             )
         if response.status_code != 200:
             raise SignalGatewayError(
@@ -808,6 +840,14 @@ def _gateway_from_config(cfg: dict, label: str, timeout: int) -> GatewayTranspor
     ]
     if missing:
         raise RuntimeError(f"{label}: gateway block is missing: {', '.join(missing)}")
+    if not url.startswith(("http://", "https://")):
+        # `requests` raises MissingSchema on the first send otherwise, which
+        # is after the run has fetched, scored and paid for a model call. The
+        # same fail-early rule this function applies to 'wait_s'.
+        raise RuntimeError(
+            f"{label}: gateway 'url' is {url!r}, which has no scheme; it needs "
+            "http:// or https://"
+        )
     message_label = gateway.get("label", "")
     if not isinstance(message_label, str):
         raise RuntimeError(f"{label}: gateway 'label' must be a string")
@@ -827,6 +867,17 @@ def _gateway_from_config(cfg: dict, label: str, timeout: int) -> GatewayTranspor
         raise RuntimeError(
             f"{label}: gateway 'wait_s' is {wait_s}; it must be between 1 and 30, "
             "which is the gateway's own cap"
+        )
+    if timeout <= wait_s:
+        # The gateway holds the response for up to `wait_s`. A socket timeout
+        # at or under that fires first, and a send still in flight then comes
+        # back as "the gateway did not answer" -- a refusal -- instead of the
+        # pending answer it is. Marking the difference matters: one says do
+        # not retry, the other says retry under the same key.
+        raise RuntimeError(
+            f"{label}: 'timeout' is {timeout}s and gateway 'wait_s' is {wait_s}s. The "
+            "request timeout has to outlast the wait, or a message still in flight is "
+            "reported as a failed send; give the timeout at least a few seconds more"
         )
     token = _read_token_file(token_file, label)
     retval = GatewayTransport(
@@ -948,11 +999,17 @@ def post_message(
                 # got. Flattening both to `SignalCliError` here would tell a
                 # retrying caller that a message still in flight had failed,
                 # and "failed" is the word that stops it resubmitting.
+                resubmit = (
+                    "Resubmitting is safe -- each part carries its own idempotency key, "
+                    "so the parts already sent are not sent twice"
+                    if getattr(transport, "idempotent", False)
+                    else "Resubmitting repeats the parts that did reach the group, because "
+                    "this transport has no idempotency key for the far side to match"
+                )
                 raise type(exc)(
                     f"part {number} of {total} did not go out after {len(timestamps)} of "
                     f"them reached the group, which now holds an incomplete message. "
-                    f"Resubmitting is safe -- each part carries its own idempotency key, "
-                    f"so the parts already sent are not sent twice: {exc}"
+                    f"{resubmit}: {exc}"
                 ) from exc
             raise
     retval = timestamps
