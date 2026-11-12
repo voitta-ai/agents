@@ -799,7 +799,13 @@ class GatewayTransport:
             file=sys.stderr,
         )
 
-    def _key(self, text: str, ranges: list[tuple[int, int, str]], seed: str = "") -> str:
+    def _key(
+        self,
+        text: str,
+        ranges: list[tuple[int, int, str]],
+        seed: str = "",
+        salt: str = "",
+    ) -> str:
         """An idempotency key for this message to this conversation.
 
         The retry a `SignalSendPending` asks for has to carry the same key as
@@ -850,6 +856,10 @@ class GatewayTransport:
         wording for the rest. Nothing is lost -- the same signal is described
         either way -- and it is strictly better than a duplicate or a hole.
 
+        `salt` moves a key off an entry the gateway can no longer honour --
+        see the `message_gone` branch in `send`. It is not a retry knob: the
+        whole value of the key is that a retry reuses it.
+
         Without a seed it falls back to the content, which is right for a
         caller that has no stable id to offer. The digest covers the styles as
         well as the text, since two parts of one message can hold the same
@@ -867,8 +877,8 @@ class GatewayTransport:
             # resubmitting repeats the parts that arrived.
             seed = f"{seed}!{self._run}"
         material = json.dumps(
-            [self.conversation, self.label, self.fingerprint, seed] if seed
-            else [self.conversation, self.label, self.fingerprint, text, ranges],
+            [self.conversation, self.label, self.fingerprint, salt, seed] if seed
+            else [self.conversation, self.label, self.fingerprint, salt, text, ranges],
             ensure_ascii=False,
             sort_keys=True,
         )
@@ -922,6 +932,34 @@ class GatewayTransport:
             "idempotency_key": self._key(text, ranges, seed),
             "wait_s": self.wait_s,
         }
+        response = self._post(payload)
+        if response.status_code == 409 and "message_gone" in (response.text or ""):
+            # The gateway still holds this idempotency key but has lost the
+            # message it names -- its data was reset, or a retention it did
+            # not have yet removed the row. The key is derived, so every run
+            # would compute it again and get this same 409 until it expires:
+            # a message that is not delivered and, from this side, cannot be.
+            # So the key is moved once, deliberately, and the send retried.
+            # The cost is a duplicate if the original did reach the group
+            # before the reset; the alternative is a silent gap for the rest
+            # of the TTL, and a duplicate someone can see is the better of
+            # the two. Once, not in a loop: a second `message_gone` under a
+            # fresh key is a gateway problem, not a key problem.
+            print(
+                "signal gateway lost the message behind this idempotency key "
+                "(message_gone); sending once more under a fresh key, which may "
+                "duplicate it if the original went out before the gateway's data was "
+                "reset",
+                file=sys.stderr,
+            )
+            payload["idempotency_key"] = self._key(text, ranges, seed, salt="message_gone")
+            response = self._post(payload)
+        said = self._scrub((response.text or "").strip())
+        tail = said[-400:]
+        return self._read(response, said, tail, seed)
+
+    def _post(self, payload: dict) -> requests.Response:
+        """One POST to the gateway, with every failure shape classified."""
         try:
             response = requests.post(
                 f"{self.base_url}/v1/messages",
@@ -929,6 +967,7 @@ class GatewayTransport:
                 headers={"Authorization": f"Bearer {self._token}"},
                 timeout=self.timeout,
             )
+            return response
         except requests.ConnectTimeout as exc:
             # No connection was established, so nothing was sent.
             # Not `from exc`: a requests exception renders the request, and
@@ -979,8 +1018,10 @@ class GatewayTransport:
         # that echoes the part it refused pushes the marker out of a 400-byte
         # tail, and the one failure this transport can explain would fall
         # through to the generic relay.
-        said = self._scrub((response.text or "").strip())
-        tail = said[-400:]
+    def _read(
+        self, response: requests.Response, said: str, tail: str, seed: str
+    ) -> int | str:
+        """What the gateway's answer means. See `send` for the contract."""
         if response.status_code == 202:
             raise SignalSendPending(
                 f"signal gateway queued the message but Signal had not taken it within "

@@ -755,6 +755,18 @@ refusal is a 502 carrying `send_failed`, and anything else in that range is a
 crash or a proxy giving up inside the window the gateway spends holding the
 reply, where the message may already be enqueued.
 
+**A 409 `message_gone` is retried once under a fresh key.** It means the
+gateway still holds the idempotency key but has lost the message it names --
+its data was reset, or a retention it did not have yet removed the row. The
+key is derived, so every run would compute it again and meet the same 409
+until it expires: a message that is not delivered and, from this side, cannot
+be. So the key is moved once, deliberately, and the send retried. The cost is
+a duplicate if the original did reach the group before the reset, and a
+duplicate someone can see is better than a silent gap for the rest of the TTL.
+Once only -- a second `message_gone` under a fresh key is a gateway problem,
+not a key problem -- and the stderr line says a duplicate is possible. No other
+409, `key_reused` included, is retried.
+
 A `200` whose status is `queued` means the gateway did not honour the wait at
 all -- an older build. That is a hard failure here rather than a pending one,
 because the gateway writes its idempotency entry when it accepts a message and
