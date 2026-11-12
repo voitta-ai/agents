@@ -33,7 +33,7 @@ from __future__ import annotations
 from framework.interfaces import Destination, ScoredSignal
 from framework.registry import register_destination
 from framework.signal_messenger import (
-    SignalTransport,
+    Transport,
     check_footer,
     post_message,
     transport_from_config,
@@ -45,7 +45,7 @@ _LABEL = "signal-messenger destination"
 class SignalDestination:
     def __init__(
         self,
-        transport: SignalTransport,
+        transport: Transport,
         min_score: int = 0,
         footer: str = "",
         show_reasons: bool = True,

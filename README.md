@@ -758,11 +758,30 @@ The handle is the gateway's own `message_id`, which its edit, delete and
 reaction endpoints take; the gateway keeps the Signal timestamp itself. So
 `post_message` returns a `message_id` under this transport and a Signal
 timestamp under the other, and the two are not interchangeable. The pending case raises its own type,
-`SignalSendPending`, because it is neither a success nor a failure: the next
-run resubmits it under the same idempotency key, which waits on the message
-already in flight rather than sending a second copy. The cap is the gateway's,
+`SignalSendPending`, a sibling of the refusal rather than a kind of it,
+because `except SignalGatewayError` is what a caller writes to mean "refused,
+give up" and pending must not be caught by it. A read timeout after the request
+was sent is pending for the same reason -- the gateway may well have queued the
+message, so calling it a refusal would tell the caller not to retry something
+in flight. The HTTP timeout therefore has to outlast `wait_s` by a margin,
+checked when the config is read: a gateway answering a moment after its own
+deadline is answering 202, and losing that to a socket timeout produces exactly
+the confusion the distinction exists to avoid. The wait's cap is the gateway's,
 30 seconds; a larger number in config is refused here rather than silently
 clamped there.
+
+The next run resubmits under the same content-derived idempotency key, which
+waits on the message already in flight rather than sending a second copy. Two
+bounds on that promise. It lasts as long as the gateway's `idempotency_ttl_s`,
+24 hours by default, so an agent whose runs are further apart than the TTL gets
+a fresh key for the same content and the resubmit does post a second copy. And
+because the key covers the text and its styles with no run or time component, a
+caller that deliberately sends identical text twice inside the TTL gets the
+earlier message's outcome replayed -- `duplicate: true`, reported as delivered,
+with nothing new sent. That is right for a retry and wrong for a repeat, and
+the two are indistinguishable from the content alone, so the flag is written to
+stderr rather than swallowed. A source that re-lists the same items every run
+is the shape to watch.
 
 **`label` mirrors the gateway's own setting and has to match it.** The prefix
 is applied by the gateway from its `consumers.<name>.label`, and it re-checks

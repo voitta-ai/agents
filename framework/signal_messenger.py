@@ -72,6 +72,7 @@ import re
 import shutil
 import stat
 import subprocess
+import sys
 from typing import Protocol
 
 import requests
@@ -90,12 +91,26 @@ BULLET = "•"
 # marker is ASCII, so its width is the same number of bytes as characters.
 _MARKER_ROOM = 24
 
+# How much longer than the gateway's own wait the HTTP timeout has to be. A
+# gateway that answers a moment after its deadline must still be heard: the
+# answer at that moment is a 202, and losing it to a socket timeout turns a
+# message in flight into one the caller is told was refused.
+_WAIT_MARGIN = 5
+
 # Every status a gateway 200 can carry, all of which mean the message left:
 # a retry that arrives after Signal has acked sees `delivered` or `read`, and
 # `deleted` is a message that went out and was then deleted. Anything outside
 # this set is a word this version has not been told the meaning of, and
 # guessing at one would either lose a message or send it twice.
 _GATEWAY_SENT = frozenset({"sent", "delivered", "read", "deleted"})
+
+# Statuses a 200 can carry that mean the message has not left yet. The
+# gateway returns 202 while a send is in flight, so these arrive only from a
+# build without `wait_s` -- its published schema allows `queued` on a 200 and
+# an older deployment answered that way. Reading one as an unknown status
+# would turn a message that is merely waiting into a hard failure, so they
+# are pending, which is what they are.
+_GATEWAY_PENDING = frozenset({"queued"})
 
 BOLD = "BOLD"
 ITALIC = "ITALIC"
@@ -160,14 +175,20 @@ class SignalGatewayError(SignalSendError):
     """The gateway refused the send, or could not be reached."""
 
 
-class SignalSendPending(SignalGatewayError):
+class SignalSendPending(SignalSendError):
     """The gateway accepted the message and Signal had not taken it yet.
 
-    Separate from `SignalGatewayError` because it is not a failure: the
-    message may still arrive. A run-and-exit caller cannot wait to find out,
-    so it must neither mark the signal delivered nor report success -- the
-    next run resubmits it under the same idempotency key, which waits on the
-    same message instead of sending a second one.
+    A sibling of `SignalGatewayError` rather than a kind of it, because the
+    obvious consumer -- `except SignalGatewayError:  # refused, give up` --
+    would otherwise swallow the one case that is not a refusal. The message
+    may still arrive. A run-and-exit caller cannot wait to find out, so it
+    must neither mark the signal delivered nor report success: the next run
+    resubmits it under the same idempotency key, which waits on the message
+    already in flight instead of sending a second one.
+
+    That promise is bounded by the gateway's `idempotency_ttl_s`, 24 hours by
+    default. A caller whose runs are further apart than the TTL gets a fresh
+    key for the same content, and the resubmit then posts a second copy.
     """
 
 
@@ -432,7 +453,7 @@ def _split_bytes(text: str, limit: int) -> list[tuple[str, int]]:
     style ranges rather than capacity.
     """
     if limit < 1:
-        raise SignalCliError(
+        raise SignalSendError(
             f"signal message split asked for parts of {limit} bytes; "
             "a footer or a marker has eaten the whole message"
         )
@@ -702,10 +723,13 @@ class GatewayTransport:
         so a caller that marks a signal delivered only when this returns can
         never mark one that did not arrive:
 
-        - 200 means the message left, under any of `_GATEWAY_SENT`. A 200
-          carries no Signal timestamp: the gateway keeps that and addresses
-          the message by `message_id`, which is what its edit, delete and
-          reaction endpoints take.
+        - 200 means the message left, under any of `_GATEWAY_SENT`, or --
+          from a build without `wait_s` -- that it has not left yet, under
+          `_GATEWAY_PENDING`. A 200 carries no Signal timestamp: the gateway
+          keeps that and addresses the message by `message_id`, which is what
+          its edit, delete and reaction endpoints take. A `duplicate` flag
+          means the key was found in the gateway's idempotency store and the
+          earlier outcome replayed, so nothing new was sent.
         - 502 means the send was refused for good; retrying it is pointless
           until whatever was wrong is fixed.
         - 202 means it was still in flight when the gateway's own deadline
@@ -735,9 +759,19 @@ class GatewayTransport:
                 headers={"Authorization": f"Bearer {self._token}"},
                 timeout=self.timeout,
             )
-        except requests.RequestException as exc:
+        except requests.ReadTimeout as exc:
+            # The request body was sent and the gateway did not answer in
+            # time, so the message may well be queued. Calling that a refusal
+            # would tell the caller not to retry something that is in flight.
             # Not `from exc`: a requests exception renders the request, and
             # the Authorization header is on it.
+            raise SignalSendPending(
+                f"signal gateway at {self.base_url} took the request and did not answer "
+                f"within {self.timeout}s. The message may be queued, so it stays unmarked "
+                f"and the next run resubmits it under the same key: "
+                f"{self._scrub(str(exc))[-300:]}"
+            ) from None
+        except requests.RequestException as exc:
             raise SignalGatewayError(
                 f"signal gateway at {self.base_url} did not answer: "
                 f"{self._scrub(str(exc))[-400:]}"
@@ -776,11 +810,34 @@ class GatewayTransport:
         if not isinstance(body, dict):
             raise SignalGatewayError(f"signal gateway answered 200 with {type(body).__name__}")
         status = str(body.get("status") or "")
+        if status in _GATEWAY_PENDING:
+            raise SignalSendPending(
+                f"signal gateway answered 200 with status {status!r}, which means the "
+                f"message has not left yet -- a build that does not implement the "
+                f"{self.wait_s}s wait this send asked for. It is not delivered and not "
+                f"failed, so it stays unmarked and the next run resubmits it: {tail}"
+            )
         if status not in _GATEWAY_SENT:
             raise SignalGatewayError(
                 f"signal gateway answered 200 with status {status!r}, which this "
                 f"version does not know how to read; it knows "
                 f"{', '.join(sorted(_GATEWAY_SENT))}: {tail}"
+            )
+        if body.get("duplicate"):
+            # The gateway found this idempotency key in its store and replayed
+            # the earlier message's outcome; nothing new was sent. For the
+            # retry this design asks for, that is exactly right. For a caller
+            # deliberately sending the same text twice inside
+            # `idempotency_ttl_s` it is a silent no-op reported as success, and
+            # the flag is the only evidence either way -- so it is said out
+            # loud rather than swallowed.
+            print(
+                f"signal gateway replayed an earlier message for this content "
+                f"(duplicate=true, status {status!r}); nothing new was sent. If this was "
+                f"a deliberate repeat rather than a retry, it did not go out: the key is "
+                f"derived from the text and its styles, and the gateway remembers it for "
+                f"its idempotency TTL.",
+                file=sys.stderr,
             )
         handle = str(body.get("message_id") or "")
         if not handle:
@@ -868,7 +925,7 @@ def _gateway_from_config(cfg: dict, label: str, timeout: int) -> GatewayTranspor
             f"{label}: gateway 'wait_s' is {wait_s}; it must be between 1 and 30, "
             "which is the gateway's own cap"
         )
-    if timeout <= wait_s:
+    if timeout < wait_s + _WAIT_MARGIN:
         # The gateway holds the response for up to `wait_s`. A socket timeout
         # at or under that fires first, and a send still in flight then comes
         # back as "the gateway did not answer" -- a refusal -- instead of the
@@ -876,8 +933,9 @@ def _gateway_from_config(cfg: dict, label: str, timeout: int) -> GatewayTranspor
         # not retry, the other says retry under the same key.
         raise RuntimeError(
             f"{label}: 'timeout' is {timeout}s and gateway 'wait_s' is {wait_s}s. The "
-            "request timeout has to outlast the wait, or a message still in flight is "
-            "reported as a failed send; give the timeout at least a few seconds more"
+            f"request timeout has to outlast the wait by at least {_WAIT_MARGIN}s, or a "
+            f"gateway answering a moment after its own deadline times out the socket "
+            f"instead, and a message still in flight is read as a failed send"
         )
     token = _read_token_file(token_file, label)
     retval = GatewayTransport(
@@ -985,7 +1043,7 @@ def post_message(
             # measures the assembled part instead of predicting it, so a slip
             # is a loud failure naming the size rather than a message Signal
             # rejects or truncates without saying so.
-            raise SignalCliError(
+            raise SignalSendError(
                 f"signal message part {number} of {total} assembled to {_bytes(body)} "
                 f"bytes, over the {limit}-byte limit; refusing to send it"
             )
