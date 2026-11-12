@@ -15,9 +15,13 @@ architecture. An agent therefore talks to an account *this deployment owns*,
 through the `signal-cli` binary, rather than borrowing a conversational agent's
 account and depending on its relay.
 
-There is no Python dependency to install, so there is no optional extra: the
-dependency is the `signal-cli` binary, whose presence on PATH is checked when
-the transport is built. That is all that is checked there. An account that is
+Which dependency applies follows the transport. `signal-cli` needs no Python
+package -- the dependency is the binary, whose presence on PATH is checked when
+that transport is built, and that is all that is checked there. The gateway
+transport needs no binary and uses `requests`, which this repo already
+depends on, and it checks a good deal more before a run starts: the URL's
+scheme, `wait_s` against the gateway's cap and against the HTTP timeout, the
+label's length, and the token file's mode and kind. An account that is
 not registered, or a group id this account is not a member of, costs a
 subprocess and the account lock to verify, so it is left to fail on the first
 send rather than on every run that sends nothing.
@@ -74,6 +78,7 @@ import shutil
 import stat
 import subprocess
 import sys
+from time import time
 from typing import Protocol
 
 import requests
@@ -715,6 +720,7 @@ class GatewayTransport:
         wait_s: int = 10,
         timeout: int = 120,
         fingerprint: str = "",
+        repeats: bool = False,
     ):
         self.base_url = base_url.rstrip("/")
         self.conversation = conversation
@@ -726,7 +732,15 @@ class GatewayTransport:
         # `_key`: the gateway's idempotency store is namespaced by consumer,
         # so two destinations behind one token need to differ here.
         self.fingerprint = fingerprint
-        self.idempotent = True
+        # Whether this destination deliberately sends the same signal more
+        # than once. See `_key`: it decides whether the gateway's replay of
+        # an earlier message is the retry this design wants or a delivery
+        # quietly dropped.
+        self.repeats = repeats
+        self.idempotent = not repeats
+        # One value per process, so every part of every message in this run
+        # shares it and a retry within the run would still match.
+        self._run = f"{int(time()):x}-{os.getpid():x}"
         # A label is prepended by the gateway to every message it sends, so
         # its bytes are not available to the body. `_bytes` and not `len`,
         # for the reason the whole module says.
@@ -802,8 +816,8 @@ class GatewayTransport:
         does not move for either reason.
 
         The material also holds this transport's `fingerprint`, a digest of
-        the destination block it was built from, and the seed `post_message`
-        builds carries a digest of the footer. Both are there because the
+        the workspace it was built in, and the seed `post_message` builds
+        carries a digest of the footer. Both are there because the
         gateway namespaces its idempotency store by consumer, not by
         destination: two destinations sharing one gateway token and one
         conversation are one consumer to it, so the same signal would
@@ -811,16 +825,19 @@ class GatewayTransport:
         message -- its own footer, its own reasons -- would come back as a
         replay of the first, reported as delivered and never sent. The footer
         alone does not settle it, since an empty or shared footer is exactly
-        the case that collides; the whole block does, for any pair of
-        destinations configured differently in any respect. Two configured
-        identically, in one conversation, sending one signal, do still
-        collide -- and are the same message, the one case where a replay is
-        the right answer. Beyond that, give each agent its own gateway
-        consumer and token, which is what the namespacing is for.
+        the case that collides; the workspace does, and it is stable against
+        the config edits an operator makes while chasing a failure. Two
+        destinations with the same footer in one workspace and one
+        conversation still collide -- and are the same message to the same
+        people, the one case where a replay is the right answer. Beyond that,
+        give each agent its own gateway consumer and token, which is what the
+        namespacing is for.
 
-        The seed `post_message` builds is `<id>#<number>-of-<total>`, and the
-        total is in it on purpose. A key that named only the part number would
-        match across runs that split differently, and the worse direction of
+        The seed `post_message` builds is
+        `<id>@<footer digest>#<number>-of-<total>`, optionally with a run
+        nonce (see `repeats`), and the total is in it on purpose. A key that
+        named only the part number would match across runs that split
+        differently, and the worse direction of
         that is silent: a retry whose text shortened into one part would carry
         the key of the old part 1, the gateway would replay that part, this
         side would read a 200 and mark the signal delivered, and everything
@@ -838,6 +855,17 @@ class GatewayTransport:
         well as the text, since two parts of one message can hold the same
         words under different emphasis.
         """
+        if seed and self.repeats:
+            # A source that re-lists the same items every run means to send
+            # them again, and the gateway cannot tell that from a retry: both
+            # arrive as the same key inside its 24-hour window, and it
+            # answers the second one by replaying the first. Reported as
+            # delivered, never sent. So a destination that repeats itself
+            # gets a key that is unique per run, and gives up the
+            # cross-run retry guarantee in exchange -- which is the trade
+            # `idempotent` then reports, so a partial send says that
+            # resubmitting repeats the parts that arrived.
+            seed = f"{seed}!{self._run}"
         material = json.dumps(
             [self.conversation, self.label, self.fingerprint, seed] if seed
             else [self.conversation, self.label, self.fingerprint, text, ranges],
@@ -1135,6 +1163,9 @@ def _gateway_from_config(cfg: dict, label: str, timeout: int) -> GatewayTranspor
             f"{label}: gateway 'url' is {url!r}, which has no scheme; it needs "
             "http:// or https://"
         )
+    repeats = gateway.get("repeats", False)
+    if not isinstance(repeats, bool):
+        raise RuntimeError(f"{label}: gateway 'repeats' must be true or false")
     message_label = gateway.get("label", "")
     if not isinstance(message_label, str):
         raise RuntimeError(f"{label}: gateway 'label' must be a string")
@@ -1167,13 +1198,16 @@ def _gateway_from_config(cfg: dict, label: str, timeout: int) -> GatewayTranspor
             f"gateway answering a moment after its own deadline times out the socket "
             f"instead, and a message still in flight is read as a failed send"
         )
-    # Everything the operator configured for this destination, as one short
-    # digest: see `GatewayTransport._key`. The token is deliberately not in
-    # it -- a value derived from a credential has no business on the wire,
-    # even hashed -- and `token_file` is a path, not a secret.
-    fingerprint = _short_digest(
-        json.dumps(cfg, ensure_ascii=False, sort_keys=True, default=str)
-    )
+    # Which destination this is, as one short digest: see
+    # `GatewayTransport._key`. The workspace alone, not the whole block --
+    # the block holds tuning that an operator changes in response to a
+    # failure, and `wait_s` is the first thing they would raise after a 202.
+    # Hashing that in would mean the fix for a pending part changes the key
+    # of the parts that already arrived and posts them again, which is the
+    # outcome the key exists to prevent. `cli.py` injects `_workspace` into
+    # every destination block, and two destinations in one workspace are
+    # told apart by the footer in the seed.
+    fingerprint = _short_digest(str(cfg.get("_workspace") or ""))
     token = _read_token_file(token_file, label)
     retval = GatewayTransport(
         base_url=url,
@@ -1183,6 +1217,7 @@ def _gateway_from_config(cfg: dict, label: str, timeout: int) -> GatewayTranspor
         wait_s=wait_s,
         timeout=timeout,
         fingerprint=fingerprint,
+        repeats=repeats,
     )
     if _bytes(message_label) > _MAX_LABEL_BYTES:
         # Bounded rather than merely checked for leaving a positive remainder.

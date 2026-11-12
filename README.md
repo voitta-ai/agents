@@ -716,6 +716,7 @@ the account and serves every agent behind one daemon:
     "conversation": "<alias>",
     "token_file": "<workspace>/gateway-token",
     "label": "<the label the gateway prefixes, or omitted>",
+    "repeats": false,
     "wait_s": 10
   },
   "min_score": 10
@@ -794,8 +795,12 @@ the vendor waterfall landed on to its reasons, and the destination renders
 those reasons into the message. A different rung would mean a different key,
 and the part that already reached the group would be posted again -- the one
 outcome the key exists to prevent. Each part goes under
-`<signal id>@<footer digest>#<number>-of-<total>`, and a digest of the whole
-destination block goes into the key alongside it. Both are there because the
+`<signal id>@<footer digest>#<number>-of-<total>`, and a digest of the
+workspace goes into the key alongside it -- the workspace rather than the
+whole block, because the block holds tuning an operator changes while chasing
+a failure, and `wait_s` is the first thing they would raise after a 202.
+Hashing that in would mean the fix for a pending part changed the keys of the
+parts that already arrived and posted them again. Both are there because the
 gateway namespaces its idempotency store by consumer, not by destination: two
 destinations sharing one token and one conversation are one consumer to it, so
 the same signal would otherwise key identically from both, and the second
@@ -828,6 +833,19 @@ since the key does not depend on the text. That is right for a retry and wrong f
 repeat, and the two cannot be told apart from here, so the flag is written to
 stderr rather than swallowed. A source that re-lists the same items every run
 is the shape to watch.
+
+**A source that re-lists the same items every run needs `repeats: true`.**
+That is the one case the key cannot infer. A source with `dedupe: false` means
+to send the same signal again, and the gateway cannot tell that from a retry:
+both arrive under the same key inside its 24-hour window, and it answers the
+second by replaying the first -- reported as delivered, never sent, with only
+a line on stderr. `repeats: true` mixes a per-run value into the key, so each
+run is its own message. The trade is the cross-run retry guarantee: a
+repeating destination reports `idempotent = False`, and a partial send then
+says plainly that resubmitting repeats the parts that did arrive. Today no
+Signal destination is fed by a non-deduping source, so this is a trap rather
+than a live fault -- `meetups` is the only workspace with `dedupe: false` and
+it posts to Slack.
 
 One caveat on the exception types: `fanout` flattens a child destination's
 exception into a `RuntimeError`, so a `signal-messenger` behind it loses the
