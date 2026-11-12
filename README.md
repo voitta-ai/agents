@@ -765,7 +765,11 @@ build has to.
 A `200` carries no Signal timestamp. Its status is `sent`, `delivered`, `read`
 or `deleted` -- a retry arriving after Signal has acked sees `delivered` or
 `read`, and `deleted` is a message that went out and was then deleted -- and
-all four mean it left. Any other status raises rather than being guessed at.
+all four mean it left. The gateway's published enum has three more, each read
+by name rather than as something unrecognised: `failed` did not go out even
+under a 200, and `queued` or `received` mean it has not left, which is the
+frozen-entry case above. Anything outside the enum raises, naming what this
+version does know.
 The handle is the gateway's own `message_id`, which its edit, delete and
 reaction endpoints take; the gateway keeps the Signal timestamp itself. So
 `post_message` returns a `message_id` under this transport and a Signal

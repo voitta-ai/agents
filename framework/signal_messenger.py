@@ -128,6 +128,23 @@ _GATEWAY_SENT = frozenset({"sent", "delivered", "read", "deleted"})
 # and no amount of retrying substitutes for it.
 _GATEWAY_PENDING = frozenset({"queued"})
 
+# `failed` on a 200 would contradict the status code, but the gateway's
+# published enum allows it and the honest reading is the status, not the code:
+# a message the gateway says failed did not go out. Kept separate from the
+# unknown-status path so the error says what happened rather than that this
+# version cannot tell.
+_GATEWAY_FAILED = frozenset({"failed"})
+
+# `received` belongs to an inbound message and should never come back from a
+# send. If it does, the message exists and has not been sent, which is the
+# same position as `queued` -- and the same frozen-entry problem, so it is
+# read the same way rather than as something this version has not been told.
+_GATEWAY_INBOUND = frozenset({"received"})
+
+# Every status the gateway's published enum declares, for the error that says
+# what this version understands.
+_known = sorted(_GATEWAY_SENT | _GATEWAY_PENDING | _GATEWAY_FAILED | _GATEWAY_INBOUND)
+
 BOLD = "BOLD"
 ITALIC = "ITALIC"
 STRIKETHROUGH = "STRIKETHROUGH"
@@ -1001,10 +1018,16 @@ class GatewayTransport:
             # returned if there is one; only the status was missing.
             retval = str(body.get("message_id") or "") or 0
             return retval
-        if status in _GATEWAY_PENDING:
+        if status in _GATEWAY_FAILED:
             raise SignalGatewayError(
-                f"signal gateway answered 200 with status {status!r}, which means it did "
-                f"not honour the {self.wait_s}s wait this send asked for -- an older build. "
+                f"signal gateway answered 200 but reports the message {status!r}; it did "
+                f"not go out: {tail}"
+            )
+        if status in _GATEWAY_PENDING or status in _GATEWAY_INBOUND:
+            raise SignalGatewayError(
+                f"signal gateway answered 200 with status {status!r}, which means the "
+                f"message has not left and it did not honour the {self.wait_s}s wait this "
+                f"send asked for -- an older build. "
                 f"The message may well have gone out, but this cannot be established from "
                 f"here: the gateway's idempotency entry keeps the status it was written "
                 f"with, so resubmitting replays this same answer until the entry expires "
@@ -1014,8 +1037,7 @@ class GatewayTransport:
         if status not in _GATEWAY_SENT:
             raise SignalGatewayError(
                 f"signal gateway answered 200 with status {status!r}, which this "
-                f"version does not know how to read; it knows "
-                f"{', '.join(sorted(_GATEWAY_SENT))}: {tail}"
+                f"version does not know how to read; it knows {', '.join(_known)}: {tail}"
             )
         handle = str(body.get("message_id") or "")
         if not handle:
