@@ -696,7 +696,7 @@ class SignalTransport:
 
 
 class GatewayTransport:
-    """Where a Signal message goes: one conversation, through voitta-gateway.
+    """Where a Signal message goes: one conversation, through the gateway.
 
     The gateway owns the Signal account. Only one process can, so this and
     `SignalTransport` are alternatives rather than layers: once the gateway's
@@ -1281,8 +1281,8 @@ def _gateway_from_config(cfg: dict, label: str, timeout: int) -> GatewayTranspor
 def transport_from_config(cfg: dict, label: str, timeout: int = 120) -> Transport:
     """Build the transport a destination block asks for.
 
-    Two kinds. `transport: gateway` sends through voitta-gateway, which owns
-    the account; anything else drives the signal-cli binary directly. They are
+    Two kinds. `transport: gateway` sends through the gateway service, which
+    owns the account; anything else drives the signal-cli binary directly. They are
     exclusive, not layered: only one process can hold a Signal account, so the
     cutover is a config flip rather than a fallback chain, and a fallback would
     be a second process trying to open an account the gateway already has.

@@ -704,8 +704,8 @@ than on every run that sends nothing.
 #### Two transports, because only one process can hold the account
 
 `transport` picks how the message leaves. The default, `signal-cli`, is the
-subprocess above. `gateway` sends through voitta-gateway, a service that owns
-the account and serves every agent behind one daemon:
+subprocess above. `gateway` sends through a gateway service that owns the
+account and serves every agent behind one daemon:
 
 ```json
 "destination": {
