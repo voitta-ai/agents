@@ -112,10 +112,20 @@ _GATEWAY_SENT = frozenset({"sent", "delivered", "read", "deleted"})
 
 # Statuses a 200 can carry that mean the message has not left yet. The
 # gateway returns 202 while a send is in flight, so these arrive only from a
-# build without `wait_s` -- its published schema allows `queued` on a 200 and
-# an older deployment answered that way. Reading one as an unknown status
-# would turn a message that is merely waiting into a hard failure, so they
-# are pending, which is what they are.
+# build that does not implement the `wait_s` this transport asks for -- its
+# published schema allows `queued` on a 200 and an older deployment answered
+# that way.
+#
+# They are not treated as pending, which is the thing to understand here. The
+# gateway writes its idempotency entry when it accepts the message, with the
+# status it has at that moment, and only the `wait_s` poll loop ever reports a
+# later one -- the stored entry keeps saying `queued` forever. So on a build
+# without that loop, every resubmit of this key replays the same `queued` and
+# pending would never resolve: the run would fail on every schedule for the
+# whole TTL, over a message that was very likely delivered on the first
+# attempt, and then post a second copy once the key expired. A hard failure
+# naming the cause is the honest answer, because the fix is a gateway build
+# and no amount of retrying substitutes for it.
 _GATEWAY_PENDING = frozenset({"queued"})
 
 BOLD = "BOLD"
@@ -490,6 +500,12 @@ def _clip(
         high = min(range_start + range_length, start + length)
         if high > low:
             retval.append((low - start, high - low, style))
+    return retval
+
+
+def _short_digest(text: str) -> str:
+    """A few bytes of hash, to tell two configurations apart inside a key."""
+    retval = hashlib.sha256(text.encode("utf-8")).hexdigest()[:8]
     return retval
 
 
@@ -908,11 +924,14 @@ class GatewayTransport:
             retval = str(body.get("message_id") or "") or 0
             return retval
         if status in _GATEWAY_PENDING:
-            raise SignalSendPending(
-                f"signal gateway answered 200 with status {status!r}, which means the "
-                f"message has not left yet -- a build that does not implement the "
-                f"{self.wait_s}s wait this send asked for. It is not delivered and not "
-                f"failed, so it stays unmarked and the next run resubmits it: {tail}"
+            raise SignalGatewayError(
+                f"signal gateway answered 200 with status {status!r}, which means it did "
+                f"not honour the {self.wait_s}s wait this send asked for -- an older build. "
+                f"The message may well have gone out, but this cannot be established from "
+                f"here: the gateway's idempotency entry keeps the status it was written "
+                f"with, so resubmitting replays this same answer until the entry expires "
+                f"and then sends a second copy. Check the conversation by hand and deploy "
+                f"a gateway that implements wait_s: {tail}"
             )
         if status not in _GATEWAY_SENT:
             raise SignalGatewayError(
@@ -1158,7 +1177,16 @@ def post_message(
 
     `seed` is a caller-stable id for the message -- a signal's `id`, not
     anything derived from the rendered text -- and each part is sent under
-    `seed#<number>-of-<total>`. A transport that deduplicates resubmits uses
+    `<seed>@<footer digest>#<number>-of-<total>`. The footer is in there
+    because the gateway namespaces its idempotency store by consumer, not by
+    destination: two destinations sharing one gateway token and one
+    conversation are one consumer to it, so the same signal would otherwise
+    produce the same key from both, and the second one's message -- its own
+    footer, its own reasons -- would come back as a replay of the first,
+    reported as delivered and never sent. A footer is the part of a
+    destination's own configuration that does not move between runs. It is
+    not a complete answer: give each agent its own gateway consumer and token,
+    which is what the gateway's own namespacing is for. A transport that deduplicates resubmits uses
     it to recognise a part it has already taken, which the text cannot do here
     because a retry re-scores and the score's reasons are rendered into it.
     The total is part of it so that a retry which splits differently is a
@@ -1201,7 +1229,11 @@ def post_message(
             )
         try:
             timestamps.append(
-                transport.send(body, styles, f"{seed}#{number}-of-{total}" if seed else "")
+                transport.send(
+                    body,
+                    styles,
+                    f"{seed}@{_short_digest(footer)}#{number}-of-{total}" if seed else "",
+                )
             )
         except SignalSendError as exc:
             if timestamps:
@@ -1212,8 +1244,10 @@ def post_message(
                 # retrying caller that a message still in flight had failed,
                 # and "failed" is the word that stops it resubmitting.
                 resubmit = (
-                    "Resubmitting is safe -- each part carries its own idempotency key, "
-                    "so the parts already sent are not sent twice"
+                    "Resubmitting does not repeat the parts that arrived, as long as the "
+                    "retry splits into the same number of parts: their idempotency keys "
+                    "name that total, so a retry whose text renders shorter or longer is "
+                    "a different message and does post them again"
                     if getattr(transport, "idempotent", False)
                     else "Resubmitting repeats the parts that did reach the group, because "
                     "this transport has no idempotency key for the far side to match"
