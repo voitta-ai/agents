@@ -33,7 +33,7 @@ from __future__ import annotations
 from framework.interfaces import Destination, ScoredSignal
 from framework.registry import register_destination
 from framework.signal_messenger import (
-    SignalTransport,
+    Transport,
     check_footer,
     post_message,
     transport_from_config,
@@ -45,7 +45,7 @@ _LABEL = "signal-messenger destination"
 class SignalDestination:
     def __init__(
         self,
-        transport: SignalTransport,
+        transport: Transport,
         min_score: int = 0,
         footer: str = "",
         show_reasons: bool = True,
@@ -91,7 +91,16 @@ class SignalDestination:
     def send(self, scored: ScoredSignal) -> None:
         if not self.accepts(scored):
             return
-        post_message(self.transport, self._format(scored), footer=self.footer)
+        # The signal's own id as the seed, not the rendered text: a retry
+        # re-scores, and `llm_scorer` renders the waterfall rung it landed on
+        # into the reasons, so the text moves between runs while the id does
+        # not. See `GatewayTransport._key`.
+        post_message(
+            self.transport,
+            self._format(scored),
+            footer=self.footer,
+            seed=scored.signal.id,
+        )
 
 
 @register_destination("signal-messenger")
@@ -110,7 +119,10 @@ def build(cfg: dict) -> Destination:
     # message is knowable before the run fetches, scores or asks a model
     # anything, and left unchecked it turns one scored signal into thousands of
     # one-character Signal messages. The same guard `slack_destination` makes.
-    check_footer(footer, f"{_LABEL}: 'footer'")
+    # Against the transport's own limit, not Signal's: a gateway that puts a
+    # label in front of every message has fewer bytes to give the footer, and
+    # a check against the constant would pass a footer the run then cannot fit.
+    check_footer(footer, f"{_LABEL}: 'footer'", limit=transport.limit)
 
     retval = SignalDestination(
         transport=transport,

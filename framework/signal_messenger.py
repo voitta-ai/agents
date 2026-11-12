@@ -15,9 +15,13 @@ architecture. An agent therefore talks to an account *this deployment owns*,
 through the `signal-cli` binary, rather than borrowing a conversational agent's
 account and depending on its relay.
 
-There is no Python dependency to install, so there is no optional extra: the
-dependency is the `signal-cli` binary, whose presence on PATH is checked when
-the transport is built. That is all that is checked there. An account that is
+Which dependency applies follows the transport. `signal-cli` needs no Python
+package -- the dependency is the binary, whose presence on PATH is checked when
+that transport is built, and that is all that is checked there. The gateway
+transport needs no binary and uses `requests`, which this repo already
+depends on, and it checks a good deal more before a run starts: the URL's
+scheme, `wait_s` against the gateway's cap and against the HTTP timeout, the
+label's length, and the token file's mode and kind. An account that is
 not registered, or a group id this account is not a member of, costs a
 subprocess and the account lock to verify, so it is left to fail on the first
 send rather than on every run that sends nothing.
@@ -65,11 +69,19 @@ was written with.
 """
 from __future__ import annotations
 
+import errno
+import hashlib
 import json
 import os
 import re
 import shutil
+import stat
 import subprocess
+import sys
+from time import time
+from typing import Protocol
+
+import requests
 
 # Signal's own per-message limit, in UTF-8 bytes. A longer message is split
 # into several, in order, the way `slack.py` splits on its block limit. Not
@@ -84,6 +96,59 @@ BULLET = "•"
 # can never push it over the limit. The same reservation `slack.py` makes. The
 # marker is ASCII, so its width is the same number of bytes as characters.
 _MARKER_ROOM = 24
+
+# The longest label the gateway may be prefixing. "Leads: " is seven bytes;
+# this is room for a name, not for content. See `_gateway_from_config` for
+# what an unbounded one does to the splitter.
+_MAX_LABEL_BYTES = 64
+
+# How much longer than the gateway's own wait the HTTP timeout has to be. A
+# gateway that answers a moment after its deadline must still be heard: the
+# answer at that moment is a 202, and losing it to a socket timeout turns a
+# message in flight into one the caller is told was refused.
+_WAIT_MARGIN = 5
+
+# Every status a gateway 200 can carry, all of which mean the message left:
+# a retry that arrives after Signal has acked sees `delivered` or `read`, and
+# `deleted` is a message that went out and was then deleted. Anything outside
+# this set is a word this version has not been told the meaning of, and
+# guessing at one would either lose a message or send it twice.
+_GATEWAY_SENT = frozenset({"sent", "delivered", "read", "deleted"})
+
+# Statuses a 200 can carry that mean the message has not left yet. The
+# gateway returns 202 while a send is in flight, so these arrive only from a
+# build that does not implement the `wait_s` this transport asks for -- its
+# published schema allows `queued` on a 200 and an older deployment answered
+# that way.
+#
+# They are not treated as pending, which is the thing to understand here. The
+# gateway writes its idempotency entry when it accepts the message, with the
+# status it has at that moment, and only the `wait_s` poll loop ever reports a
+# later one -- the stored entry keeps saying `queued` forever. So on a build
+# without that loop, every resubmit of this key replays the same `queued` and
+# pending would never resolve: the run would fail on every schedule for the
+# whole TTL, over a message that was very likely delivered on the first
+# attempt, and then post a second copy once the key expired. A hard failure
+# naming the cause is the honest answer, because the fix is a gateway build
+# and no amount of retrying substitutes for it.
+_GATEWAY_PENDING = frozenset({"queued"})
+
+# `failed` on a 200 would contradict the status code, but the gateway's
+# published enum allows it and the honest reading is the status, not the code:
+# a message the gateway says failed did not go out. Kept separate from the
+# unknown-status path so the error says what happened rather than that this
+# version cannot tell.
+_GATEWAY_FAILED = frozenset({"failed"})
+
+# `received` belongs to an inbound message and should never come back from a
+# send. If it does, the message exists and has not been sent, which is the
+# same position as `queued` -- and the same frozen-entry problem, so it is
+# read the same way rather than as something this version has not been told.
+_GATEWAY_INBOUND = frozenset({"received"})
+
+# Every status the gateway's published enum declares, for the error that says
+# what this version understands.
+_known = sorted(_GATEWAY_SENT | _GATEWAY_PENDING | _GATEWAY_FAILED | _GATEWAY_INBOUND)
 
 BOLD = "BOLD"
 ITALIC = "ITALIC"
@@ -136,8 +201,33 @@ _INLINE_RULES: tuple[tuple[re.Pattern[str], str | None], ...] = (
 _RECURSIVE = frozenset({"BOLD+ITALIC", BOLD, STRIKETHROUGH, SPOILER, ITALIC})
 
 
-class SignalCliError(RuntimeError):
+class SignalSendError(RuntimeError):
+    """A Signal message did not go out. Nothing downstream may mark it sent."""
+
+
+class SignalCliError(SignalSendError):
     """signal-cli refused or failed. The message carries its stderr, scrubbed."""
+
+
+class SignalGatewayError(SignalSendError):
+    """The gateway refused the send, or could not be reached."""
+
+
+class SignalSendPending(SignalSendError):
+    """The gateway accepted the message and Signal had not taken it yet.
+
+    A sibling of `SignalGatewayError` rather than a kind of it, because the
+    obvious consumer -- `except SignalGatewayError:  # refused, give up` --
+    would otherwise swallow the one case that is not a refusal. The message
+    may still arrive. A run-and-exit caller cannot wait to find out, so it
+    must neither mark the signal delivered nor report success: the next run
+    resubmits it under the same idempotency key, which waits on the message
+    already in flight instead of sending a second one.
+
+    That promise is bounded by the gateway's `idempotency_ttl_s`, 24 hours by
+    default. A caller whose runs are further apart than the TTL gets a fresh
+    key for the same content, and the resubmit then posts a second copy.
+    """
 
 
 def _units(text: str) -> int:
@@ -401,7 +491,7 @@ def _split_bytes(text: str, limit: int) -> list[tuple[str, int]]:
     style ranges rather than capacity.
     """
     if limit < 1:
-        raise SignalCliError(
+        raise SignalSendError(
             f"signal message split asked for parts of {limit} bytes; "
             "a footer or a marker has eaten the whole message"
         )
@@ -435,6 +525,12 @@ def _clip(
     return retval
 
 
+def _short_digest(text: str) -> str:
+    """A few bytes of hash, to tell two configurations apart inside a key."""
+    retval = hashlib.sha256(text.encode("utf-8")).hexdigest()[:8]
+    return retval
+
+
 def _as_text(value: object) -> str:
     """Whatever a subprocess attribute holds, as a string."""
     if value is None:
@@ -444,6 +540,42 @@ def _as_text(value: object) -> str:
     else:
         retval = str(value)
     return retval
+
+
+class Transport(Protocol):
+    """What `post_message` needs from whatever carries the message.
+
+    `limit` belongs to the transport rather than to the splitter because only
+    the transport knows what the text will be wrapped in: the gateway may put
+    a label in front of every message, and those bytes come out of the same
+    2000.
+    """
+
+    limit: int
+    # Whether a resubmitted part is deduplicated by the far side. False for
+    # signal-cli, which has nothing to deduplicate against, so a retry after
+    # a partial send posts the earlier parts a second time. `post_message`
+    # tells a caller which of those two situations it is in rather than
+    # asserting the safe one for both.
+    idempotent: bool
+
+    def send(
+        self, text: str, ranges: list[tuple[int, int, str]], seed: str = ""
+    ) -> int | str:
+        """Send one rendered message; return the handle it is addressed by.
+
+        `seed` identifies *which* message this is, independently of how it
+        reads. A transport that deduplicates resubmits needs that: see
+        `GatewayTransport._key`. A transport that does not may ignore it.
+
+        Which handle depends on the transport, and neither is interchangeable
+        with the other: signal-cli hands back Signal's own timestamp, an int,
+        which is what an edit through signal-cli would take. The gateway hands
+        back its own `message_id`, a string, which is what its edit, delete
+        and reaction endpoints take -- it keeps the Signal timestamp itself. A
+        zero means the message went out and the transport did not say which.
+        """
+        ...
 
 
 class SignalTransport:
@@ -465,6 +597,8 @@ class SignalTransport:
         self.group_id = group_id
         self.binary = binary
         self.timeout = timeout
+        self.limit = SIGNAL_MESSAGE_LIMIT
+        self.idempotent = False
 
     def _scrub(self, text: str) -> str:
         """Keep the account, the group and any phone number out of what we raise.
@@ -483,8 +617,13 @@ class SignalTransport:
         retval = _NUMBER_RE.sub("<number>", retval)
         return retval
 
-    def send(self, text: str, ranges: list[tuple[int, int, str]]) -> int:
+    def send(
+        self, text: str, ranges: list[tuple[int, int, str]], seed: str = ""
+    ) -> int:
         """Send one already-rendered message. Returns its Signal timestamp.
+
+        `seed` is accepted and ignored: signal-cli has nothing to deduplicate
+        a resubmit against, which is what `idempotent = False` says.
 
         That timestamp *is* the message id in Signal -- the counterpart of a
         Slack `ts`, and the only handle an edit could later be made with. A
@@ -556,13 +695,610 @@ class SignalTransport:
         return 0
 
 
-def transport_from_config(cfg: dict, label: str, timeout: int = 120) -> SignalTransport:
+class GatewayTransport:
+    """Where a Signal message goes: one conversation, through voitta-gateway.
+
+    The gateway owns the Signal account. Only one process can, so this and
+    `SignalTransport` are alternatives rather than layers: once the gateway's
+    daemon holds the account, the subprocess path cannot open it.
+
+    Three things are deliberately not here. The group id never appears -- the
+    gateway maps an alias such as `leads` to it, so a private conversation's
+    id does not travel to its consumers or into their logs. The token is read
+    from a 0600 file rather than the environment, because a run spawns LLM
+    CLIs as children and a variable in the environment is visible to all of
+    them. And nothing polls for delivery: a run-and-exit caller cannot wait,
+    so it asks the gateway to wait instead.
+    """
+
+    def __init__(
+        self,
+        base_url: str,
+        conversation: str,
+        token: str,
+        label: str = "",
+        wait_s: int = 10,
+        timeout: int = 120,
+        fingerprint: str = "",
+        repeats: bool = False,
+    ):
+        self.base_url = base_url.rstrip("/")
+        self.conversation = conversation
+        self.label = label
+        self.wait_s = wait_s
+        self.timeout = timeout
+        self._token = token
+        # Which destination this is, as far as anything stable can say. See
+        # `_key`: the gateway's idempotency store is namespaced by consumer,
+        # so two destinations behind one token need to differ here.
+        self.fingerprint = fingerprint
+        # Whether this destination deliberately sends the same signal more
+        # than once. See `_key`: it decides whether the gateway's replay of
+        # an earlier message is the retry this design wants or a delivery
+        # quietly dropped.
+        self.repeats = repeats
+        self.idempotent = not repeats
+        # One value per process, so every part of every message in this run
+        # shares it and a retry within the run would still match.
+        self._run = f"{int(time()):x}-{os.getpid():x}"
+        # A label is prepended by the gateway to every message it sends, so
+        # its bytes are not available to the body. `_bytes` and not `len`,
+        # for the reason the whole module says.
+        #
+        # This value only *mirrors* the gateway's: the prefix comes from its
+        # own `consumers.<name>.label`, no endpoint reports that back, and the
+        # gateway re-checks the length after prefixing. So a label configured
+        # there and missing here means every full-size part is refused with
+        # 422 `too_long` -- which `send` names as a likely cause, because the
+        # arithmetic looks right from this side and the mismatch is the only
+        # thing that explains it.
+        self.limit = SIGNAL_MESSAGE_LIMIT - (_bytes(f"{label}: ") if label else 0)
+
+    def _scrub(self, text: str) -> str:
+        """Keep the token out of whatever this raises.
+
+        Less to hide than the subprocess transport -- there is no account
+        number or group id here, by design -- but a gateway that echoed a bad
+        Authorization header back would otherwise put the token in a
+        traceback, a log and any issue it is pasted into.
+        """
+        retval = text
+        if self._token:
+            retval = retval.replace(self._token, "<token>")
+        retval = _NUMBER_RE.sub("<number>", retval)
+        return retval
+
+    def _warn_replayed(self, status: str, seed: str) -> None:
+        """Say that the gateway replayed a message rather than sending one.
+
+        The gateway found this idempotency key in its store and answered with
+        the earlier message's outcome; nothing new went out. For the retry
+        this design asks for, that is exactly right. For a caller sending the
+        same signal twice inside `idempotency_ttl_s` it is a silent no-op
+        reported as success, and the flag is the only evidence either way --
+        so it is said out loud, from one place, before any of `send`'s
+        returns.
+        """
+        keyed = (
+            f"the id {seed!r} this part was sent under"
+            if seed
+            else "derived from this part's text and styles"
+        )
+        print(
+            f"signal gateway replayed an earlier message for this part "
+            f"(duplicate=true, status {status or 'unreported'!r}); nothing new was sent. "
+            f"The key is {keyed}, and the gateway remembers it for its idempotency TTL -- "
+            f"so a deliberate repeat, as opposed to a retry, keeps being replayed until "
+            f"that TTL expires"
+            + (
+                ", and editing the message will not change that, because the key does "
+                "not depend on the text"
+                if seed
+                else ""
+            ),
+            file=sys.stderr,
+        )
+
+    def _key(
+        self,
+        text: str,
+        ranges: list[tuple[int, int, str]],
+        seed: str = "",
+        salt: str = "",
+    ) -> str:
+        """An idempotency key for this message to this conversation.
+
+        The retry a `SignalSendPending` asks for has to carry the same key as
+        the send it is retrying, or the gateway has nothing to match and the
+        parts that did arrive are posted again.
+
+        So `seed` is preferred over the content when a caller supplies one,
+        because the content is not stable across runs in this framework: a
+        retry re-scores, `llm_scorer` appends the rung the vendor waterfall
+        landed on to its reasons, and the destination renders those reasons
+        into the text. A different rung, or any drift in a model's wording,
+        changes the text and therefore a content-derived key -- and the part
+        that already reached the group is sent a second time. A signal's `id`
+        does not move for either reason.
+
+        The material also holds this transport's `fingerprint`, a digest of
+        the workspace it was built in, and the seed `post_message` builds
+        carries a digest of the footer. Both are there because the
+        gateway namespaces its idempotency store by consumer, not by
+        destination: two destinations sharing one gateway token and one
+        conversation are one consumer to it, so the same signal would
+        otherwise produce the same key from both, and the second one's
+        message -- its own footer, its own reasons -- would come back as a
+        replay of the first, reported as delivered and never sent. The footer
+        alone does not settle it, since an empty or shared footer is exactly
+        the case that collides; the workspace does, and it is stable against
+        the config edits an operator makes while chasing a failure. Two
+        destinations with the same footer in one workspace and one
+        conversation still collide -- and are the same message to the same
+        people, the one case where a replay is the right answer. Beyond that,
+        give each agent its own gateway consumer and token, which is what the
+        namespacing is for.
+
+        The seed `post_message` builds is
+        `<id>@<footer digest>#<number>-of-<total>`, optionally with a run
+        nonce (see `repeats`), and the total is in it on purpose. A key that
+        named only the part number would match across runs that split
+        differently, and the worse direction of
+        that is silent: a retry whose text shortened into one part would carry
+        the key of the old part 1, the gateway would replay that part, this
+        side would read a 200 and mark the signal delivered, and everything
+        that had been in part 2 would never be sent. Including the total means
+        a different split is a different message, which is what it is.
+
+        What remains, and is the lesser of the two: a retry that splits the
+        same way but reads differently matches the parts that already arrived,
+        so the group keeps the first run's wording for those and takes the new
+        wording for the rest. Nothing is lost -- the same signal is described
+        either way -- and it is strictly better than a duplicate or a hole.
+
+        `salt` moves a key off an entry the gateway can no longer honour --
+        see the `message_gone` branch in `send`. It is not a retry knob: the
+        whole value of the key is that a retry reuses it.
+
+        Without a seed it falls back to the content, which is right for a
+        caller that has no stable id to offer. The digest covers the styles as
+        well as the text, since two parts of one message can hold the same
+        words under different emphasis.
+        """
+        if seed and self.repeats:
+            # A source that re-lists the same items every run means to send
+            # them again, and the gateway cannot tell that from a retry: both
+            # arrive as the same key inside its 24-hour window, and it
+            # answers the second one by replaying the first. Reported as
+            # delivered, never sent. So a destination that repeats itself
+            # gets a key that is unique per run, and gives up the
+            # cross-run retry guarantee in exchange -- which is the trade
+            # `idempotent` then reports, so a partial send says that
+            # resubmitting repeats the parts that arrived.
+            seed = f"{seed}!{self._run}"
+        material = json.dumps(
+            [self.conversation, self.label, self.fingerprint, salt, seed] if seed
+            else [self.conversation, self.label, self.fingerprint, salt, text, ranges],
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+        retval = hashlib.sha256(material.encode("utf-8")).hexdigest()
+        return retval
+
+    def send(
+        self, text: str, ranges: list[tuple[int, int, str]], seed: str = ""
+    ) -> int | str:
+        """Send one rendered message, waiting for Signal to take it.
+
+        `seed` identifies the message independently of how it reads, and is
+        what the idempotency key is built from when a caller gives one. See
+        `_key`.
+
+        Returns the gateway's `message_id` on a 200. Raises on anything else,
+        so a caller that marks a signal delivered only when this returns can
+        never mark one that did not arrive:
+
+        - 200 means the message left, under any of `_GATEWAY_SENT`, or --
+          from a build without `wait_s` -- that it has not left yet, under
+          `_GATEWAY_PENDING`. A 200 carries no Signal timestamp: the gateway
+          keeps that and addresses the message by `message_id`, which is what
+          its edit, delete and reaction endpoints take. A `duplicate` flag
+          means the key was found in the gateway's idempotency store and the
+          earlier outcome replayed, so nothing new was sent.
+        - 502 means the send was refused for good; retrying it is pointless
+          until whatever was wrong is fixed.
+        - 202 means it was still in flight when the gateway's own deadline
+          passed, which includes a retry of a message still in flight. Not a
+          failure and not a success, so it raises `SignalSendPending` and the
+          next run resubmits the same key.
+        """
+        # The ranges go in as offsets into the text as submitted, not
+        # shifted for a label. The gateway rebases them itself when it
+        # prefixes one -- `_labelled` adds `units(prefix)` to every style and
+        # mention start -- so adjusting here would move them twice. Only the
+        # label's *bytes* are this side's business, in `limit`.
+        payload = {
+            "to": {"conversation": self.conversation},
+            "parts": [
+                {
+                    "type": "text",
+                    "text": text,
+                    "styles": [
+                        {"start": start, "length": length, "style": style}
+                        for start, length, style in ranges
+                    ],
+                }
+            ],
+            "idempotency_key": self._key(text, ranges, seed),
+            "wait_s": self.wait_s,
+        }
+        response = self._post(payload)
+        if response.status_code == 409 and "message_gone" in (response.text or ""):
+            # The gateway still holds this idempotency key but has lost the
+            # message it names -- its data was reset, or a retention it did
+            # not have yet removed the row. The key is derived, so every run
+            # would compute it again and get this same 409 until it expires:
+            # a message that is not delivered and, from this side, cannot be.
+            # So the key is moved once, deliberately, and the send retried.
+            # The cost is a duplicate if the original did reach the group
+            # before the reset; the alternative is a silent gap for the rest
+            # of the TTL, and a duplicate someone can see is the better of
+            # the two. Once, not in a loop: a second `message_gone` under a
+            # fresh key is a gateway problem, not a key problem.
+            print(
+                "signal gateway lost the message behind this idempotency key "
+                "(message_gone); sending once more under a fresh key, which may "
+                "duplicate it if the original went out before the gateway's data was "
+                "reset",
+                file=sys.stderr,
+            )
+            payload["idempotency_key"] = self._key(text, ranges, seed, salt="message_gone")
+            response = self._post(payload)
+        said = self._scrub((response.text or "").strip())
+        tail = said[-400:]
+        return self._read(response, said, tail, seed)
+
+    def _post(self, payload: dict) -> requests.Response:
+        """One POST to the gateway, with every failure shape classified."""
+        try:
+            response = requests.post(
+                f"{self.base_url}/v1/messages",
+                json=payload,
+                headers={"Authorization": f"Bearer {self._token}"},
+                timeout=self.timeout,
+            )
+            return response
+        except requests.ConnectTimeout as exc:
+            # No connection was established, so nothing was sent.
+            # Not `from exc`: a requests exception renders the request, and
+            # the Authorization header is on it.
+            raise SignalGatewayError(
+                f"signal gateway at {self.base_url} did not accept a connection within "
+                f"{self.timeout}s; nothing was sent: {self._scrub(str(exc))[-300:]}"
+            ) from None
+        except (requests.exceptions.SSLError, requests.exceptions.ProxyError) as exc:
+            # Both are `ConnectionError` subclasses and would otherwise be
+            # caught below as pending. They are not ambiguous: a handshake
+            # that failed or a proxy that refused the tunnel means the request
+            # never went, and reporting a misconfigured certificate as a
+            # message possibly in flight would hide it run after run.
+            raise SignalGatewayError(
+                f"signal gateway at {self.base_url} could not be reached securely, so "
+                f"nothing was sent: {self._scrub(str(exc))[-300:]}"
+            ) from None
+        except (
+            requests.ReadTimeout,
+            requests.ConnectionError,
+            requests.exceptions.ChunkedEncodingError,
+        ):
+            # Everything else that fails around a connection leaves the
+            # message in doubt: a read deadline passing, a gateway restarting
+            # or a proxy resetting while it holds the response for `wait_s`, a
+            # truncated body, a refused connection. The window the gateway
+            # spends holding a reply is exactly where a restart lands, and
+            # `requests` raises one class for a reset at that moment and for a
+            # port that was never open -- telling them apart means reading
+            # urllib3's cause chain, which is not worth depending on for a
+            # message's wording. Pending is the answer that is true either
+            # way: it marks nothing and resubmits under the same key, which
+            # the gateway matches if the message did get through, and which is
+            # also what a caller should do when the gateway is simply down.
+            raise SignalSendPending(
+                f"the exchange with the signal gateway at {self.base_url} did not complete "
+                f"within {self.timeout}s. If the request reached it the message may be "
+                f"queued, so it stays unmarked and the next run resubmits it under the "
+                f"same key"
+            ) from None
+        except requests.RequestException as exc:
+            raise SignalGatewayError(
+                f"signal gateway at {self.base_url} did not answer: "
+                f"{self._scrub(str(exc))[-400:]}"
+            ) from None
+        # Matched on the whole body and truncated only for display: a 422
+        # that echoes the part it refused pushes the marker out of a 400-byte
+        # tail, and the one failure this transport can explain would fall
+        # through to the generic relay.
+    def _read(
+        self, response: requests.Response, said: str, tail: str, seed: str
+    ) -> int | str:
+        """What the gateway's answer means. See `send` for the contract."""
+        if response.status_code == 202:
+            raise SignalSendPending(
+                f"signal gateway queued the message but Signal had not taken it within "
+                f"{self.wait_s}s; it is not delivered and not failed, so it stays unmarked "
+                f"and the next run resubmits it: {tail}"
+            )
+        if response.status_code == 422 and "too_long" in said:
+            # The arithmetic on this side reserved room for `self.label`. If
+            # the gateway still finds the part too long, the label it is
+            # actually configured with is longer than the one named here --
+            # it re-checks after prefixing, and nothing reports its value
+            # back, so this is the one failure worth explaining rather than
+            # relaying.
+            raise SignalGatewayError(
+                f"signal gateway refused a part as too long although this side split at "
+                f"{self.limit} bytes, reserving room for the label {self.label!r}. The "
+                f"gateway prefixes its own consumers.<name>.label and re-checks the length "
+                f"afterwards, so that label is probably longer than this one, or set when "
+                f"this config has none: {tail}"
+            )
+        if response.status_code == 502 and "send_failed" in said:
+            raise SignalGatewayError(
+                f"signal gateway answered 502 send_failed, refusing the message for "
+                f"good: {tail}"
+            )
+        if response.status_code >= 500:
+            # Not a refusal. The gateway's own "refused for good" is a 502
+            # carrying `send_failed`, handled above; any other 5xx is a
+            # gateway that crashed or a proxy that gave up, and it lands in
+            # the window the gateway spends holding the response for
+            # `wait_s` -- the same ambiguity the connection branch above
+            # treats as pending, and for the same reason: the message may
+            # already be enqueued.
+            raise SignalSendPending(
+                f"signal gateway answered {response.status_code}, which is not its own "
+                f"refusal. The message may already be queued, so it stays unmarked and "
+                f"the next run resubmits it under the same key: {tail}"
+            )
+        if response.status_code != 200:
+            raise SignalGatewayError(
+                f"signal gateway answered {response.status_code}: {tail}"
+            )
+        try:
+            body = response.json()
+        except ValueError:
+            raise SignalGatewayError(
+                f"signal gateway answered 200 with a body that is not JSON: {tail}"
+            ) from None
+        if not isinstance(body, dict):
+            raise SignalGatewayError(f"signal gateway answered 200 with {type(body).__name__}")
+        status = str(body.get("status") or "")
+        if body.get("duplicate"):
+            self._warn_replayed(status, seed)
+        if not status:
+            # Absent, null or empty: all three are the gateway not saying,
+            # which is not the same as saying something this version does not
+            # know. The same rule applies as to a missing `message_id`: a 200
+            # is the gateway saying the message left, and raising over a field
+            # it did not fill would discard a delivered message's mark and
+            # post it again next run -- or, once the idempotency store
+            # replays this same statusless 200, fail identically every run
+            # until the TTL expires and then duplicate. The handle is still
+            # returned if there is one; only the status was missing.
+            retval = str(body.get("message_id") or "") or 0
+            return retval
+        if status in _GATEWAY_FAILED:
+            raise SignalGatewayError(
+                f"signal gateway answered 200 but reports the message {status!r}; it did "
+                f"not go out: {tail}"
+            )
+        if status in _GATEWAY_PENDING or status in _GATEWAY_INBOUND:
+            raise SignalGatewayError(
+                f"signal gateway answered 200 with status {status!r}, which means the "
+                f"message has not left and it did not honour the {self.wait_s}s wait this "
+                f"send asked for -- an older build. "
+                f"The message may well have gone out, but this cannot be established from "
+                f"here: the gateway's idempotency entry keeps the status it was written "
+                f"with, so resubmitting replays this same answer until the entry expires "
+                f"and then sends a second copy. Check the conversation by hand and deploy "
+                f"a gateway that implements wait_s: {tail}"
+            )
+        if status not in _GATEWAY_SENT:
+            raise SignalGatewayError(
+                f"signal gateway answered 200 with status {status!r}, which this "
+                f"version does not know how to read; it knows {', '.join(_known)}: {tail}"
+            )
+        handle = str(body.get("message_id") or "")
+        if not handle:
+            # Delivered, id unknown: the same call the subprocess transport
+            # makes when signal-cli accepts a message without naming it.
+            # Raising here would discard a delivered message's mark and post
+            # it again next run.
+            return 0
+        retval = handle
+        return retval
+
+
+def _read_token_file(path: str, label: str) -> str:
+    """The token in a 0600 file, refusing one anybody else can read.
+
+    The mode is checked rather than assumed: a token readable by another
+    account is a token to treat as disclosed, and the moment to notice is
+    before the run starts rather than after it has posted.
+    """
+    try:
+        # O_NOFOLLOW, and the mode read from the descriptor rather than the
+        # path: `os.stat` follows a symlink, so a world-writable link to a
+        # 0600 file would pass a check on the target. Opening first and
+        # calling fstat also closes the gap between checking a path and
+        # reading it. The open is inside the guard because a file that stats
+        # and will not open -- 0400 owned by another account, root-owned, a
+        # directory at that path -- is exactly the early, labelled failure
+        # this function exists to produce.
+        # O_NONBLOCK so a FIFO at this path fails instead of hanging the run
+        # with no timeout: the regular-file check below cannot run until the
+        # open returns, and on a FIFO it never would.
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError as exc:
+        raise RuntimeError(
+            f"{label}: cannot read 'token_file' {path!r}: {exc.strerror}"
+            + (". A symbolic link is not accepted here" if exc.errno == errno.ELOOP else "")
+        ) from None
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            # Checked on the descriptor before anything wraps it: a directory
+            # opens happily with O_RDONLY and it is `fdopen` that raises, as a
+            # bare IsADirectoryError naming neither the label nor the setting.
+            raise RuntimeError(f"{label}: 'token_file' {path!r} is not a regular file")
+        leaked = stat.S_IMODE(info.st_mode) & (stat.S_IRWXG | stat.S_IRWXO)
+        if leaked:
+            raise RuntimeError(
+                f"{label}: 'token_file' {path!r} is mode {stat.S_IMODE(info.st_mode):04o}; it "
+                "holds a send credential and must be 0600, readable only by the account that "
+                "runs the agent. Fix it with chmod 600 and, since it was readable, have the "
+                "token reissued"
+            )
+        # Handed over before the call, not inside the `with`: if `fdopen`
+        # raises, it has already closed the descriptor, and the `finally`
+        # below would close it a second time -- an EBADF masking the real
+        # failure, or a close of a number since reused by another thread.
+        owned, fd = fd, -1
+        with os.fdopen(owned, "rb") as handle:
+            retval = handle.read().decode("utf-8").strip()
+    finally:
+        if fd >= 0:
+            os.close(fd)
+    if not retval:
+        raise RuntimeError(f"{label}: 'token_file' {path!r} is empty")
+    return retval
+
+
+def _gateway_from_config(cfg: dict, label: str, timeout: int) -> GatewayTransport:
+    """Build the gateway transport a destination block asks for."""
+    gateway = cfg.get("gateway")
+    if not isinstance(gateway, dict):
+        raise RuntimeError(
+            f"{label}: transport 'gateway' needs a 'gateway' block with 'url', "
+            "'conversation' and 'token_file'"
+        )
+    url = str(gateway.get("url") or "")
+    conversation = str(gateway.get("conversation") or "")
+    token_file = str(gateway.get("token_file") or "")
+    missing = [
+        name
+        for name, value in (
+            ("url", url),
+            ("conversation", conversation),
+            ("token_file", token_file),
+        )
+        if not value
+    ]
+    if missing:
+        raise RuntimeError(f"{label}: gateway block is missing: {', '.join(missing)}")
+    if not url.startswith(("http://", "https://")):
+        # `requests` raises MissingSchema on the first send otherwise, which
+        # is after the run has fetched, scored and paid for a model call. The
+        # same fail-early rule this function applies to 'wait_s'.
+        raise RuntimeError(
+            f"{label}: gateway 'url' is {url!r}, which has no scheme; it needs "
+            "http:// or https://"
+        )
+    repeats = gateway.get("repeats", False)
+    if not isinstance(repeats, bool):
+        raise RuntimeError(f"{label}: gateway 'repeats' must be true or false")
+    message_label = gateway.get("label", "")
+    if not isinstance(message_label, str):
+        raise RuntimeError(f"{label}: gateway 'label' must be a string")
+    try:
+        wait_s = int(gateway.get("wait_s", 10))
+    except (TypeError, ValueError):
+        # The gateway answers 422 `bad_wait` for this, but only after the run
+        # has been built and has fetched and scored something. A config value
+        # that is not a number is knowable now.
+        raise RuntimeError(
+            f"{label}: gateway 'wait_s' is {gateway.get('wait_s')!r}, which is not a number"
+        ) from None
+    if not 1 <= wait_s <= 30:
+        # The gateway caps its own wait at 30. A larger number here would be
+        # silently clamped there, which is a config file that does not say
+        # what happens.
+        raise RuntimeError(
+            f"{label}: gateway 'wait_s' is {wait_s}; it must be between 1 and 30, "
+            "which is the gateway's own cap"
+        )
+    if timeout < wait_s + _WAIT_MARGIN:
+        # The gateway holds the response for up to `wait_s`. A socket timeout
+        # at or under that fires first, and a send still in flight then comes
+        # back as "the gateway did not answer" -- a refusal -- instead of the
+        # pending answer it is. Marking the difference matters: one says do
+        # not retry, the other says retry under the same key.
+        raise RuntimeError(
+            f"{label}: 'timeout' is {timeout}s and gateway 'wait_s' is {wait_s}s. The "
+            f"request timeout has to outlast the wait by at least {_WAIT_MARGIN}s, or a "
+            f"gateway answering a moment after its own deadline times out the socket "
+            f"instead, and a message still in flight is read as a failed send"
+        )
+    # Which destination this is, as one short digest: see
+    # `GatewayTransport._key`. The workspace alone, not the whole block --
+    # the block holds tuning that an operator changes in response to a
+    # failure, and `wait_s` is the first thing they would raise after a 202.
+    # Hashing that in would mean the fix for a pending part changes the key
+    # of the parts that already arrived and posts them again, which is the
+    # outcome the key exists to prevent. `cli.py` injects `_workspace` into
+    # every destination block, and two destinations in one workspace are
+    # told apart by the footer in the seed.
+    fingerprint = _short_digest(str(cfg.get("_workspace") or ""))
+    token = _read_token_file(token_file, label)
+    retval = GatewayTransport(
+        base_url=url,
+        conversation=conversation,
+        token=token,
+        label=message_label,
+        wait_s=wait_s,
+        timeout=timeout,
+        fingerprint=fingerprint,
+        repeats=repeats,
+    )
+    if _bytes(message_label) > _MAX_LABEL_BYTES:
+        # Bounded rather than merely checked for leaving a positive remainder.
+        # A limit a little above the marker reservation is not safe: once a
+        # message needs more than one part the splitter re-splits at
+        # `limit - _MARKER_ROOM`, so a remainder of a few dozen bytes yields
+        # parts of one or two characters, each of which passes every per-part
+        # check while one message becomes hundreds of them and the run reports
+        # success. A label is a prefix on every message, not content, so the
+        # honest bound is on the label itself.
+        raise RuntimeError(
+            f"{label}: gateway 'label' is {_bytes(message_label)} bytes, over the "
+            f"{_MAX_LABEL_BYTES} allowed. It is prefixed to every message and comes out of "
+            f"the same {SIGNAL_MESSAGE_LIMIT}-byte limit, and a label long enough to crowd "
+            f"the message splits one into hundreds of tiny ones that each look fine"
+        )
+    return retval
+
+
+def transport_from_config(cfg: dict, label: str, timeout: int = 120) -> Transport:
     """Build the transport a destination block asks for.
 
-    Both values are named by env var, never written in config: the account is a
-    phone number and the group id identifies a private conversation, and this
-    repo's examples are public.
+    Two kinds. `transport: gateway` sends through voitta-gateway, which owns
+    the account; anything else drives the signal-cli binary directly. They are
+    exclusive, not layered: only one process can hold a Signal account, so the
+    cutover is a config flip rather than a fallback chain, and a fallback would
+    be a second process trying to open an account the gateway already has.
+
+    For the subprocess transport both values are named by env var, never
+    written in config: the account is a phone number and the group id
+    identifies a private conversation, and this repo's examples are public.
     """
+    kind = str(cfg.get("transport") or "signal-cli")
+    if kind == "gateway":
+        retval = _gateway_from_config(cfg, label, timeout)
+        return retval
+    if kind != "signal-cli":
+        raise RuntimeError(
+            f"{label}: unknown transport {kind!r}; it is 'signal-cli' or 'gateway'"
+        )
     account_env = cfg.get("account_env")
     group_env = cfg.get("group_id_env")
     if not account_env or not group_env:
@@ -590,20 +1326,34 @@ def transport_from_config(cfg: dict, label: str, timeout: int = 120) -> SignalTr
 
 
 def post_message(
-    transport: SignalTransport,
+    transport: Transport,
     text: str,
     footer: str = "",
-    limit: int = SIGNAL_MESSAGE_LIMIT,
-) -> list[int]:
+    limit: int | None = None,
+    seed: str = "",
+) -> list[int | str]:
     """Post Markdown to Signal, splitting it if it is too long.
 
-    Returns the timestamp of every message sent, in order; a zero is a message
-    that went out under an id signal-cli did not report. The footer rides on
+    Returns the handle of every message sent, in order -- a Signal timestamp
+    from the subprocess transport, a gateway `message_id` from the gateway
+    one, and a zero for a message that went out under an id the transport did
+    not report.
+
+    `seed` is a caller-stable id for the message -- a signal's `id`, not
+    anything derived from the rendered text -- and each part is sent under
+    `<seed>@<footer digest>#<number>-of-<total>`. A transport that
+    deduplicates resubmits uses it to recognise a part it has already taken,
+    which the text cannot do here because a retry re-scores and the score's
+    reasons are rendered into it. The total is part of it so that a retry
+    which splits differently is a different message rather than a partial
+    match, and the footer tells two destinations apart; see
+    `GatewayTransport._key` for what each of those prevents. The footer rides on
     each part, as it does on Slack, because a standing line that appears on
     only the last part of three is a line a reader can miss -- and it is
     appended after the conversion, so it arrives as the characters it was
     written with.
     """
+    limit = transport.limit if limit is None else limit
     check_footer(footer, limit=limit)
     rendered, ranges = to_signal(text)
     tail = f"\n{footer}" if footer else ""
@@ -614,7 +1364,7 @@ def post_message(
         # marker rather than letting it push a part over the limit.
         pieces = _split_bytes(rendered, room - _MARKER_ROOM)
     total = len(pieces)
-    timestamps: list[int] = []
+    timestamps: list[int | str] = []
     for number, (piece, offset) in enumerate(pieces, 1):
         body = piece
         styles = _clip(ranges, offset, _units(piece))
@@ -629,17 +1379,39 @@ def post_message(
             # measures the assembled part instead of predicting it, so a slip
             # is a loud failure naming the size rather than a message Signal
             # rejects or truncates without saying so.
-            raise SignalCliError(
+            raise SignalSendError(
                 f"signal message part {number} of {total} assembled to {_bytes(body)} "
                 f"bytes, over the {limit}-byte limit; refusing to send it"
             )
         try:
-            timestamps.append(transport.send(body, styles))
-        except SignalCliError as exc:
+            timestamps.append(
+                transport.send(
+                    body,
+                    styles,
+                    f"{seed}@{_short_digest(footer)}#{number}-of-{total}" if seed else "",
+                )
+            )
+        except SignalSendError as exc:
             if timestamps:
-                raise SignalCliError(
-                    f"part {number} of {total} failed after {len(timestamps)} of them "
-                    f"reached the group, which now holds an incomplete message: {exc}"
+                # The same class, not a fixed one: a part left pending by the
+                # gateway and a part refused outright are different answers,
+                # and a caller deciding whether to retry needs the one it
+                # got. Flattening both to `SignalCliError` here would tell a
+                # retrying caller that a message still in flight had failed,
+                # and "failed" is the word that stops it resubmitting.
+                resubmit = (
+                    "Resubmitting does not repeat the parts that arrived, as long as the "
+                    "retry splits into the same number of parts: their idempotency keys "
+                    "name that total, so a retry whose text renders shorter or longer is "
+                    "a different message and does post them again"
+                    if getattr(transport, "idempotent", False)
+                    else "Resubmitting repeats the parts that did reach the group, because "
+                    "this transport has no idempotency key for the far side to match"
+                )
+                raise type(exc)(
+                    f"part {number} of {total} did not go out after {len(timestamps)} of "
+                    f"them reached the group, which now holds an incomplete message. "
+                    f"{resubmit}: {exc}"
                 ) from exc
             raise
     retval = timestamps

@@ -701,6 +701,181 @@ an unregistered account or a group id this account is not in costs a subprocess
 and the account lock to verify, so it is left to fail on the first send rather
 than on every run that sends nothing.
 
+#### Two transports, because only one process can hold the account
+
+`transport` picks how the message leaves. The default, `signal-cli`, is the
+subprocess above. `gateway` sends through voitta-gateway, a service that owns
+the account and serves every agent behind one daemon:
+
+```json
+"destination": {
+  "type": "signal-messenger",
+  "transport": "gateway",
+  "gateway": {
+    "url": "http://127.0.0.1:<port>",
+    "conversation": "<alias>",
+    "token_file": "<workspace>/gateway-token",
+    "label": "<the label the gateway prefixes, or omitted>",
+    "repeats": false,
+    "wait_s": 10
+  },
+  "min_score": 10
+}
+```
+
+They are exclusive and the switch is a flip, not a fallback. Once the
+gateway's daemon holds the account the subprocess path cannot open it, so a
+transport that fell back to `signal-cli` would be a second process contending
+for an account another already has — it would hang and then drop the message,
+which is worse than refusing.
+
+**The group id is not in this block.** `conversation` is an alias the gateway
+maps to the real conversation, so a private group's id stays in the gateway's
+own config and never reaches a consumer, a consumer's logs or a failure it
+raises. That is the whole reason for the alias.
+
+**The token is a file, not an env var.** Two reasons, and the second is the
+one that decided it: a scheduled run reads the environment launchd gives it
+rather than a login shell's, and a variable in the environment is inherited by
+every child the run spawns — and these runs spawn LLM CLIs. The file must be
+mode 0600; the build refuses a group- or world-readable one, names the mode it
+found, and says to have the token reissued, because a credential other
+accounts could read is a credential to treat as disclosed.
+
+**`wait_s` is what keeps "a clean exit means delivered" true.** The gateway
+answers `202 queued` the moment it accepts a message, and a queued message can
+still fail — as an event a run-and-exit agent has already exited before seeing.
+So the send asks the gateway to hold the response until Signal takes it:
+`200` means the message left, `502` means refused for good, and `202` means it
+was still in flight at the deadline, which includes a retry of a message still
+in flight. Only `200` returns; both others raise, so a caller that marks a
+signal delivered when the send returns can never mark one that did not arrive.
+A 5xx other than that 502 is pending rather than refused: the gateway's own
+refusal is a 502 carrying `send_failed`, and anything else in that range is a
+crash or a proxy giving up inside the window the gateway spends holding the
+reply, where the message may already be enqueued.
+
+**A 409 `message_gone` is retried once under a fresh key.** It means the
+gateway still holds the idempotency key but has lost the message it names --
+its data was reset, or a retention it did not have yet removed the row. The
+key is derived, so every run would compute it again and meet the same 409
+until it expires: a message that is not delivered and, from this side, cannot
+be. So the key is moved once, deliberately, and the send retried. The cost is
+a duplicate if the original did reach the group before the reset, and a
+duplicate someone can see is better than a silent gap for the rest of the TTL.
+Once only -- a second `message_gone` under a fresh key is a gateway problem,
+not a key problem -- and the stderr line says a duplicate is possible. No other
+409, `key_reused` included, is retried.
+
+A `200` whose status is `queued` means the gateway did not honour the wait at
+all -- an older build. That is a hard failure here rather than a pending one,
+because the gateway writes its idempotency entry when it accepts a message and
+only the wait loop ever reports a later status: the entry keeps saying
+`queued`, so every resubmit of that key replays the same answer until it
+expires and then sends a second copy. Retrying cannot resolve what a gateway
+build has to.
+
+A `200` carries no Signal timestamp. Its status is `sent`, `delivered`, `read`
+or `deleted` -- a retry arriving after Signal has acked sees `delivered` or
+`read`, and `deleted` is a message that went out and was then deleted -- and
+all four mean it left. The gateway's published enum has three more, each read
+by name rather than as something unrecognised: `failed` did not go out even
+under a 200, and `queued` or `received` mean it has not left, which is the
+frozen-entry case above. Anything outside the enum raises, naming what this
+version does know.
+The handle is the gateway's own `message_id`, which its edit, delete and
+reaction endpoints take; the gateway keeps the Signal timestamp itself. So
+`post_message` returns a `message_id` under this transport and a Signal
+timestamp under the other, and the two are not interchangeable. The pending case raises its own type,
+`SignalSendPending`, a sibling of the refusal rather than a kind of it,
+because `except SignalGatewayError` is what a caller writes to mean "refused,
+give up" and pending must not be caught by it. A read timeout after the request
+was sent is pending for the same reason -- the gateway may well have queued the
+message, so calling it a refusal would tell the caller not to retry something
+in flight. The HTTP timeout therefore has to outlast `wait_s` by a margin,
+checked when the config is read: a gateway answering a moment after its own
+deadline is answering 202, and losing that to a socket timeout produces exactly
+the confusion the distinction exists to avoid. The wait's cap is the gateway's,
+30 seconds; a larger number in config is refused here rather than silently
+clamped there.
+
+The next run resubmits under the same idempotency key, which waits on the
+message already in flight rather than sending a second copy. **That key is
+derived from the signal's id, not from the rendered text**, because the text is
+not stable across runs here: a retry re-scores, `llm_scorer` appends the rung
+the vendor waterfall landed on to its reasons, and the destination renders
+those reasons into the message. A different rung would mean a different key,
+and the part that already reached the group would be posted again -- the one
+outcome the key exists to prevent. Each part goes under
+`<signal id>@<footer digest>#<number>-of-<total>`, and a digest of the
+workspace goes into the key alongside it -- the workspace rather than the
+whole block, because the block holds tuning an operator changes while chasing
+a failure, and `wait_s` is the first thing they would raise after a 202.
+Hashing that in would mean the fix for a pending part changed the keys of the
+parts that already arrived and posted them again. Both are there because the
+gateway namespaces its idempotency store by consumer, not by destination: two
+destinations sharing one token and one conversation are one consumer to it, so
+the same signal would otherwise key identically from both, and the second
+one's message would come back as a replay of the first -- reported as
+delivered, never sent. The footer alone would not settle it, since an empty or
+shared footer is precisely the colliding case. Two destinations configured
+identically, in one conversation, sending one signal, still collide, and are
+the same message -- the one case where a replay is right. Beyond that, give
+each agent its own gateway consumer and token, which is what that namespacing
+is for. The total is in there deliberately too: a
+key naming only the part number would match across runs that split
+differently, and the worse direction of that is silent. A retry whose text
+shortened into one part would carry the old part 1's key, the gateway would
+replay that part, this side would read a 200 and mark the signal delivered,
+and everything that had been in part 2 would never be sent at all. Including
+the total makes a different split a different message, which is what it is.
+What remains is the lesser case: a retry that splits the same way but reads
+differently keeps the first run's wording for the parts that already arrived
+and takes the new wording for the rest. Nothing is lost -- the same signal is
+described either way. A caller with
+no stable id to offer falls back to hashing the text and its styles.
+
+Two bounds on the promise. It lasts as long as the gateway's
+`idempotency_ttl_s`, 24 hours by default, so an agent whose runs are further
+apart than the TTL gets a fresh key and the resubmit does post a second copy.
+And a caller that deliberately sends the same signal twice inside the TTL gets
+the earlier message's outcome replayed -- `duplicate: true`, reported as
+delivered, with nothing new sent; editing the message does not change that,
+since the key does not depend on the text. That is right for a retry and wrong for a
+repeat, and the two cannot be told apart from here, so the flag is written to
+stderr rather than swallowed. A source that re-lists the same items every run
+is the shape to watch.
+
+**A source that re-lists the same items every run needs `repeats: true`.**
+That is the one case the key cannot infer. A source with `dedupe: false` means
+to send the same signal again, and the gateway cannot tell that from a retry:
+both arrive under the same key inside its 24-hour window, and it answers the
+second by replaying the first -- reported as delivered, never sent, with only
+a line on stderr. `repeats: true` mixes a per-run value into the key, so each
+run is its own message. The trade is the cross-run retry guarantee: a
+repeating destination reports `idempotent = False`, and a partial send then
+says plainly that resubmitting repeats the parts that did arrive. Today no
+Signal destination is fed by a non-deduping source, so this is a trap rather
+than a live fault -- `meetups` is the only workspace with `dedupe: false` and
+it posts to Slack.
+
+One caveat on the exception types: `fanout` flattens a child destination's
+exception into a `RuntimeError`, so a `signal-messenger` behind it loses the
+pending-versus-refused distinction. No message is lost -- the run fails and the
+runner marks nothing -- but a caller cannot branch on it there.
+
+**`label` mirrors the gateway's own setting and has to match it.** The prefix
+is applied by the gateway from its `consumers.<name>.label`, and it re-checks
+the length *after* prefixing, so those bytes come out of the same 2000. No
+endpoint reports that value back, which makes this the one field here that
+duplicates state we do not own: a label set there and omitted here means every
+full-size part is refused with `422 too_long`, because the arithmetic looks
+correct from this side. So a 422 naming `too_long` says that explicitly rather
+than relaying the gateway's message — a mismatched label is the only thing that
+explains it. A label longer here than there is merely wasteful. `limit` belongs
+to the transport for this reason, and the footer is checked against the
+transport's limit rather than Signal's.
+
 **Signal takes plain text plus styled ranges, not markup.** Everything this
 repo sends goes through `framework/signal_messenger.py::post_message`, which is
 to Signal what `framework/slack.py` is to Slack: code that builds a message
