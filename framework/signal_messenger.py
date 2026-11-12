@@ -92,6 +92,11 @@ BULLET = "•"
 # marker is ASCII, so its width is the same number of bytes as characters.
 _MARKER_ROOM = 24
 
+# The longest label the gateway may be prefixing. "Leads: " is seven bytes;
+# this is room for a name, not for content. See `_gateway_from_config` for
+# what an unbounded one does to the splitter.
+_MAX_LABEL_BYTES = 64
+
 # How much longer than the gateway's own wait the HTTP timeout has to be. A
 # gateway that answers a moment after its deadline must still be heard: the
 # answer at that moment is a 202, and losing it to a socket timeout turns a
@@ -723,10 +728,24 @@ class GatewayTransport:
         retry re-scores, `llm_scorer` appends the rung the vendor waterfall
         landed on to its reasons, and the destination renders those reasons
         into the text. A different rung, or any drift in a model's wording,
-        changes the text and therefore the key -- and the part that already
-        reached the group is sent a second time, which is the one outcome this
-        key exists to prevent. A signal's `id` does not move for either
-        reason.
+        changes the text and therefore a content-derived key -- and the part
+        that already reached the group is sent a second time. A signal's `id`
+        does not move for either reason.
+
+        The seed `post_message` builds is `<id>#<number>-of-<total>`, and the
+        total is in it on purpose. A key that named only the part number would
+        match across runs that split differently, and the worse direction of
+        that is silent: a retry whose text shortened into one part would carry
+        the key of the old part 1, the gateway would replay that part, this
+        side would read a 200 and mark the signal delivered, and everything
+        that had been in part 2 would never be sent. Including the total means
+        a different split is a different message, which is what it is.
+
+        What remains, and is the lesser of the two: a retry that splits the
+        same way but reads differently matches the parts that already arrived,
+        so the group keeps the first run's wording for those and takes the new
+        wording for the rest. Nothing is lost -- the same signal is described
+        either way -- and it is strictly better than a duplicate or a hole.
 
         Without a seed it falls back to the content, which is right for a
         caller that has no stable id to offer. The digest covers the styles as
@@ -792,13 +811,22 @@ class GatewayTransport:
                 timeout=self.timeout,
             )
         except requests.ConnectTimeout as exc:
-            # No connection was established, so nothing was sent. The only
-            # shape here that can be called a refusal without guessing.
+            # No connection was established, so nothing was sent.
             # Not `from exc`: a requests exception renders the request, and
             # the Authorization header is on it.
             raise SignalGatewayError(
                 f"signal gateway at {self.base_url} did not accept a connection within "
                 f"{self.timeout}s; nothing was sent: {self._scrub(str(exc))[-300:]}"
+            ) from None
+        except (requests.exceptions.SSLError, requests.exceptions.ProxyError) as exc:
+            # Both are `ConnectionError` subclasses and would otherwise be
+            # caught below as pending. They are not ambiguous: a handshake
+            # that failed or a proxy that refused the tunnel means the request
+            # never went, and reporting a misconfigured certificate as a
+            # message possibly in flight would hide it run after run.
+            raise SignalGatewayError(
+                f"signal gateway at {self.base_url} could not be reached securely, so "
+                f"nothing was sent: {self._scrub(str(exc))[-300:]}"
             ) from None
         except (
             requests.ReadTimeout,
@@ -866,17 +894,19 @@ class GatewayTransport:
             ) from None
         if not isinstance(body, dict):
             raise SignalGatewayError(f"signal gateway answered 200 with {type(body).__name__}")
-        if "status" not in body or body["status"] is None:
-            # The same rule this module applies to a missing `message_id`
-            # below and to a signal-cli reply it cannot parse: a 200 is the
-            # gateway saying the message left, and raising over a field it did
-            # not fill would discard a delivered message's mark and post it
-            # again next run -- or, once the idempotency store replays this
-            # same statusless 200, fail identically every run until the TTL
-            # expires and then duplicate. A field that is absent is not a
-            # status this version does not know; it is no status at all.
-            return 0
         status = str(body.get("status") or "")
+        if not status:
+            # Absent, null or empty: all three are the gateway not saying,
+            # which is not the same as saying something this version does not
+            # know. The same rule applies as to a missing `message_id`: a 200
+            # is the gateway saying the message left, and raising over a field
+            # it did not fill would discard a delivered message's mark and
+            # post it again next run -- or, once the idempotency store
+            # replays this same statusless 200, fail identically every run
+            # until the TTL expires and then duplicate. The handle is still
+            # returned if there is one; only the status was missing.
+            retval = str(body.get("message_id") or "") or 0
+            return retval
         if status in _GATEWAY_PENDING:
             raise SignalSendPending(
                 f"signal gateway answered 200 with status {status!r}, which means the "
@@ -898,12 +928,23 @@ class GatewayTransport:
             # `idempotency_ttl_s` it is a silent no-op reported as success, and
             # the flag is the only evidence either way -- so it is said out
             # loud rather than swallowed.
+            keyed = (
+                f"the id {seed!r} this part was sent under"
+                if seed
+                else "derived from this part's text and styles"
+            )
             print(
-                f"signal gateway replayed an earlier message for this content "
-                f"(duplicate=true, status {status!r}); nothing new was sent. If this was "
-                f"a deliberate repeat rather than a retry, it did not go out: the key is "
-                f"derived from the text and its styles, and the gateway remembers it for "
-                f"its idempotency TTL.",
+                f"signal gateway replayed an earlier message for this part "
+                f"(duplicate=true, status {status!r}); nothing new was sent. The key is "
+                f"{keyed}, and the gateway remembers it for its idempotency TTL -- so a "
+                f"deliberate repeat, as opposed to a retry, keeps being replayed until "
+                f"that TTL expires"
+                + (
+                    ", and editing the message will not change that, because the key "
+                    "does not depend on the text"
+                    if seed
+                    else ""
+                ),
                 file=sys.stderr,
             )
         handle = str(body.get("message_id") or "")
@@ -1036,9 +1077,20 @@ def _gateway_from_config(cfg: dict, label: str, timeout: int) -> GatewayTranspor
         wait_s=wait_s,
         timeout=timeout,
     )
-    if retval.limit < 1:
+    if _bytes(message_label) > _MAX_LABEL_BYTES:
+        # Bounded rather than merely checked for leaving a positive remainder.
+        # A limit a little above the marker reservation is not safe: once a
+        # message needs more than one part the splitter re-splits at
+        # `limit - _MARKER_ROOM`, so a remainder of a few dozen bytes yields
+        # parts of one or two characters, each of which passes every per-part
+        # check while one message becomes hundreds of them and the run reports
+        # success. A label is a prefix on every message, not content, so the
+        # honest bound is on the label itself.
         raise RuntimeError(
-            f"{label}: gateway 'label' {message_label!r} is as long as the whole message limit"
+            f"{label}: gateway 'label' is {_bytes(message_label)} bytes, over the "
+            f"{_MAX_LABEL_BYTES} allowed. It is prefixed to every message and comes out of "
+            f"the same {SIGNAL_MESSAGE_LIMIT}-byte limit, and a label long enough to crowd "
+            f"the message splits one into hundreds of tiny ones that each look fine"
         )
     return retval
 
@@ -1106,11 +1158,12 @@ def post_message(
 
     `seed` is a caller-stable id for the message -- a signal's `id`, not
     anything derived from the rendered text -- and each part is sent under
-    `seed#<number>`. A transport that deduplicates resubmits uses it to
-    recognise a part it has already taken, which the text cannot do here
+    `seed#<number>-of-<total>`. A transport that deduplicates resubmits uses
+    it to recognise a part it has already taken, which the text cannot do here
     because a retry re-scores and the score's reasons are rendered into it.
-    The part's number is in the key and its total is not: a retry whose text
-    splits differently still matches on the parts that already went. The footer rides on
+    The total is part of it so that a retry which splits differently is a
+    different message rather than a partial match: see
+    `GatewayTransport._key` for what that prevents. The footer rides on
     each part, as it does on Slack, because a standing line that appears on
     only the last part of three is a line a reader can miss -- and it is
     appended after the conversion, so it arrives as the characters it was
@@ -1148,7 +1201,7 @@ def post_message(
             )
         try:
             timestamps.append(
-                transport.send(body, styles, f"{seed}#{number}" if seed else "")
+                transport.send(body, styles, f"{seed}#{number}-of-{total}" if seed else "")
             )
         except SignalSendError as exc:
             if timestamps:

@@ -777,9 +777,18 @@ not stable across runs here: a retry re-scores, `llm_scorer` appends the rung
 the vendor waterfall landed on to its reasons, and the destination renders
 those reasons into the message. A different rung would mean a different key,
 and the part that already reached the group would be posted again -- the one
-outcome the key exists to prevent. Each part goes under `<signal id>#<number>`,
-with the number in the key and the total deliberately not, so a retry that
-splits differently still matches on the parts that already went. A caller with
+outcome the key exists to prevent. Each part goes under
+`<signal id>#<number>-of-<total>`, and the total is in there deliberately: a
+key naming only the part number would match across runs that split
+differently, and the worse direction of that is silent. A retry whose text
+shortened into one part would carry the old part 1's key, the gateway would
+replay that part, this side would read a 200 and mark the signal delivered,
+and everything that had been in part 2 would never be sent at all. Including
+the total makes a different split a different message, which is what it is.
+What remains is the lesser case: a retry that splits the same way but reads
+differently keeps the first run's wording for the parts that already arrived
+and takes the new wording for the rest. Nothing is lost -- the same signal is
+described either way. A caller with
 no stable id to offer falls back to hashing the text and its styles.
 
 Two bounds on the promise. It lasts as long as the gateway's
@@ -787,7 +796,8 @@ Two bounds on the promise. It lasts as long as the gateway's
 apart than the TTL gets a fresh key and the resubmit does post a second copy.
 And a caller that deliberately sends the same signal twice inside the TTL gets
 the earlier message's outcome replayed -- `duplicate: true`, reported as
-delivered, with nothing new sent. That is right for a retry and wrong for a
+delivered, with nothing new sent; editing the message does not change that,
+since the key does not depend on the text. That is right for a retry and wrong for a
 repeat, and the two cannot be told apart from here, so the flag is written to
 stderr rather than swallowed. A source that re-lists the same items every run
 is the shape to watch.
