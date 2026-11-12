@@ -744,10 +744,19 @@ accounts could read is a credential to treat as disclosed.
 answers `202 queued` the moment it accepts a message, and a queued message can
 still fail — as an event a run-and-exit agent has already exited before seeing.
 So the send asks the gateway to hold the response until Signal takes it:
-`200` with the Signal timestamp means sent, `502` means refused for good, and
-`202` means it was still in flight at the deadline. Only `200` returns; both
-others raise, so a caller that marks a signal delivered when the send returns
-can never mark one that did not arrive. The pending case raises its own type,
+`200` means the message left, `502` means refused for good, and `202` means it
+was still in flight at the deadline, which includes a retry of a message still
+in flight. Only `200` returns; both others raise, so a caller that marks a
+signal delivered when the send returns can never mark one that did not arrive.
+
+A `200` carries no Signal timestamp. Its status is `sent`, `delivered`, `read`
+or `deleted` -- a retry arriving after Signal has acked sees `delivered` or
+`read`, and `deleted` is a message that went out and was then deleted -- and
+all four mean it left. Any other status raises rather than being guessed at.
+The handle is the gateway's own `message_id`, which its edit, delete and
+reaction endpoints take; the gateway keeps the Signal timestamp itself. So
+`post_message` returns a `message_id` under this transport and a Signal
+timestamp under the other, and the two are not interchangeable. The pending case raises its own type,
 `SignalSendPending`, because it is neither a success nor a failure: the next
 run resubmits it under the same idempotency key, which waits on the message
 already in flight rather than sending a second copy. The cap is the gateway's,

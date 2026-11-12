@@ -90,6 +90,13 @@ BULLET = "•"
 # marker is ASCII, so its width is the same number of bytes as characters.
 _MARKER_ROOM = 24
 
+# Every status a gateway 200 can carry, all of which mean the message left:
+# a retry that arrives after Signal has acked sees `delivered` or `read`, and
+# `deleted` is a message that went out and was then deleted. Anything outside
+# this set is a word this version has not been told the meaning of, and
+# guessing at one would either lose a message or send it twice.
+_GATEWAY_SENT = frozenset({"sent", "delivered", "read", "deleted"})
+
 BOLD = "BOLD"
 ITALIC = "ITALIC"
 STRIKETHROUGH = "STRIKETHROUGH"
@@ -481,8 +488,16 @@ class Transport(Protocol):
 
     limit: int
 
-    def send(self, text: str, ranges: list[tuple[int, int, str]]) -> int:
-        """Send one rendered message; return its Signal timestamp, or 0."""
+    def send(self, text: str, ranges: list[tuple[int, int, str]]) -> int | str:
+        """Send one rendered message; return the handle it is addressed by.
+
+        Which handle depends on the transport, and neither is interchangeable
+        with the other: signal-cli hands back Signal's own timestamp, an int,
+        which is what an edit through signal-cli would take. The gateway hands
+        back its own `message_id`, a string, which is what its edit, delete
+        and reaction endpoints take -- it keeps the Signal timestamp itself. A
+        zero means the message went out and the transport did not say which.
+        """
         ...
 
 
@@ -665,16 +680,20 @@ class GatewayTransport:
     def send(self, text: str, ranges: list[tuple[int, int, str]]) -> int:
         """Send one rendered message, waiting for Signal to take it.
 
-        Returns the Signal timestamp on a 200. Raises on anything else, so a
-        caller that marks a signal delivered only when this returns can never
-        mark one that did not arrive:
+        Returns the gateway's `message_id` on a 200. Raises on anything else,
+        so a caller that marks a signal delivered only when this returns can
+        never mark one that did not arrive:
 
-        - 200 means Signal took it, and the timestamp is its id.
+        - 200 means the message left, under any of `_GATEWAY_SENT`. A 200
+          carries no Signal timestamp: the gateway keeps that and addresses
+          the message by `message_id`, which is what its edit, delete and
+          reaction endpoints take.
         - 502 means the send was refused for good; retrying it is pointless
           until whatever was wrong is fixed.
         - 202 means it was still in flight when the gateway's own deadline
-          passed. Not a failure and not a success, so it raises
-          `SignalSendPending` and the next run resubmits the same key.
+          passed, which includes a retry of a message still in flight. Not a
+          failure and not a success, so it raises `SignalSendPending` and the
+          next run resubmits the same key.
         """
         payload = {
             "to": {"conversation": self.conversation},
@@ -725,23 +744,21 @@ class GatewayTransport:
         if not isinstance(body, dict):
             raise SignalGatewayError(f"signal gateway answered 200 with {type(body).__name__}")
         status = str(body.get("status") or "")
-        if status != "sent":
-            # A 200 is the gateway saying Signal took it. If it says anything
-            # other than `sent`, this code does not know what it means, and
-            # guessing would either lose a message or duplicate one.
+        if status not in _GATEWAY_SENT:
             raise SignalGatewayError(
                 f"signal gateway answered 200 with status {status!r}, which this "
-                f"version does not know how to read: {tail}"
+                f"version does not know how to read; it knows "
+                f"{', '.join(sorted(_GATEWAY_SENT))}: {tail}"
             )
-        try:
-            retval = int(body["timestamp"])
-            return retval
-        except (KeyError, TypeError, ValueError):
+        handle = str(body.get("message_id") or "")
+        if not handle:
             # Delivered, id unknown: the same call the subprocess transport
             # makes when signal-cli accepts a message without naming it.
             # Raising here would discard a delivered message's mark and post
             # it again next run.
             return 0
+        retval = handle
+        return retval
 
 
 def _read_token_file(path: str, label: str) -> str:
@@ -794,7 +811,15 @@ def _gateway_from_config(cfg: dict, label: str, timeout: int) -> GatewayTranspor
     message_label = gateway.get("label", "")
     if not isinstance(message_label, str):
         raise RuntimeError(f"{label}: gateway 'label' must be a string")
-    wait_s = int(gateway.get("wait_s", 10))
+    try:
+        wait_s = int(gateway.get("wait_s", 10))
+    except (TypeError, ValueError):
+        # The gateway answers 422 `bad_wait` for this, but only after the run
+        # has been built and has fetched and scored something. A config value
+        # that is not a number is knowable now.
+        raise RuntimeError(
+            f"{label}: gateway 'wait_s' is {gateway.get('wait_s')!r}, which is not a number"
+        ) from None
     if not 1 <= wait_s <= 30:
         # The gateway caps its own wait at 30. A larger number here would be
         # silently clamped there, which is a config file that does not say
@@ -871,11 +896,13 @@ def post_message(
     text: str,
     footer: str = "",
     limit: int | None = None,
-) -> list[int]:
+) -> list[int | str]:
     """Post Markdown to Signal, splitting it if it is too long.
 
-    Returns the timestamp of every message sent, in order; a zero is a message
-    that went out under an id signal-cli did not report. The footer rides on
+    Returns the handle of every message sent, in order -- a Signal timestamp
+    from the subprocess transport, a gateway `message_id` from the gateway
+    one, and a zero for a message that went out under an id the transport did
+    not report. The footer rides on
     each part, as it does on Slack, because a standing line that appears on
     only the last part of three is a line a reader can miss -- and it is
     appended after the conversion, so it arrives as the characters it was
@@ -892,7 +919,7 @@ def post_message(
         # marker rather than letting it push a part over the limit.
         pieces = _split_bytes(rendered, room - _MARKER_ROOM)
     total = len(pieces)
-    timestamps: list[int] = []
+    timestamps: list[int | str] = []
     for number, (piece, offset) in enumerate(pieces, 1):
         body = piece
         styles = _clip(ranges, offset, _units(piece))
