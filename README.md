@@ -770,18 +770,32 @@ the confusion the distinction exists to avoid. The wait's cap is the gateway's,
 30 seconds; a larger number in config is refused here rather than silently
 clamped there.
 
-The next run resubmits under the same content-derived idempotency key, which
-waits on the message already in flight rather than sending a second copy. Two
-bounds on that promise. It lasts as long as the gateway's `idempotency_ttl_s`,
-24 hours by default, so an agent whose runs are further apart than the TTL gets
-a fresh key for the same content and the resubmit does post a second copy. And
-because the key covers the text and its styles with no run or time component, a
-caller that deliberately sends identical text twice inside the TTL gets the
-earlier message's outcome replayed -- `duplicate: true`, reported as delivered,
-with nothing new sent. That is right for a retry and wrong for a repeat, and
-the two are indistinguishable from the content alone, so the flag is written to
+The next run resubmits under the same idempotency key, which waits on the
+message already in flight rather than sending a second copy. **That key is
+derived from the signal's id, not from the rendered text**, because the text is
+not stable across runs here: a retry re-scores, `llm_scorer` appends the rung
+the vendor waterfall landed on to its reasons, and the destination renders
+those reasons into the message. A different rung would mean a different key,
+and the part that already reached the group would be posted again -- the one
+outcome the key exists to prevent. Each part goes under `<signal id>#<number>`,
+with the number in the key and the total deliberately not, so a retry that
+splits differently still matches on the parts that already went. A caller with
+no stable id to offer falls back to hashing the text and its styles.
+
+Two bounds on the promise. It lasts as long as the gateway's
+`idempotency_ttl_s`, 24 hours by default, so an agent whose runs are further
+apart than the TTL gets a fresh key and the resubmit does post a second copy.
+And a caller that deliberately sends the same signal twice inside the TTL gets
+the earlier message's outcome replayed -- `duplicate: true`, reported as
+delivered, with nothing new sent. That is right for a retry and wrong for a
+repeat, and the two cannot be told apart from here, so the flag is written to
 stderr rather than swallowed. A source that re-lists the same items every run
 is the shape to watch.
+
+One caveat on the exception types: `fanout` flattens a child destination's
+exception into a `RuntimeError`, so a `signal-messenger` behind it loses the
+pending-versus-refused distinction. No message is lost -- the run fails and the
+runner marks nothing -- but a caller cannot branch on it there.
 
 **`label` mirrors the gateway's own setting and has to match it.** The prefix
 is applied by the gateway from its `consumers.<name>.label`, and it re-checks

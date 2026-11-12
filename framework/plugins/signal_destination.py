@@ -91,7 +91,16 @@ class SignalDestination:
     def send(self, scored: ScoredSignal) -> None:
         if not self.accepts(scored):
             return
-        post_message(self.transport, self._format(scored), footer=self.footer)
+        # The signal's own id as the seed, not the rendered text: a retry
+        # re-scores, and `llm_scorer` renders the waterfall rung it landed on
+        # into the reasons, so the text moves between runs while the id does
+        # not. See `GatewayTransport._key`.
+        post_message(
+            self.transport,
+            self._format(scored),
+            footer=self.footer,
+            seed=scored.signal.id,
+        )
 
 
 @register_destination("signal-messenger")

@@ -65,6 +65,7 @@ was written with.
 """
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import os
@@ -515,8 +516,14 @@ class Transport(Protocol):
     # asserting the safe one for both.
     idempotent: bool
 
-    def send(self, text: str, ranges: list[tuple[int, int, str]]) -> int | str:
+    def send(
+        self, text: str, ranges: list[tuple[int, int, str]], seed: str = ""
+    ) -> int | str:
         """Send one rendered message; return the handle it is addressed by.
+
+        `seed` identifies *which* message this is, independently of how it
+        reads. A transport that deduplicates resubmits needs that: see
+        `GatewayTransport._key`. A transport that does not may ignore it.
 
         Which handle depends on the transport, and neither is interchangeable
         with the other: signal-cli hands back Signal's own timestamp, an int,
@@ -567,8 +574,13 @@ class SignalTransport:
         retval = _NUMBER_RE.sub("<number>", retval)
         return retval
 
-    def send(self, text: str, ranges: list[tuple[int, int, str]]) -> int:
+    def send(
+        self, text: str, ranges: list[tuple[int, int, str]], seed: str = ""
+    ) -> int:
         """Send one already-rendered message. Returns its Signal timestamp.
+
+        `seed` is accepted and ignored: signal-cli has nothing to deduplicate
+        a resubmit against, which is what `idempotent = False` says.
 
         That timestamp *is* the message id in Signal -- the counterpart of a
         Slack `ts`, and the only handle an edit could later be made with. A
@@ -699,25 +711,45 @@ class GatewayTransport:
         retval = _NUMBER_RE.sub("<number>", retval)
         return retval
 
-    def _key(self, text: str, ranges: list[tuple[int, int, str]]) -> str:
-        """An idempotency key for this exact message to this conversation.
+    def _key(self, text: str, ranges: list[tuple[int, int, str]], seed: str = "") -> str:
+        """An idempotency key for this message to this conversation.
 
-        Derived from the content, so the retry a `SignalSendPending` asks for
-        carries the same key and waits on the message already in flight
-        instead of sending a second copy. The digest is of the text and the
-        styles together: two parts of one message can hold the same words
-        under different emphasis.
+        The retry a `SignalSendPending` asks for has to carry the same key as
+        the send it is retrying, or the gateway has nothing to match and the
+        parts that did arrive are posted again.
+
+        So `seed` is preferred over the content when a caller supplies one,
+        because the content is not stable across runs in this framework: a
+        retry re-scores, `llm_scorer` appends the rung the vendor waterfall
+        landed on to its reasons, and the destination renders those reasons
+        into the text. A different rung, or any drift in a model's wording,
+        changes the text and therefore the key -- and the part that already
+        reached the group is sent a second time, which is the one outcome this
+        key exists to prevent. A signal's `id` does not move for either
+        reason.
+
+        Without a seed it falls back to the content, which is right for a
+        caller that has no stable id to offer. The digest covers the styles as
+        well as the text, since two parts of one message can hold the same
+        words under different emphasis.
         """
         material = json.dumps(
-            [self.conversation, self.label, text, ranges],
+            [self.conversation, self.label, seed] if seed
+            else [self.conversation, self.label, text, ranges],
             ensure_ascii=False,
             sort_keys=True,
         )
         retval = hashlib.sha256(material.encode("utf-8")).hexdigest()
         return retval
 
-    def send(self, text: str, ranges: list[tuple[int, int, str]]) -> int | str:
+    def send(
+        self, text: str, ranges: list[tuple[int, int, str]], seed: str = ""
+    ) -> int | str:
         """Send one rendered message, waiting for Signal to take it.
+
+        `seed` identifies the message independently of how it reads, and is
+        what the idempotency key is built from when a caller gives one. See
+        `_key`.
 
         Returns the gateway's `message_id` on a 200. Raises on anything else,
         so a caller that marks a signal delivered only when this returns can
@@ -749,7 +781,7 @@ class GatewayTransport:
                     ],
                 }
             ],
-            "idempotency_key": self._key(text, ranges),
+            "idempotency_key": self._key(text, ranges, seed),
             "wait_s": self.wait_s,
         }
         try:
@@ -759,31 +791,56 @@ class GatewayTransport:
                 headers={"Authorization": f"Bearer {self._token}"},
                 timeout=self.timeout,
             )
-        except requests.ReadTimeout as exc:
-            # The request body was sent and the gateway did not answer in
-            # time, so the message may well be queued. Calling that a refusal
-            # would tell the caller not to retry something that is in flight.
+        except requests.ConnectTimeout as exc:
+            # No connection was established, so nothing was sent. The only
+            # shape here that can be called a refusal without guessing.
             # Not `from exc`: a requests exception renders the request, and
             # the Authorization header is on it.
+            raise SignalGatewayError(
+                f"signal gateway at {self.base_url} did not accept a connection within "
+                f"{self.timeout}s; nothing was sent: {self._scrub(str(exc))[-300:]}"
+            ) from None
+        except (
+            requests.ReadTimeout,
+            requests.ConnectionError,
+            requests.exceptions.ChunkedEncodingError,
+        ):
+            # Everything else that fails around a connection leaves the
+            # message in doubt: a read deadline passing, a gateway restarting
+            # or a proxy resetting while it holds the response for `wait_s`, a
+            # truncated body, a refused connection. The window the gateway
+            # spends holding a reply is exactly where a restart lands, and
+            # `requests` raises one class for a reset at that moment and for a
+            # port that was never open -- telling them apart means reading
+            # urllib3's cause chain, which is not worth depending on for a
+            # message's wording. Pending is the answer that is true either
+            # way: it marks nothing and resubmits under the same key, which
+            # the gateway matches if the message did get through, and which is
+            # also what a caller should do when the gateway is simply down.
             raise SignalSendPending(
-                f"signal gateway at {self.base_url} took the request and did not answer "
-                f"within {self.timeout}s. The message may be queued, so it stays unmarked "
-                f"and the next run resubmits it under the same key: "
-                f"{self._scrub(str(exc))[-300:]}"
+                f"the exchange with the signal gateway at {self.base_url} did not complete "
+                f"within {self.timeout}s. If the request reached it the message may be "
+                f"queued, so it stays unmarked and the next run resubmits it under the "
+                f"same key"
             ) from None
         except requests.RequestException as exc:
             raise SignalGatewayError(
                 f"signal gateway at {self.base_url} did not answer: "
                 f"{self._scrub(str(exc))[-400:]}"
             ) from None
-        tail = self._scrub((response.text or "").strip())[-400:]
+        # Matched on the whole body and truncated only for display: a 422
+        # that echoes the part it refused pushes the marker out of a 400-byte
+        # tail, and the one failure this transport can explain would fall
+        # through to the generic relay.
+        said = self._scrub((response.text or "").strip())
+        tail = said[-400:]
         if response.status_code == 202:
             raise SignalSendPending(
                 f"signal gateway queued the message but Signal had not taken it within "
                 f"{self.wait_s}s; it is not delivered and not failed, so it stays unmarked "
                 f"and the next run resubmits it: {tail}"
             )
-        if response.status_code == 422 and "too_long" in tail:
+        if response.status_code == 422 and "too_long" in said:
             # The arithmetic on this side reserved room for `self.label`. If
             # the gateway still finds the part too long, the label it is
             # actually configured with is longer than the one named here --
@@ -809,6 +866,16 @@ class GatewayTransport:
             ) from None
         if not isinstance(body, dict):
             raise SignalGatewayError(f"signal gateway answered 200 with {type(body).__name__}")
+        if "status" not in body or body["status"] is None:
+            # The same rule this module applies to a missing `message_id`
+            # below and to a signal-cli reply it cannot parse: a 200 is the
+            # gateway saying the message left, and raising over a field it did
+            # not fill would discard a delivered message's mark and post it
+            # again next run -- or, once the idempotency store replays this
+            # same statusless 200, fail identically every run until the TTL
+            # expires and then duplicate. A field that is absent is not a
+            # status this version does not know; it is no status at all.
+            return 0
         status = str(body.get("status") or "")
         if status in _GATEWAY_PENDING:
             raise SignalSendPending(
@@ -858,18 +925,41 @@ def _read_token_file(path: str, label: str) -> str:
     before the run starts rather than after it has posted.
     """
     try:
-        info = os.stat(path)
+        # O_NOFOLLOW, and the mode read from the descriptor rather than the
+        # path: `os.stat` follows a symlink, so a world-writable link to a
+        # 0600 file would pass a check on the target. Opening first and
+        # calling fstat also closes the gap between checking a path and
+        # reading it. The open is inside the guard because a file that stats
+        # and will not open -- 0400 owned by another account, root-owned, a
+        # directory at that path -- is exactly the early, labelled failure
+        # this function exists to produce.
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
     except OSError as exc:
-        raise RuntimeError(f"{label}: cannot read 'token_file' {path!r}: {exc.strerror}") from None
-    leaked = stat.S_IMODE(info.st_mode) & (stat.S_IRWXG | stat.S_IRWXO)
-    if leaked:
         raise RuntimeError(
-            f"{label}: 'token_file' {path!r} is mode {stat.S_IMODE(info.st_mode):04o}; it holds "
-            "a send credential and must be 0600, readable only by the account that runs the "
-            "agent. Fix it with chmod 600 and, since it was readable, have the token reissued"
-        )
-    with open(path, encoding="utf-8") as handle:
-        retval = handle.read().strip()
+            f"{label}: cannot read 'token_file' {path!r}: {exc.strerror}"
+            + (". A symbolic link is not accepted here" if exc.errno == errno.ELOOP else "")
+        ) from None
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            # Checked on the descriptor before anything wraps it: a directory
+            # opens happily with O_RDONLY and it is `fdopen` that raises, as a
+            # bare IsADirectoryError naming neither the label nor the setting.
+            raise RuntimeError(f"{label}: 'token_file' {path!r} is not a regular file")
+        leaked = stat.S_IMODE(info.st_mode) & (stat.S_IRWXG | stat.S_IRWXO)
+        if leaked:
+            raise RuntimeError(
+                f"{label}: 'token_file' {path!r} is mode {stat.S_IMODE(info.st_mode):04o}; it "
+                "holds a send credential and must be 0600, readable only by the account that "
+                "runs the agent. Fix it with chmod 600 and, since it was readable, have the "
+                "token reissued"
+            )
+        with os.fdopen(fd, "rb") as handle:
+            fd = -1  # fdopen owns it now and its context manager closes it
+            retval = handle.read().decode("utf-8").strip()
+    finally:
+        if fd >= 0:
+            os.close(fd)
     if not retval:
         raise RuntimeError(f"{label}: 'token_file' {path!r} is empty")
     return retval
@@ -1005,13 +1095,22 @@ def post_message(
     text: str,
     footer: str = "",
     limit: int | None = None,
+    seed: str = "",
 ) -> list[int | str]:
     """Post Markdown to Signal, splitting it if it is too long.
 
     Returns the handle of every message sent, in order -- a Signal timestamp
     from the subprocess transport, a gateway `message_id` from the gateway
     one, and a zero for a message that went out under an id the transport did
-    not report. The footer rides on
+    not report.
+
+    `seed` is a caller-stable id for the message -- a signal's `id`, not
+    anything derived from the rendered text -- and each part is sent under
+    `seed#<number>`. A transport that deduplicates resubmits uses it to
+    recognise a part it has already taken, which the text cannot do here
+    because a retry re-scores and the score's reasons are rendered into it.
+    The part's number is in the key and its total is not: a retry whose text
+    splits differently still matches on the parts that already went. The footer rides on
     each part, as it does on Slack, because a standing line that appears on
     only the last part of three is a line a reader can miss -- and it is
     appended after the conversion, so it arrives as the characters it was
@@ -1048,7 +1147,9 @@ def post_message(
                 f"bytes, over the {limit}-byte limit; refusing to send it"
             )
         try:
-            timestamps.append(transport.send(body, styles))
+            timestamps.append(
+                transport.send(body, styles, f"{seed}#{number}" if seed else "")
+            )
         except SignalSendError as exc:
             if timestamps:
                 # The same class, not a fixed one: a part left pending by the
