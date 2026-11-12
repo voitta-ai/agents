@@ -110,7 +110,10 @@ def build(cfg: dict) -> Destination:
     # message is knowable before the run fetches, scores or asks a model
     # anything, and left unchecked it turns one scored signal into thousands of
     # one-character Signal messages. The same guard `slack_destination` makes.
-    check_footer(footer, f"{_LABEL}: 'footer'")
+    # Against the transport's own limit, not Signal's: a gateway that puts a
+    # label in front of every message has fewer bytes to give the footer, and
+    # a check against the constant would pass a footer the run then cannot fit.
+    check_footer(footer, f"{_LABEL}: 'footer'", limit=transport.limit)
 
     retval = SignalDestination(
         transport=transport,

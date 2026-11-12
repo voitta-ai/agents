@@ -65,11 +65,16 @@ was written with.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
 import shutil
+import stat
 import subprocess
+from typing import Protocol
+
+import requests
 
 # Signal's own per-message limit, in UTF-8 bytes. A longer message is split
 # into several, in order, the way `slack.py` splits on its block limit. Not
@@ -136,8 +141,27 @@ _INLINE_RULES: tuple[tuple[re.Pattern[str], str | None], ...] = (
 _RECURSIVE = frozenset({"BOLD+ITALIC", BOLD, STRIKETHROUGH, SPOILER, ITALIC})
 
 
-class SignalCliError(RuntimeError):
+class SignalSendError(RuntimeError):
+    """A Signal message did not go out. Nothing downstream may mark it sent."""
+
+
+class SignalCliError(SignalSendError):
     """signal-cli refused or failed. The message carries its stderr, scrubbed."""
+
+
+class SignalGatewayError(SignalSendError):
+    """The gateway refused the send, or could not be reached."""
+
+
+class SignalSendPending(SignalGatewayError):
+    """The gateway accepted the message and Signal had not taken it yet.
+
+    Separate from `SignalGatewayError` because it is not a failure: the
+    message may still arrive. A run-and-exit caller cannot wait to find out,
+    so it must neither mark the signal delivered nor report success -- the
+    next run resubmits it under the same idempotency key, which waits on the
+    same message instead of sending a second one.
+    """
 
 
 def _units(text: str) -> int:
@@ -446,6 +470,22 @@ def _as_text(value: object) -> str:
     return retval
 
 
+class Transport(Protocol):
+    """What `post_message` needs from whatever carries the message.
+
+    `limit` belongs to the transport rather than to the splitter because only
+    the transport knows what the text will be wrapped in: the gateway may put
+    a label in front of every message, and those bytes come out of the same
+    2000.
+    """
+
+    limit: int
+
+    def send(self, text: str, ranges: list[tuple[int, int, str]]) -> int:
+        """Send one rendered message; return its Signal timestamp, or 0."""
+        ...
+
+
 class SignalTransport:
     """Where a Signal message goes: one group, through the `signal-cli` binary.
 
@@ -465,6 +505,7 @@ class SignalTransport:
         self.group_id = group_id
         self.binary = binary
         self.timeout = timeout
+        self.limit = SIGNAL_MESSAGE_LIMIT
 
     def _scrub(self, text: str) -> str:
         """Keep the account, the group and any phone number out of what we raise.
@@ -556,13 +597,249 @@ class SignalTransport:
         return 0
 
 
-def transport_from_config(cfg: dict, label: str, timeout: int = 120) -> SignalTransport:
+class GatewayTransport:
+    """Where a Signal message goes: one conversation, through voitta-gateway.
+
+    The gateway owns the Signal account. Only one process can, so this and
+    `SignalTransport` are alternatives rather than layers: once the gateway's
+    daemon holds the account, the subprocess path cannot open it.
+
+    Three things are deliberately not here. The group id never appears -- the
+    gateway maps an alias such as `leads` to it, so a private conversation's
+    id does not travel to its consumers or into their logs. The token is read
+    from a 0600 file rather than the environment, because a run spawns LLM
+    CLIs as children and a variable in the environment is visible to all of
+    them. And nothing polls for delivery: a run-and-exit caller cannot wait,
+    so it asks the gateway to wait instead.
+    """
+
+    def __init__(
+        self,
+        base_url: str,
+        conversation: str,
+        token: str,
+        label: str = "",
+        wait_s: int = 10,
+        timeout: int = 120,
+    ):
+        self.base_url = base_url.rstrip("/")
+        self.conversation = conversation
+        self.label = label
+        self.wait_s = wait_s
+        self.timeout = timeout
+        self._token = token
+        # A label is prepended by the gateway to every message it sends, so
+        # its bytes are not available to the body. `_bytes` and not `len`,
+        # for the reason the whole module says.
+        self.limit = SIGNAL_MESSAGE_LIMIT - (_bytes(f"{label}: ") if label else 0)
+
+    def _scrub(self, text: str) -> str:
+        """Keep the token out of whatever this raises.
+
+        Less to hide than the subprocess transport -- there is no account
+        number or group id here, by design -- but a gateway that echoed a bad
+        Authorization header back would otherwise put the token in a
+        traceback, a log and any issue it is pasted into.
+        """
+        retval = text
+        if self._token:
+            retval = retval.replace(self._token, "<token>")
+        retval = _NUMBER_RE.sub("<number>", retval)
+        return retval
+
+    def _key(self, text: str) -> str:
+        """An idempotency key for this exact message to this conversation.
+
+        Derived from the content, so the retry a `SignalSendPending` asks for
+        carries the same key and waits on the message already in flight
+        instead of sending a second copy. The digest is of the text and the
+        styles together: two parts of one message can hold the same words
+        under different emphasis.
+        """
+        material = json.dumps(
+            [self.conversation, self.label, text], ensure_ascii=False, sort_keys=True
+        )
+        retval = hashlib.sha256(material.encode("utf-8")).hexdigest()
+        return retval
+
+    def send(self, text: str, ranges: list[tuple[int, int, str]]) -> int:
+        """Send one rendered message, waiting for Signal to take it.
+
+        Returns the Signal timestamp on a 200. Raises on anything else, so a
+        caller that marks a signal delivered only when this returns can never
+        mark one that did not arrive:
+
+        - 200 means Signal took it, and the timestamp is its id.
+        - 502 means the send was refused for good; retrying it is pointless
+          until whatever was wrong is fixed.
+        - 202 means it was still in flight when the gateway's own deadline
+          passed. Not a failure and not a success, so it raises
+          `SignalSendPending` and the next run resubmits the same key.
+        """
+        payload = {
+            "to": {"conversation": self.conversation},
+            "parts": [
+                {
+                    "type": "text",
+                    "text": text,
+                    "styles": [
+                        {"start": start, "length": length, "style": style}
+                        for start, length, style in ranges
+                    ],
+                }
+            ],
+            "idempotency_key": self._key(text),
+            "wait_s": self.wait_s,
+        }
+        try:
+            response = requests.post(
+                f"{self.base_url}/v1/messages",
+                json=payload,
+                headers={"Authorization": f"Bearer {self._token}"},
+                timeout=self.timeout,
+            )
+        except requests.RequestException as exc:
+            # Not `from exc`: a requests exception renders the request, and
+            # the Authorization header is on it.
+            raise SignalGatewayError(
+                f"signal gateway at {self.base_url} did not answer: "
+                f"{self._scrub(str(exc))[-400:]}"
+            ) from None
+        tail = self._scrub((response.text or "").strip())[-400:]
+        if response.status_code == 202:
+            raise SignalSendPending(
+                f"signal gateway queued the message but Signal had not taken it within "
+                f"{self.wait_s}s; it is not delivered and not failed, so it stays unmarked "
+                f"and the next run resubmits it: {tail}"
+            )
+        if response.status_code != 200:
+            raise SignalGatewayError(
+                f"signal gateway answered {response.status_code}: {tail}"
+            )
+        try:
+            body = response.json()
+        except ValueError:
+            raise SignalGatewayError(
+                f"signal gateway answered 200 with a body that is not JSON: {tail}"
+            ) from None
+        if not isinstance(body, dict):
+            raise SignalGatewayError(f"signal gateway answered 200 with {type(body).__name__}")
+        status = str(body.get("status") or "")
+        if status != "sent":
+            # A 200 is the gateway saying Signal took it. If it says anything
+            # other than `sent`, this code does not know what it means, and
+            # guessing would either lose a message or duplicate one.
+            raise SignalGatewayError(
+                f"signal gateway answered 200 with status {status!r}, which this "
+                f"version does not know how to read: {tail}"
+            )
+        try:
+            retval = int(body["timestamp"])
+            return retval
+        except (KeyError, TypeError, ValueError):
+            # Delivered, id unknown: the same call the subprocess transport
+            # makes when signal-cli accepts a message without naming it.
+            # Raising here would discard a delivered message's mark and post
+            # it again next run.
+            return 0
+
+
+def _read_token_file(path: str, label: str) -> str:
+    """The token in a 0600 file, refusing one anybody else can read.
+
+    The mode is checked rather than assumed: a token readable by another
+    account is a token to treat as disclosed, and the moment to notice is
+    before the run starts rather than after it has posted.
+    """
+    try:
+        info = os.stat(path)
+    except OSError as exc:
+        raise RuntimeError(f"{label}: cannot read 'token_file' {path!r}: {exc.strerror}") from None
+    leaked = stat.S_IMODE(info.st_mode) & (stat.S_IRWXG | stat.S_IRWXO)
+    if leaked:
+        raise RuntimeError(
+            f"{label}: 'token_file' {path!r} is mode {stat.S_IMODE(info.st_mode):04o}; it holds "
+            "a send credential and must be 0600, readable only by the account that runs the "
+            "agent. Fix it with chmod 600 and, since it was readable, have the token reissued"
+        )
+    with open(path, encoding="utf-8") as handle:
+        retval = handle.read().strip()
+    if not retval:
+        raise RuntimeError(f"{label}: 'token_file' {path!r} is empty")
+    return retval
+
+
+def _gateway_from_config(cfg: dict, label: str, timeout: int) -> GatewayTransport:
+    """Build the gateway transport a destination block asks for."""
+    gateway = cfg.get("gateway")
+    if not isinstance(gateway, dict):
+        raise RuntimeError(
+            f"{label}: transport 'gateway' needs a 'gateway' block with 'url', "
+            "'conversation' and 'token_file'"
+        )
+    url = str(gateway.get("url") or "")
+    conversation = str(gateway.get("conversation") or "")
+    token_file = str(gateway.get("token_file") or "")
+    missing = [
+        name
+        for name, value in (
+            ("url", url),
+            ("conversation", conversation),
+            ("token_file", token_file),
+        )
+        if not value
+    ]
+    if missing:
+        raise RuntimeError(f"{label}: gateway block is missing: {', '.join(missing)}")
+    message_label = gateway.get("label", "")
+    if not isinstance(message_label, str):
+        raise RuntimeError(f"{label}: gateway 'label' must be a string")
+    wait_s = int(gateway.get("wait_s", 10))
+    if not 1 <= wait_s <= 30:
+        # The gateway caps its own wait at 30. A larger number here would be
+        # silently clamped there, which is a config file that does not say
+        # what happens.
+        raise RuntimeError(
+            f"{label}: gateway 'wait_s' is {wait_s}; it must be between 1 and 30, "
+            "which is the gateway's own cap"
+        )
+    token = _read_token_file(token_file, label)
+    retval = GatewayTransport(
+        base_url=url,
+        conversation=conversation,
+        token=token,
+        label=message_label,
+        wait_s=wait_s,
+        timeout=timeout,
+    )
+    if retval.limit < 1:
+        raise RuntimeError(
+            f"{label}: gateway 'label' {message_label!r} is as long as the whole message limit"
+        )
+    return retval
+
+
+def transport_from_config(cfg: dict, label: str, timeout: int = 120) -> Transport:
     """Build the transport a destination block asks for.
 
-    Both values are named by env var, never written in config: the account is a
-    phone number and the group id identifies a private conversation, and this
-    repo's examples are public.
+    Two kinds. `transport: gateway` sends through voitta-gateway, which owns
+    the account; anything else drives the signal-cli binary directly. They are
+    exclusive, not layered: only one process can hold a Signal account, so the
+    cutover is a config flip rather than a fallback chain, and a fallback would
+    be a second process trying to open an account the gateway already has.
+
+    For the subprocess transport both values are named by env var, never
+    written in config: the account is a phone number and the group id
+    identifies a private conversation, and this repo's examples are public.
     """
+    kind = str(cfg.get("transport") or "signal-cli")
+    if kind == "gateway":
+        retval = _gateway_from_config(cfg, label, timeout)
+        return retval
+    if kind != "signal-cli":
+        raise RuntimeError(
+            f"{label}: unknown transport {kind!r}; it is 'signal-cli' or 'gateway'"
+        )
     account_env = cfg.get("account_env")
     group_env = cfg.get("group_id_env")
     if not account_env or not group_env:
@@ -590,10 +867,10 @@ def transport_from_config(cfg: dict, label: str, timeout: int = 120) -> SignalTr
 
 
 def post_message(
-    transport: SignalTransport,
+    transport: Transport,
     text: str,
     footer: str = "",
-    limit: int = SIGNAL_MESSAGE_LIMIT,
+    limit: int | None = None,
 ) -> list[int]:
     """Post Markdown to Signal, splitting it if it is too long.
 
@@ -604,6 +881,7 @@ def post_message(
     appended after the conversion, so it arrives as the characters it was
     written with.
     """
+    limit = transport.limit if limit is None else limit
     check_footer(footer, limit=limit)
     rendered, ranges = to_signal(text)
     tail = f"\n{footer}" if footer else ""
@@ -635,11 +913,19 @@ def post_message(
             )
         try:
             timestamps.append(transport.send(body, styles))
-        except SignalCliError as exc:
+        except SignalSendError as exc:
             if timestamps:
-                raise SignalCliError(
-                    f"part {number} of {total} failed after {len(timestamps)} of them "
-                    f"reached the group, which now holds an incomplete message: {exc}"
+                # The same class, not a fixed one: a part left pending by the
+                # gateway and a part refused outright are different answers,
+                # and a caller deciding whether to retry needs the one it
+                # got. Flattening both to `SignalCliError` here would tell a
+                # retrying caller that a message still in flight had failed,
+                # and "failed" is the word that stops it resubmitting.
+                raise type(exc)(
+                    f"part {number} of {total} did not go out after {len(timestamps)} of "
+                    f"them reached the group, which now holds an incomplete message. "
+                    f"Resubmitting is safe -- each part carries its own idempotency key, "
+                    f"so the parts already sent are not sent twice: {exc}"
                 ) from exc
             raise
     retval = timestamps

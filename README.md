@@ -701,6 +701,63 @@ an unregistered account or a group id this account is not in costs a subprocess
 and the account lock to verify, so it is left to fail on the first send rather
 than on every run that sends nothing.
 
+#### Two transports, because only one process can hold the account
+
+`transport` picks how the message leaves. The default, `signal-cli`, is the
+subprocess above. `gateway` sends through voitta-gateway, a service that owns
+the account and serves every agent behind one daemon:
+
+```json
+"destination": {
+  "type": "signal-messenger",
+  "transport": "gateway",
+  "gateway": {
+    "url": "http://127.0.0.1:<port>",
+    "conversation": "<alias>",
+    "token_file": "<workspace>/gateway-token",
+    "wait_s": 10
+  },
+  "min_score": 10
+}
+```
+
+They are exclusive and the switch is a flip, not a fallback. Once the
+gateway's daemon holds the account the subprocess path cannot open it, so a
+transport that fell back to `signal-cli` would be a second process contending
+for an account another already has — it would hang and then drop the message,
+which is worse than refusing.
+
+**The group id is not in this block.** `conversation` is an alias the gateway
+maps to the real conversation, so a private group's id stays in the gateway's
+own config and never reaches a consumer, a consumer's logs or a failure it
+raises. That is the whole reason for the alias.
+
+**The token is a file, not an env var.** Two reasons, and the second is the
+one that decided it: a scheduled run reads the environment launchd gives it
+rather than a login shell's, and a variable in the environment is inherited by
+every child the run spawns — and these runs spawn LLM CLIs. The file must be
+mode 0600; the build refuses a group- or world-readable one, names the mode it
+found, and says to have the token reissued, because a credential other
+accounts could read is a credential to treat as disclosed.
+
+**`wait_s` is what keeps "a clean exit means delivered" true.** The gateway
+answers `202 queued` the moment it accepts a message, and a queued message can
+still fail — as an event a run-and-exit agent has already exited before seeing.
+So the send asks the gateway to hold the response until Signal takes it:
+`200` with the Signal timestamp means sent, `502` means refused for good, and
+`202` means it was still in flight at the deadline. Only `200` returns; both
+others raise, so a caller that marks a signal delivered when the send returns
+can never mark one that did not arrive. The pending case raises its own type,
+`SignalSendPending`, because it is neither a success nor a failure: the next
+run resubmits it under the same idempotency key, which waits on the message
+already in flight rather than sending a second copy. The cap is the gateway's,
+30 seconds; a larger number in config is refused here rather than silently
+clamped there.
+
+A label, if the gateway is configured to prefix one, costs its bytes out of
+the same 2000 — so `limit` belongs to the transport, and the footer is checked
+against the transport's limit rather than Signal's.
+
 **Signal takes plain text plus styled ranges, not markup.** Everything this
 repo sends goes through `framework/signal_messenger.py::post_message`, which is
 to Signal what `framework/slack.py` is to Slack: code that builds a message
