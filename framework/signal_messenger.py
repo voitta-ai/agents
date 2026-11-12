@@ -30,12 +30,18 @@ both: the text with every marker removed, and the ranges that reproduce them.
 
 Two consequences shaped the code:
 
-- **Offsets are UTF-16 code units, not characters**, which signal-cli's own
-  help says in capitals. An emoji is two units, so a message with one emoji
-  before a bold word would bold the wrong letters if offsets were counted in
-  Python characters. `_units` is the only place that counts, including the
-  split: measuring the split in code points and the limit in units is a
-  disagreement that grows to 2x on emoji, and it refuses messages that fit.
+- **Two units, each with one job.** Offsets are UTF-16 code units, which
+  signal-cli's own help says in capitals: an emoji is two units, so a message
+  with one emoji before a bold word would bold the wrong letters if offsets
+  were counted in Python characters. The *limit*, though, is 2000 UTF-8
+  **bytes** -- `ServiceConfig.MAX_MESSAGE_SIZE_BYTES`, tested in `ManagerImpl`
+  as `Utf8.size(messageText()) > MAX_MESSAGE_SIZE_BYTES`. So `_units` counts
+  offsets and `_bytes` counts capacity, and no function mixes them: in `_cut`
+  the fit test is bytes while the offset it carries is units. Counting
+  capacity in units instead under-counts every non-ASCII character -- the
+  bullet this file writes is one unit and three bytes -- and signal-cli does
+  not refuse the result, it truncates the text and attaches the tail as a
+  file, so the mistake arrives as a mangled message rather than an error.
 - **A range cannot be reopened across messages.** So a long message is
   rendered *once*, and the text and its ranges are split together: a bold span
   that straddles a part boundary becomes a bold range at the end of one part
@@ -65,14 +71,18 @@ import re
 import shutil
 import subprocess
 
-# Signal's own per-message limit, in UTF-16 code units. A longer message is
-# split into several, in order, the way `slack.py` splits on its block limit.
+# Signal's own per-message limit, in UTF-8 bytes. A longer message is split
+# into several, in order, the way `slack.py` splits on its block limit. Not
+# UTF-16 units: signal-cli measures `Utf8.size` against this number, and past
+# it splits the text itself and attaches the remainder, which is a success as
+# far as the send is concerned and a truncated message as far as a reader is.
 SIGNAL_MESSAGE_LIMIT = 2000
 
 BULLET = "•"
 
 # Room kept back for `(part 12 of 34)` plus its newline, so numbering a part
-# can never push it over the limit. The same reservation `slack.py` makes.
+# can never push it over the limit. The same reservation `slack.py` makes. The
+# marker is ASCII, so its width is the same number of bytes as characters.
 _MARKER_ROOM = 24
 
 BOLD = "BOLD"
@@ -131,21 +141,37 @@ class SignalCliError(RuntimeError):
 
 
 def _units(text: str) -> int:
-    """Length in UTF-16 code units, which is what Signal counts.
+    """Length in UTF-16 code units, which is what Signal's offsets count.
 
-    The one place this repo counts for Signal, for both the style offsets and
-    the message limit. Python's `len` counts code points, so an emoji (two
-    units) ahead of a styled span would shift every range after it by one and
-    style the wrong characters.
+    The one place this repo counts offsets: style ranges and mention
+    positions. Capacity is `_bytes`, because the limit is measured in UTF-8
+    bytes instead -- the two are different questions and mixing them is the
+    bug this split prevents. Python's `len` counts code points, so an emoji
+    (two units) ahead of a styled span would shift every range after it by one
+    and style the wrong characters.
     """
     retval = len(text.encode("utf-16-le")) // 2
+    return retval
+
+
+def _bytes(text: str) -> int:
+    """Length in UTF-8 bytes, which is what Signal's limit counts.
+
+    The one place this repo measures capacity for Signal. Separate from
+    `_units` on purpose: the limit and the offsets are different units, and
+    the only way to keep them straight is to keep them in different
+    functions. Every non-ASCII character makes them disagree -- the bullet is
+    one unit and three bytes, an em-dash likewise, an emoji two units and
+    four bytes.
+    """
+    retval = len(text.encode("utf-8"))
     return retval
 
 
 # The longest footer that still leaves room for the message it rides on. A
 # footer rides on every part, costing its length plus the newline before it,
 # and a split message also carries a part marker. See `check_footer`.
-MAX_FOOTER_UNITS = SIGNAL_MESSAGE_LIMIT - _MARKER_ROOM - 2
+MAX_FOOTER_BYTES = SIGNAL_MESSAGE_LIMIT - _MARKER_ROOM - 2
 
 
 def check_footer(
@@ -166,11 +192,11 @@ def check_footer(
     constant would pass a footer that leaves the caller's limit nothing.
     """
     room = limit - _MARKER_ROOM - 2
-    if _units(footer) > room:
+    if _bytes(footer) > room:
         raise ValueError(
-            f"{label} is {_units(footer)} UTF-16 units, which leaves no room for content "
+            f"{label} is {_bytes(footer)} UTF-8 bytes, which leaves no room for content "
             f"under {'Signal' if limit == SIGNAL_MESSAGE_LIMIT else 'this caller'}'s "
-            f"{limit}-unit limit"
+            f"{limit}-byte limit"
         )
 
 
@@ -320,13 +346,17 @@ def _cut(text: str, offset: int, limit: int) -> list[tuple[str, int]]:
     """Cut inside a line, on a code-point boundary, when nothing coarser fits.
 
     A code point is never split, so a surrogate pair cannot be halved into two
-    messages of invalid text.
+    messages of invalid text, and no part can end with half a UTF-8 sequence.
+
+    Both units appear here, which is why they are named: the test is whether
+    another character still fits under the byte limit, and the number carried
+    forward is the piece's offset in UTF-16 units for its style ranges.
     """
     retval: list[tuple[str, int]] = []
     current = ""
     start = offset
     for char in text:
-        if current and _units(current) + _units(char) > limit:
+        if current and _bytes(current) + _bytes(char) > limit:
             retval.append((current, start))
             start += _units(current)
             current = ""
@@ -337,7 +367,7 @@ def _cut(text: str, offset: int, limit: int) -> list[tuple[str, int]]:
 
 
 def _pack(pieces: list[tuple[str, int]], sep: str, limit: int, finer) -> list[tuple[str, int]]:
-    """Greedily join `pieces` into parts of at most `limit` units.
+    """Greedily join `pieces` into parts of at most `limit` bytes.
 
     A piece too long on its own is handed to `finer`, which splits it on the
     next boundary down.
@@ -347,12 +377,12 @@ def _pack(pieces: list[tuple[str, int]], sep: str, limit: int, finer) -> list[tu
     for piece, offset in pieces:
         if current is not None:
             candidate = f"{current[0]}{sep}{piece}"
-            if _units(candidate) <= limit:
+            if _bytes(candidate) <= limit:
                 current = (candidate, current[1])
                 continue
             parts.append(current)
             current = None
-        if _units(piece) <= limit:
+        if _bytes(piece) <= limit:
             current = (piece, offset)
             continue
         parts.extend(finer(piece, offset, limit))
@@ -362,18 +392,20 @@ def _pack(pieces: list[tuple[str, int]], sep: str, limit: int, finer) -> list[tu
     return retval
 
 
-def _split_units(text: str, limit: int) -> list[tuple[str, int]]:
-    """`text` in parts of at most `limit` UTF-16 units, each with its offset.
+def _split_bytes(text: str, limit: int) -> list[tuple[str, int]]:
+    """`text` in parts of at most `limit` UTF-8 bytes, each with its offset.
 
     Paragraph boundaries first, then line boundaries, then inside a line only
-    when one line is itself longer than the limit. Never truncates.
+    when one line is itself longer than the limit. Never truncates. The offset
+    that comes back with each part is in UTF-16 units, because it addresses
+    style ranges rather than capacity.
     """
     if limit < 1:
         raise SignalCliError(
-            f"signal message split asked for parts of {limit} units; "
+            f"signal message split asked for parts of {limit} bytes; "
             "a footer or a marker has eaten the whole message"
         )
-    if _units(text) <= limit:
+    if _bytes(text) <= limit:
         retval = [(text, 0)]
         return retval
 
@@ -575,12 +607,12 @@ def post_message(
     check_footer(footer, limit=limit)
     rendered, ranges = to_signal(text)
     tail = f"\n{footer}" if footer else ""
-    room = limit - _units(tail)
-    pieces = _split_units(rendered, room)
+    room = limit - _bytes(tail)
+    pieces = _split_bytes(rendered, room)
     if len(pieces) > 1:
-        # Numbering costs units, so the split is redone with room for the
+        # Numbering costs room, so the split is redone with space for the
         # marker rather than letting it push a part over the limit.
-        pieces = _split_units(rendered, room - _MARKER_ROOM)
+        pieces = _split_bytes(rendered, room - _MARKER_ROOM)
     total = len(pieces)
     timestamps: list[int] = []
     for number, (piece, offset) in enumerate(pieces, 1):
@@ -591,15 +623,15 @@ def post_message(
             styles.append((_units(body) + 1, _units(marker) - 1, ITALIC))
             body += marker
         body += tail
-        if _units(body) > limit:
+        if _bytes(body) > limit:
             # Every reservation above -- the footer, the marker, the join
             # between paragraphs -- is arithmetic that can be wrong. This
             # measures the assembled part instead of predicting it, so a slip
             # is a loud failure naming the size rather than a message Signal
             # rejects or truncates without saying so.
             raise SignalCliError(
-                f"signal message part {number} of {total} assembled to {_units(body)} "
-                f"units, over the {limit}-unit limit; refusing to send it"
+                f"signal message part {number} of {total} assembled to {_bytes(body)} "
+                f"bytes, over the {limit}-byte limit; refusing to send it"
             )
         try:
             timestamps.append(transport.send(body, styles))
