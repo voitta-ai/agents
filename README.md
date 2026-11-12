@@ -749,6 +749,10 @@ So the send asks the gateway to hold the response until Signal takes it:
 was still in flight at the deadline, which includes a retry of a message still
 in flight. Only `200` returns; both others raise, so a caller that marks a
 signal delivered when the send returns can never mark one that did not arrive.
+A 5xx other than that 502 is pending rather than refused: the gateway's own
+refusal is a 502 carrying `send_failed`, and anything else in that range is a
+crash or a proxy giving up inside the window the gateway spends holding the
+reply, where the message may already be enqueued.
 
 A `200` whose status is `queued` means the gateway did not honour the wait at
 all -- an older build. That is a hard failure here rather than a pending one,
@@ -786,12 +790,16 @@ the vendor waterfall landed on to its reasons, and the destination renders
 those reasons into the message. A different rung would mean a different key,
 and the part that already reached the group would be posted again -- the one
 outcome the key exists to prevent. Each part goes under
-`<signal id>@<footer digest>#<number>-of-<total>`. The footer digest is there
-because the gateway namespaces its idempotency store by consumer, not by
-destination: two destinations sharing one token and one conversation are one
-consumer to it, so the same signal would otherwise key identically from both,
-and the second one's message would come back as a replay of the first --
-reported as delivered, never sent. It is a mitigation, not an answer: give
+`<signal id>@<footer digest>#<number>-of-<total>`, and a digest of the whole
+destination block goes into the key alongside it. Both are there because the
+gateway namespaces its idempotency store by consumer, not by destination: two
+destinations sharing one token and one conversation are one consumer to it, so
+the same signal would otherwise key identically from both, and the second
+one's message would come back as a replay of the first -- reported as
+delivered, never sent. The footer alone would not settle it, since an empty or
+shared footer is precisely the colliding case. Two destinations configured
+identically, in one conversation, sending one signal, still collide, and are
+the same message -- the one case where a replay is right. Beyond that, give
 each agent its own gateway consumer and token, which is what that namespacing
 is for. The total is in there deliberately too: a
 key naming only the part number would match across runs that split

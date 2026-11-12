@@ -697,6 +697,7 @@ class GatewayTransport:
         label: str = "",
         wait_s: int = 10,
         timeout: int = 120,
+        fingerprint: str = "",
     ):
         self.base_url = base_url.rstrip("/")
         self.conversation = conversation
@@ -704,6 +705,10 @@ class GatewayTransport:
         self.wait_s = wait_s
         self.timeout = timeout
         self._token = token
+        # Which destination this is, as far as anything stable can say. See
+        # `_key`: the gateway's idempotency store is namespaced by consumer,
+        # so two destinations behind one token need to differ here.
+        self.fingerprint = fingerprint
         self.idempotent = True
         # A label is prepended by the gateway to every message it sends, so
         # its bytes are not available to the body. `_bytes` and not `len`,
@@ -732,6 +737,37 @@ class GatewayTransport:
         retval = _NUMBER_RE.sub("<number>", retval)
         return retval
 
+    def _warn_replayed(self, status: str, seed: str) -> None:
+        """Say that the gateway replayed a message rather than sending one.
+
+        The gateway found this idempotency key in its store and answered with
+        the earlier message's outcome; nothing new went out. For the retry
+        this design asks for, that is exactly right. For a caller sending the
+        same signal twice inside `idempotency_ttl_s` it is a silent no-op
+        reported as success, and the flag is the only evidence either way --
+        so it is said out loud, from one place, before any of `send`'s
+        returns.
+        """
+        keyed = (
+            f"the id {seed!r} this part was sent under"
+            if seed
+            else "derived from this part's text and styles"
+        )
+        print(
+            f"signal gateway replayed an earlier message for this part "
+            f"(duplicate=true, status {status or 'unreported'!r}); nothing new was sent. "
+            f"The key is {keyed}, and the gateway remembers it for its idempotency TTL -- "
+            f"so a deliberate repeat, as opposed to a retry, keeps being replayed until "
+            f"that TTL expires"
+            + (
+                ", and editing the message will not change that, because the key does "
+                "not depend on the text"
+                if seed
+                else ""
+            ),
+            file=sys.stderr,
+        )
+
     def _key(self, text: str, ranges: list[tuple[int, int, str]], seed: str = "") -> str:
         """An idempotency key for this message to this conversation.
 
@@ -747,6 +783,23 @@ class GatewayTransport:
         changes the text and therefore a content-derived key -- and the part
         that already reached the group is sent a second time. A signal's `id`
         does not move for either reason.
+
+        The material also holds this transport's `fingerprint`, a digest of
+        the destination block it was built from, and the seed `post_message`
+        builds carries a digest of the footer. Both are there because the
+        gateway namespaces its idempotency store by consumer, not by
+        destination: two destinations sharing one gateway token and one
+        conversation are one consumer to it, so the same signal would
+        otherwise produce the same key from both, and the second one's
+        message -- its own footer, its own reasons -- would come back as a
+        replay of the first, reported as delivered and never sent. The footer
+        alone does not settle it, since an empty or shared footer is exactly
+        the case that collides; the whole block does, for any pair of
+        destinations configured differently in any respect. Two configured
+        identically, in one conversation, sending one signal, do still
+        collide -- and are the same message, the one case where a replay is
+        the right answer. Beyond that, give each agent its own gateway
+        consumer and token, which is what the namespacing is for.
 
         The seed `post_message` builds is `<id>#<number>-of-<total>`, and the
         total is in it on purpose. A key that named only the part number would
@@ -769,8 +822,8 @@ class GatewayTransport:
         words under different emphasis.
         """
         material = json.dumps(
-            [self.conversation, self.label, seed] if seed
-            else [self.conversation, self.label, text, ranges],
+            [self.conversation, self.label, self.fingerprint, seed] if seed
+            else [self.conversation, self.label, self.fingerprint, text, ranges],
             ensure_ascii=False,
             sort_keys=True,
         )
@@ -804,6 +857,11 @@ class GatewayTransport:
           failure and not a success, so it raises `SignalSendPending` and the
           next run resubmits the same key.
         """
+        # The ranges go in as offsets into the text as submitted, not
+        # shifted for a label. The gateway rebases them itself when it
+        # prefixes one -- `_labelled` adds `units(prefix)` to every style and
+        # mention start -- so adjusting here would move them twice. Only the
+        # label's *bytes* are this side's business, in `limit`.
         payload = {
             "to": {"conversation": self.conversation},
             "parts": [
@@ -898,6 +956,24 @@ class GatewayTransport:
                 f"afterwards, so that label is probably longer than this one, or set when "
                 f"this config has none: {tail}"
             )
+        if response.status_code == 502 and "send_failed" in said:
+            raise SignalGatewayError(
+                f"signal gateway answered 502 send_failed, refusing the message for "
+                f"good: {tail}"
+            )
+        if response.status_code >= 500:
+            # Not a refusal. The gateway's own "refused for good" is a 502
+            # carrying `send_failed`, handled above; any other 5xx is a
+            # gateway that crashed or a proxy that gave up, and it lands in
+            # the window the gateway spends holding the response for
+            # `wait_s` -- the same ambiguity the connection branch above
+            # treats as pending, and for the same reason: the message may
+            # already be enqueued.
+            raise SignalSendPending(
+                f"signal gateway answered {response.status_code}, which is not its own "
+                f"refusal. The message may already be queued, so it stays unmarked and "
+                f"the next run resubmits it under the same key: {tail}"
+            )
         if response.status_code != 200:
             raise SignalGatewayError(
                 f"signal gateway answered {response.status_code}: {tail}"
@@ -911,6 +987,8 @@ class GatewayTransport:
         if not isinstance(body, dict):
             raise SignalGatewayError(f"signal gateway answered 200 with {type(body).__name__}")
         status = str(body.get("status") or "")
+        if body.get("duplicate"):
+            self._warn_replayed(status, seed)
         if not status:
             # Absent, null or empty: all three are the gateway not saying,
             # which is not the same as saying something this version does not
@@ -939,33 +1017,6 @@ class GatewayTransport:
                 f"version does not know how to read; it knows "
                 f"{', '.join(sorted(_GATEWAY_SENT))}: {tail}"
             )
-        if body.get("duplicate"):
-            # The gateway found this idempotency key in its store and replayed
-            # the earlier message's outcome; nothing new was sent. For the
-            # retry this design asks for, that is exactly right. For a caller
-            # deliberately sending the same text twice inside
-            # `idempotency_ttl_s` it is a silent no-op reported as success, and
-            # the flag is the only evidence either way -- so it is said out
-            # loud rather than swallowed.
-            keyed = (
-                f"the id {seed!r} this part was sent under"
-                if seed
-                else "derived from this part's text and styles"
-            )
-            print(
-                f"signal gateway replayed an earlier message for this part "
-                f"(duplicate=true, status {status!r}); nothing new was sent. The key is "
-                f"{keyed}, and the gateway remembers it for its idempotency TTL -- so a "
-                f"deliberate repeat, as opposed to a retry, keeps being replayed until "
-                f"that TTL expires"
-                + (
-                    ", and editing the message will not change that, because the key "
-                    "does not depend on the text"
-                    if seed
-                    else ""
-                ),
-                file=sys.stderr,
-            )
         handle = str(body.get("message_id") or "")
         if not handle:
             # Delivered, id unknown: the same call the subprocess transport
@@ -993,7 +1044,10 @@ def _read_token_file(path: str, label: str) -> str:
         # and will not open -- 0400 owned by another account, root-owned, a
         # directory at that path -- is exactly the early, labelled failure
         # this function exists to produce.
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+        # O_NONBLOCK so a FIFO at this path fails instead of hanging the run
+        # with no timeout: the regular-file check below cannot run until the
+        # open returns, and on a FIFO it never would.
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     except OSError as exc:
         raise RuntimeError(
             f"{label}: cannot read 'token_file' {path!r}: {exc.strerror}"
@@ -1014,8 +1068,12 @@ def _read_token_file(path: str, label: str) -> str:
                 "runs the agent. Fix it with chmod 600 and, since it was readable, have the "
                 "token reissued"
             )
-        with os.fdopen(fd, "rb") as handle:
-            fd = -1  # fdopen owns it now and its context manager closes it
+        # Handed over before the call, not inside the `with`: if `fdopen`
+        # raises, it has already closed the descriptor, and the `finally`
+        # below would close it a second time -- an EBADF masking the real
+        # failure, or a close of a number since reused by another thread.
+        owned, fd = fd, -1
+        with os.fdopen(owned, "rb") as handle:
             retval = handle.read().decode("utf-8").strip()
     finally:
         if fd >= 0:
@@ -1087,6 +1145,13 @@ def _gateway_from_config(cfg: dict, label: str, timeout: int) -> GatewayTranspor
             f"gateway answering a moment after its own deadline times out the socket "
             f"instead, and a message still in flight is read as a failed send"
         )
+    # Everything the operator configured for this destination, as one short
+    # digest: see `GatewayTransport._key`. The token is deliberately not in
+    # it -- a value derived from a credential has no business on the wire,
+    # even hashed -- and `token_file` is a path, not a secret.
+    fingerprint = _short_digest(
+        json.dumps(cfg, ensure_ascii=False, sort_keys=True, default=str)
+    )
     token = _read_token_file(token_file, label)
     retval = GatewayTransport(
         base_url=url,
@@ -1095,6 +1160,7 @@ def _gateway_from_config(cfg: dict, label: str, timeout: int) -> GatewayTranspor
         label=message_label,
         wait_s=wait_s,
         timeout=timeout,
+        fingerprint=fingerprint,
     )
     if _bytes(message_label) > _MAX_LABEL_BYTES:
         # Bounded rather than merely checked for leaving a positive remainder.
@@ -1177,21 +1243,13 @@ def post_message(
 
     `seed` is a caller-stable id for the message -- a signal's `id`, not
     anything derived from the rendered text -- and each part is sent under
-    `<seed>@<footer digest>#<number>-of-<total>`. The footer is in there
-    because the gateway namespaces its idempotency store by consumer, not by
-    destination: two destinations sharing one gateway token and one
-    conversation are one consumer to it, so the same signal would otherwise
-    produce the same key from both, and the second one's message -- its own
-    footer, its own reasons -- would come back as a replay of the first,
-    reported as delivered and never sent. A footer is the part of a
-    destination's own configuration that does not move between runs. It is
-    not a complete answer: give each agent its own gateway consumer and token,
-    which is what the gateway's own namespacing is for. A transport that deduplicates resubmits uses
-    it to recognise a part it has already taken, which the text cannot do here
-    because a retry re-scores and the score's reasons are rendered into it.
-    The total is part of it so that a retry which splits differently is a
-    different message rather than a partial match: see
-    `GatewayTransport._key` for what that prevents. The footer rides on
+    `<seed>@<footer digest>#<number>-of-<total>`. A transport that
+    deduplicates resubmits uses it to recognise a part it has already taken,
+    which the text cannot do here because a retry re-scores and the score's
+    reasons are rendered into it. The total is part of it so that a retry
+    which splits differently is a different message rather than a partial
+    match, and the footer tells two destinations apart; see
+    `GatewayTransport._key` for what each of those prevents. The footer rides on
     each part, as it does on Slack, because a standing line that appears on
     only the last part of three is a line a reader can miss -- and it is
     appended after the conversion, so it arrives as the characters it was
