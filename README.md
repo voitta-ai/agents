@@ -1009,3 +1009,7 @@ without printing a secret into a terminal, a log, or an agent transcript.
 ## Status
 
 Early scaffold. See GitHub issues for the tracked build-out plan (#1-#13).
+
+## License
+
+AGPL-3.0-or-later -- see [LICENSE](./LICENSE).
