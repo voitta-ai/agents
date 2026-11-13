@@ -3,7 +3,7 @@ name = "agents-framework"
 version = "0.1.0"
 description = "Framework for small, single-purpose pain-signal / lead-finding agents."
 requires-python = ">=3.10"
-license = "MIT"
+license = "AGPL-3.0-or-later"
 license-files = ["LICENSE"]
 dependencies = [
     "requests>=2.31",
@@ -34,7 +34,7 @@ agent = "framework.cli:main"
 # exactly by one definition", because those versions accept only the older
 # table forms, {text = "..."} or {file = "..."}. Checked against 75.8.0, which
 # fails, and 77.0.3 and 80.9.0, which both build and emit
-# `License-Expression: MIT` with the LICENSE file in the wheel.
+# `License-Expression: AGPL-3.0-or-later` with the LICENSE file in the wheel.
 requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
