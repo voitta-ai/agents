@@ -66,6 +66,13 @@ that drops signals by its own rules has to say so in its own logs. Naming the
 counter `sent` rather than `delivered` is the whole of the honesty available at
 this layer.
 
+What the summary line cannot say, the per-signal lines can. The loop prints one
+stderr line per scored signal carrying its id and its score, which is the fact
+every destination gate turns on. That is not a delivery claim and adds nothing
+to `Destination`: it simply means a log can answer "how many signals landed just
+under the threshold", a question the counters above are structurally unable to
+answer and the one question worth asking before moving a `min_score`.
+
 A source may set `dedupe = False` (issue #59), read here with getattr like
 `commit()`. The SeenStore makes a *stream* safe -- each item is interesting
 once -- but a window digest is the other shape, re-listing "what is on this
@@ -155,6 +162,19 @@ def run(
                     file=sys.stderr,
                 )
                 continue
+            # One stderr line per scored signal. The summary counters below
+            # cannot tell "scored 58" from "scored 12", so a destination's own
+            # min_score gate is invisible in the log and there is no evidence
+            # for or against moving it. This is the cheapest thing that makes
+            # the distribution measurable: no new protocol surface, no claim
+            # about what the destination did with the signal. Deliberately
+            # symmetric with the unscored line above -- same prefix, the same
+            # id -- so one grep over a log yields both outcomes per signal.
+            print(
+                f"agent={agent_name} scored id={signal.id} "
+                f"score={scored.score} source={signal.source}",
+                file=sys.stderr,
+            )
             destination.send(scored)
             sent += 1
             if dedupe:
