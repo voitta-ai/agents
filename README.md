@@ -3,6 +3,60 @@
 Framework for small, single-purpose pain-signal / lead-finding agents that run
 as short-lived, cron/launchd-invoked processes (not daemons).
 
+## If you arrived here cold
+
+An agent here is four pieces and a clock. A **source** it reads, a **scorer**
+that rates what it found, a **destination** that receives whatever cleared the
+bar, and **state** so the next run does not repeat the last one. You declare
+those four in one JSON file and the framework runs them; each piece is a plugin,
+so a new source or destination is a class and a registry entry rather than a
+fork.
+
+Three things run on it today:
+
+- **Reddit lead-finding** — reads new posts across a list of subreddits, has a
+  model judge which of them is somebody describing a problem worth answering,
+  and posts what clears the threshold to Slack together with a drafted reply
+  that a human sends, edits or discards.
+- **Digests of community Slack workspaces** — workspaces we take part in but do
+  not administer, read either through their own notification emails or as the
+  logged-in browser user, and summarized.
+- **Weekly release notes** — one signal per GitHub release across an
+  organization since the last run.
+
+It is worth your time if you want a scored feed out of a noisy source and would
+rather write a config than a service. It is not a general agent framework, an
+orchestrator or a chatbot: nothing here holds a conversation, and an agent does
+not decide to act on its own. Where an action would have consequences outside
+the agent — publishing a post, sending an application — the destination
+proposes and a human approves before anything leaves (see
+[Approval-gated actions](#approval-gated-actions)).
+
+### Run one
+
+```bash
+git clone https://github.com/voitta-ai/agents && cd agents
+python3 -m venv .venv && . .venv/bin/activate
+pip install -e .
+
+mkdir -p ~/agent-workspaces/reddit-leads
+cp agents/reddit-leads/config.example.json \
+   ~/agent-workspaces/reddit-leads/config.json
+# Edit that file: the subreddits and the scoring rules are yours. The example
+# ships the keyword scorer, which needs no model and no key; swapping it for
+# "type": "llm" is what the deployment above runs. The Slack webhook is not
+# written in the file -- the route names an environment variable
+# (SLACK_LEADS_WEBHOOK in the example) that holds the URL.
+agent run --workspace ~/agent-workspaces/reddit-leads
+```
+
+Nothing else is needed to see a run end to end. The workspace is a directory
+outside any git checkout holding that agent's config, its dedupe state and its
+logs, which is what makes a merge to master not a deploy; see
+[Layout](#layout). When the run looks right,
+`agent install-schedule --workspace <path>` turns the config's `schedule` into
+the launchd job that invokes it from then on; see [Scheduling](#scheduling).
+
 ## Shape
 
 - **Source** — where signals come from (e.g. Reddit RSS). Plugin interface,
@@ -126,8 +180,9 @@ Approval-gated actions), so avoid re-installing while one is executing.
 
 ## Agents
 
-- `agents/reddit-leads/` — first agent, porting the pain-signal Reddit
-  monitor currently running out of `hq/leads/signals/`. See issue #8.
+- `agents/reddit-leads/` — reads new posts from a list of subreddits and
+  scores each one for somebody describing a problem worth answering. See
+  issue #8.
 - `agents/slack-workspace/` — digests community Slack workspaces we
   participate in but don't administer, via their own notification emails
   forwarded to AgentMail. See issue #19. An inbox that looks empty is usually
@@ -1008,7 +1063,9 @@ without printing a secret into a terminal, a log, or an agent transcript.
 
 ## Status
 
-Early scaffold. See GitHub issues for the tracked build-out plan (#1-#13).
+In use rather than finished: the agents above run on a schedule against live
+sources, while the plugin interfaces are still moving. See the GitHub issues
+for the tracked build-out plan.
 
 ## License
 
