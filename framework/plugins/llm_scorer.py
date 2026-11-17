@@ -42,12 +42,20 @@ sizes and schedules the deployed agents run at (25 signals every few hours) and
 would not be for a firehose. Nothing here batches signals into one call; that is
 a deliberate non-feature until an agent needs it.
 
+`repeats` and `repeat_above` buy a second and third opinion where the score is
+close enough to a destination's gate for the scorer's own run-to-run noise to
+decide the outcome. Set `repeat_above` a little below that gate: only a first
+pass at or above it is repeated, the median wins, and everything else still
+costs exactly one call. Both default to one pass and no threshold, so a scorer
+that sets neither is unchanged.
+
 Contract: see docs/PLUGIN-CONTRACT.md.
 """
 from __future__ import annotations
 
 import json
 import math
+import statistics
 
 from framework.interfaces import ScoredSignal, ScoreError, Scorer, Signal
 from framework.llm import LLMClient, build_client
@@ -169,6 +177,8 @@ class LLMScorer:
         max_chars: int = 4000,
         floor: int = 0,
         ceiling: int = 100,
+        repeats: int = 1,
+        repeat_above: int = 0,
     ):
         self.llm = llm
         self.prompt = prompt
@@ -176,6 +186,8 @@ class LLMScorer:
         self.max_chars = max_chars
         self.floor = floor
         self.ceiling = ceiling
+        self.repeats = repeats
+        self.repeat_above = repeat_above
 
     @property
     def model_used(self) -> str | None:
@@ -209,8 +221,7 @@ class LLMScorer:
         retval = "\n".join(parts)
         return retval
 
-    def score(self, signal: Signal) -> ScoredSignal:
-        user = self._render(signal)
+    def _one_pass(self, user: str) -> tuple[int, list[str]]:
         reply = self.llm.complete(self.system, user)
         try:
             score, reasons = _parse_score(reply)
@@ -225,7 +236,58 @@ class LLMScorer:
                 raise LLMScoreError(
                     f"unreadable reply after one retry; first: {first}; retry: {second}"
                 ) from second
-        score = max(self.floor, min(self.ceiling, score))
+        retval = (max(self.floor, min(self.ceiling, score)), reasons)
+        return retval
+
+    def score(self, signal: Signal) -> ScoredSignal:
+        """Score once, and again where the answer is close enough to matter.
+
+        The model does not return the same score twice for the same text.
+        Measured on 14 real leads at `temperature: 0.0`, re-scoring differed
+        from the delivered score by `-27, -10, -6, -5, -3, 0 x6, +6, +10, +16`
+        -- mean absolute 5.9, with tails far wider than that. A destination
+        gate at 60 sits inside that spread, so whether a given post clears it
+        is partly chance, and one pass cannot tell a 58 that is really a 58
+        from a 58 that is really a 74.
+
+        Repeating every signal would fix that and triple the bill, which is
+        not a neutral cost on a waterfall whose rungs are already hitting
+        vendor budget limits. It would also spend most of that money on the
+        roughly 70% of posts that score in single digits, where no amount of
+        noise changes what happens to them.
+
+        So repeats are spent only where they can change an outcome:
+        `repeat_above` is set just below the gate the destination applies,
+        and only a first pass at or above it is scored again. The median
+        wins, because the tails are what this is for -- a mean would let a
+        single -27 outlier drag a real lead back under the gate, which is the
+        failure being fixed.
+
+        Defaults to one pass, so a scorer that configures nothing behaves
+        exactly as it did before.
+        """
+        user = self._render(signal)
+        passes = [self._one_pass(user)]
+
+        if self.repeats > 1 and passes[0][0] >= self.repeat_above:
+            for _ in range(self.repeats - 1):
+                try:
+                    passes.append(self._one_pass(user))
+                except LLMScoreError:
+                    # The first pass already answered, so this signal is not
+                    # unscorable; a repeat that cannot be read is one sample
+                    # fewer, not a reason to drop the signal and re-do the
+                    # whole thing next run.
+                    continue
+
+        scores = [n for n, _ in passes]
+        score = int(round(statistics.median(scores)))
+        # The reasons shown are the ones from whichever pass came closest to
+        # the score beside them, so the bullets a human reads belong to the
+        # number they are reading.
+        reasons = min(passes, key=lambda pair: abs(pair[0] - score))[1]
+        if len(scores) > 1:
+            reasons.append("scores=" + ",".join(str(n) for n in scores))
         reasons.append(f"model={self.llm.model_used}")
         retval = ScoredSignal(signal=signal, score=score, reasons=reasons)
         return retval
@@ -243,6 +305,11 @@ def build(cfg: dict) -> Scorer:
         default_temperature=0.0,
         what="llm scorer",
     )
+    repeats = int(cfg.get("repeats", 1))
+    if repeats < 1:
+        raise RuntimeError("llm scorer 'repeats' is a number of passes, so it is at least 1")
+    repeat_above = int(cfg.get("repeat_above", 0))
+
     retval = LLMScorer(
         llm=llm,
         prompt=prompt,
@@ -250,5 +317,7 @@ def build(cfg: dict) -> Scorer:
         max_chars=int(cfg.get("max_chars", 4000)),
         floor=int(cfg.get("floor", 0)),
         ceiling=int(cfg.get("ceiling", 100)),
+        repeats=repeats,
+        repeat_above=repeat_above,
     )
     return retval
