@@ -126,6 +126,9 @@ class RedditSource:
         self.max_retries = max_retries
         self.include_rules = include_rules
         self.feed_errors: list[tuple[str, str]] = []
+        # One (subreddit, url, posts) row per feed that answered, so a run can
+        # say how much of its configured supply it actually got.
+        self.feed_counts: list[tuple[str, str, int]] = []
         # Rules that could not be read. Separate from feed_errors because they
         # degrade a lead rather than losing one, and must not count toward the
         # all-feeds-failed check that turns a dead run into a raise.
@@ -240,6 +243,7 @@ class RedditSource:
 
     def fetch(self) -> list[Signal]:
         self.feed_errors = []
+        self.feed_counts = []
         self.rule_errors = []
         signals: list[Signal] = []
         seen_ids: set[str] = set()
@@ -253,7 +257,15 @@ class RedditSource:
             urls = [_search_url(subreddit, s) for s in searches] or [_new_url(subreddit)]
             for url in urls:
                 attempted += 1
-                for post in self._fetch_feed(url):
+                # `_fetch_feed` returns [] both for a feed that failed and for
+                # one that is genuinely empty, and those are opposite facts.
+                # The error list growing across the call is what separates
+                # them, so a feed counted here is one that actually answered.
+                failures_before = len(self.feed_errors)
+                posts = self._fetch_feed(url)
+                if len(self.feed_errors) == failures_before:
+                    self.feed_counts.append((subreddit, url, len(posts)))
+                for post in posts:
                     signal = self._to_signal(post, subreddit)
                     # The same post can surface under several search terms.
                     if not signal.id or signal.id in seen_ids:
@@ -263,6 +275,37 @@ class RedditSource:
                     if rules:
                         signal.meta["subreddit_rules"] = rules
                     signals.append(signal)
+
+        # Neither must a half-failed one. Until this line existed, a feed that
+        # 404ed or stayed rate-limited was recorded in `feed_errors` and then
+        # never mentioned again unless *every* feed failed, so the usual case
+        # -- some feeds through, some not -- was silent. It is not a rare case:
+        # across 285 runs of the leads agent the fetched count never once
+        # reached the configured 8 x 25, and its three most common values sat
+        # one, two and three whole feeds short. Roughly 40% of the configured
+        # supply had been going missing since the agent was first deployed,
+        # with nothing in any log to say so.
+        if attempted:
+            got = sum(n for _, _, n in self.feed_counts)
+            per_sub: dict[str, int] = {}
+            for subreddit, _, n in self.feed_counts:
+                per_sub[subreddit] = per_sub.get(subreddit, 0) + n
+            detail = " ".join(f"{sub}={n}" for sub, n in per_sub.items())
+            print(
+                f"reddit source: {len(self.feed_counts)}/{attempted} feed(s) answered "
+                f"with {got} post(s) — {detail or 'none'}",
+                file=sys.stderr,
+            )
+        # Unconditional on feed_errors, including the all-failed case below:
+        # the raise quotes only the first three, and the reason the other five
+        # failed is worth having.
+        if self.feed_errors:
+            print(
+                f"reddit source: {len(self.feed_errors)} of {attempted} feed(s) failed and "
+                f"their posts are missing from this run — "
+                f"{'; '.join(f'{url}: {why}' for url, why in self.feed_errors)}",
+                file=sys.stderr,
+            )
 
         # A totally failed run must not masquerade as a quiet one.
         if attempted and len(self.feed_errors) == attempted:
