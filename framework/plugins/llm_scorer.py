@@ -150,6 +150,23 @@ class LLMScorer:
         self.floor = floor
         self.ceiling = ceiling
 
+    @property
+    def model_used(self) -> str | None:
+        """Which waterfall rung answered the most recent `score()` call.
+
+        A waterfall falls through on a rung that is out of budget, timing out
+        or answering empty, so consecutive signals in one run can be scored by
+        different models on different scales. The runner reads this through
+        `getattr` and puts it on the per-signal log line, which is the only
+        place the two facts -- what the score was, and who produced it -- can
+        be read together after the fact.
+
+        `None` before the first call. After a reply that had to be retried it
+        names the rung that answered the retry, which is the one the score (or
+        the `ScoreError`) came from.
+        """
+        return self.llm.model_used
+
     def _render(self, signal: Signal) -> str:
         title = (signal.meta or {}).get("title")
         body = signal.text.strip()
