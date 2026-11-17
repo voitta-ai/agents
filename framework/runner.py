@@ -113,6 +113,28 @@ from framework.interfaces import Destination, ScoreError, Scorer, Source
 from framework.state import SeenStore
 
 
+def _model_suffix(scorer: Scorer) -> str:
+    """` model=<rung>` for a scorer that names the model it just used, else "".
+
+    A scorer backed by an LLM waterfall does not use one model, it uses
+    whichever rung answered: the primary falls through on an exhausted budget,
+    a timeout or an empty completion, and the next signal in the same run may
+    be scored by a different model on a different scale. Without this, a log
+    full of scores cannot distinguish a drifting corpus from a drifting
+    scorer, and a gate tuned against one model is silently applied to another.
+
+    Optional and discovered with `getattr`, exactly like `flush()` and
+    `commit()`: the regex scorer defines nothing and its log lines are
+    unchanged.
+
+    The value is the waterfall's own label, `name (model)`, so it contains
+    spaces and is always the last field on the `scored` line.
+    """
+    model = getattr(scorer, "model_used", None)
+    retval = f" model={model}" if model else ""
+    return retval
+
+
 def run(
     source: Source,
     scorer: Scorer,
@@ -157,8 +179,12 @@ def run(
                 # retries it. Anything else a scorer raises aborts the run.
                 unscored += 1
                 detail = str(exc).replace("\n", " ")
+                # `model=` goes before `error=`, not after: the error detail
+                # is unbounded free text, so anything following it cannot be
+                # split back out.
                 print(
-                    f"agent={agent_name} unscored id={signal.id} error={detail}",
+                    f"agent={agent_name} unscored id={signal.id}"
+                    f"{_model_suffix(scorer)} error={detail}",
                     file=sys.stderr,
                 )
                 continue
@@ -172,7 +198,8 @@ def run(
             # id -- so one grep over a log yields both outcomes per signal.
             print(
                 f"agent={agent_name} scored id={signal.id} "
-                f"score={scored.score} source={signal.source}",
+                f"score={scored.score} source={signal.source}"
+                f"{_model_suffix(scorer)}",
                 file=sys.stderr,
             )
             destination.send(scored)
