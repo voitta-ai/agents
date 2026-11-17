@@ -53,12 +53,39 @@ from framework.interfaces import ScoredSignal, ScoreError, Scorer, Signal
 from framework.llm import LLMClient, build_client
 from framework.registry import register_scorer
 
+# Why the bands, and why "be strict" is no longer the last word.
+#
+# The previous version of this gave two anchors, 0 and 100, and ended "Be
+# strict: most text is irrelevant and should score low". Measured over 308
+# scored posts from the deployed leads agent, that produced a distribution with
+# no usable middle and no top at all: 71% of everything landed on 2-5, a
+# near-constant floor rather than a judgment, and the single highest score in
+# the whole sample was 62. Nothing scored above it, because "an unmistakable
+# match" reads as a bar nothing clears, and a strictness instruction with no
+# counterweight is satisfied most cheaply by scoring everything low.
+#
+# That is a problem for any fixed `min_score` gate downstream: the gate was
+# chosen against a distribution that has since collapsed underneath it, and a
+# post that scored 86 in October scores 62 now. Naming the bands, and saying
+# out loud that the bottom being crowded is not a reason to crowd the top,
+# asks for the discrimination the gate was always assuming.
 _DEFAULT_SYSTEM = (
     "You score short pieces of text for a specific purpose described by the "
     "user. Reply with a single JSON object and nothing else: "
     '{"score": <integer 0-100>, "reasons": [<one or two short strings>]}. '
-    "0 means irrelevant, 100 means an unmistakable match. Be strict: most "
-    "text is irrelevant and should score low."
+    "Use the whole range. Place each text in one of these bands and then "
+    "pick a number inside it:\n"
+    "90-100: everything the user asked for is present and stated outright.\n"
+    "70-89: clearly the thing the user is looking for, with one element "
+    "implied rather than stated.\n"
+    "50-69: plausibly the thing, but what would settle it is missing and you "
+    "are inferring it.\n"
+    "20-49: the right subject, the wrong thing.\n"
+    "0-19: unrelated.\n"
+    "Most text belongs in the bottom two bands. That is expected, and it is "
+    "not a reason to compress the top ones: a text that matches better than "
+    "another must score higher than it. Do not return the same few numbers "
+    "for everything."
 )
 
 _DECODER = json.JSONDecoder()
