@@ -15,10 +15,53 @@ search-engine-as-source. A `site:linkedin.com/posts` query and a
       "fetch_page": true
     }
 
-Why Brave rather than a scraped SERP: it is a documented API with a key, so
-nothing here depends on a page's markup holding still. The retired LinkedIn
+Why a search API rather than a scraped SERP: it is documented and takes a key,
+so nothing here depends on a page's markup holding still. The retired LinkedIn
 scraper broke silently against a changed DOM while still reporting successful
 runs, and that failure mode is what this plugin exists not to repeat.
+
+## Two backends, and when the second one matters
+
+`backend` is `brave` (the default, unchanged) or `firecrawl`:
+
+    "source": {
+      "type": "websearch",
+      "backend": "firecrawl",
+      "firecrawl_api_key_env": "FIRECRAWL_API_KEY",
+      "api_key_env": "BRAVE_API_KEY",
+      "queries": ["\"I own a\" plumbing business"],
+      "count": 10
+    }
+
+`freshness` and `country` are Brave's parameters and have no verified Firecrawl
+equivalent, so combining either with `backend: "firecrawl"` is refused at build
+time rather than accepted and dropped. Asking for the past week and silently
+getting everything is the kind of quiet wrongness this plugin exists to avoid,
+and guessing at a translation would be worse: the config would then look
+honoured while meaning something nobody checked. Whoever needs it can add the
+mapping against a real reply.
+
+The difference that justifies the second one is **quoted phrases**. A query that
+finds a business owner identifying themselves is recognisable by its
+construction rather than its topic -- `"I own a"`, `"I run a small"` -- so the
+engine has to honour the quotes. Firecrawl does. Brave mostly does (measured
+2026-11-12: 72-100% of on-site snippets contained the quoted phrase) and honours
+`site:`, but returns nothing at all for `site:reddit.com/r/<sub>`.
+
+With `backend: "firecrawl"` each query goes to Firecrawl, and once Firecrawl
+answers 402 (credits exhausted) the rest of the run uses Brave -- including the
+query that hit the 402, which is retried there immediately. Exhaustion is sticky
+for the run and announced on stderr once, not once per query. If there is no
+Brave key to fall back to, the 402 is recorded as that query's error and the
+run carries on under the whole-run guard below.
+
+**Only a 402 falls back.** A Firecrawl 429 or 500 is recorded as a query error
+like any other and is *not* answered by Brave. Credits running out is a
+permanent condition for the rest of the run, and continuing is strictly better
+than stopping; a transient error is not, and quietly swapping the engine
+mid-run would change what a quoted phrase means with nothing in the log saying
+so. `meta["backend"]` on every signal names the engine that returned it, so a
+run that straddles the switch can still be read.
 
 ## Snippets, `fetch_page`, and the honest limit
 
@@ -83,7 +126,9 @@ import requests
 from framework.interfaces import Signal, Source
 from framework.registry import register_source
 
-_ENDPOINT = "https://api.search.brave.com/res/v1/web/search"
+_BRAVE_ENDPOINT = "https://api.search.brave.com/res/v1/web/search"
+_FIRECRAWL_ENDPOINT = "https://api.firecrawl.dev/v2/search"
+_BACKENDS = ("brave", "firecrawl")
 _DEFAULT_LABEL = "websearch"
 _DEFAULT_PAGE_CHARS = 4000
 
@@ -175,6 +220,8 @@ class WebSearchSource:
         self,
         api_key: str,
         queries: list[str],
+        backend: str = "brave",
+        firecrawl_api_key: str = "",
         count: int = 10,
         freshness: str = "",
         fetch_page: bool = False,
@@ -188,6 +235,8 @@ class WebSearchSource:
     ):
         self.api_key = api_key
         self.queries = queries
+        self.backend = backend
+        self.firecrawl_api_key = firecrawl_api_key
         self.count = count
         self.freshness = freshness
         self.fetch_page = fetch_page
@@ -199,8 +248,88 @@ class WebSearchSource:
         self.page_timeout = page_timeout
         self.user_agent = user_agent
         self.query_errors: list[tuple[str, str]] = []
+        # Sticky for the run: once Firecrawl says the credits are gone, asking
+        # it again on every remaining query only wastes the run's time.
+        self._firecrawl_exhausted = False
 
     def _search(self, query: str) -> list[dict]:
+        """The configured backend's results, falling back to Brave on a 402."""
+        if self.backend != "firecrawl" or self._firecrawl_exhausted:
+            return self._search_brave(query)
+
+        results, exhausted = self._search_firecrawl(query)
+        if not exhausted:
+            return results
+
+        self._firecrawl_exhausted = True
+        print(
+            "websearch source: firecrawl credits exhausted; the rest of this run "
+            f"{'uses brave' if self.api_key else 'has no backend left'}",
+            file=sys.stderr,
+        )
+        return self._search_brave(query)
+
+    def _search_firecrawl(self, query: str) -> tuple[list[dict], bool]:
+        """(results, credits_exhausted).
+
+        The flag is separate from an empty list because the two mean opposite
+        things: no results for this query, versus no results for any query from
+        here on. Only the second is worth switching engines over.
+        """
+        body = {"query": query, "limit": self.count, "sources": ["web"]}
+        headers = {"Authorization": f"Bearer {self.firecrawl_api_key}"}
+        try:
+            resp = requests.post(
+                _FIRECRAWL_ENDPOINT, json=body, headers=headers, timeout=self.timeout
+            )
+        except requests.RequestException as exc:
+            self.query_errors.append((query, f"firecrawl {type(exc).__name__}: {exc}"))
+            return ([], False)
+        if resp.status_code == 402:
+            return ([], True)
+        if not resp.ok:
+            self.query_errors.append((query, f"firecrawl {resp.status_code} {resp.reason}"))
+            return ([], False)
+        try:
+            payload = resp.json()
+        except ValueError as exc:
+            self.query_errors.append((query, f"firecrawl reply was not JSON: {exc}"))
+            return ([], False)
+        if not payload.get("success", True):
+            self.query_errors.append((query, f"firecrawl: {payload.get('error')}"))
+            return ([], False)
+        data = payload.get("data") or {}
+        rows = data.get("web") if isinstance(data, dict) else data
+        if not isinstance(rows, list):
+            self.query_errors.append((query, "firecrawl data.web was not a list"))
+            return ([], False)
+        # Normalised to the shape `_to_signal` already reads, so one code path
+        # builds the Signal whichever engine answered. Firecrawl reports no age
+        # for a result; the keys stay absent rather than being faked.
+        results = [
+            {
+                "url": row.get("url", ""),
+                "title": row.get("title", ""),
+                "description": row.get("description", ""),
+                "backend": "firecrawl",
+            }
+            for row in rows
+            if isinstance(row, dict)
+        ]
+        return (results, False)
+
+    def _search_brave(self, query: str) -> list[dict]:
+        # Reachable with no key only after a Firecrawl 402, since `build()`
+        # requires the key when Brave is the configured backend. Checked here
+        # rather than at the fallback because it has to hold for *every*
+        # remaining query, not just the one that hit the 402: sending them with
+        # an empty token would spend the rest of the run collecting 401s.
+        if not self.api_key:
+            self.query_errors.append(
+                (query, "402 firecrawl credits exhausted, and no Brave key to fall back to")
+            )
+            return []
+
         params: dict[str, object] = {"q": query, "count": self.count}
         if self.freshness:
             params["freshness"] = self.freshness
@@ -210,7 +339,13 @@ class WebSearchSource:
             "Accept": "application/json",
             "X-Subscription-Token": self.api_key,
         }
-        resp = requests.get(_ENDPOINT, params=params, headers=headers, timeout=self.timeout)
+        try:
+            resp = requests.get(
+                _BRAVE_ENDPOINT, params=params, headers=headers, timeout=self.timeout
+            )
+        except requests.RequestException as exc:
+            self.query_errors.append((query, f"{type(exc).__name__}: {exc}"))
+            return []
         if resp.status_code == 429:
             self.query_errors.append((query, "429 rate limited"))
             return []
@@ -226,6 +361,9 @@ class WebSearchSource:
         if not isinstance(results, list):
             self.query_errors.append((query, "web.results was not a list"))
             return []
+        for result in results:
+            if isinstance(result, dict):
+                result["backend"] = "brave"
         return results
 
     def _page_text(self, url: str) -> tuple[str, str]:
@@ -248,6 +386,7 @@ class WebSearchSource:
 
     def fetch(self) -> list[Signal]:
         self.query_errors = []
+        self._firecrawl_exhausted = False
         signals: list[Signal] = []
         seen_ids: set[str] = set()
 
@@ -288,6 +427,7 @@ class WebSearchSource:
             "title": title,
             "snippet": snippet,
             "query": query,
+            "backend": str(result.get("backend") or ""),
             "age": str(result.get("age") or ""),
             "page_age": str(result.get("page_age") or ""),
             "page_fetched": False,
@@ -307,13 +447,44 @@ class WebSearchSource:
 
 @register_source("websearch")
 def build(cfg: dict) -> Source:
+    backend = str(cfg.get("backend", "brave") or "brave").strip().lower()
+    if backend not in _BACKENDS:
+        raise RuntimeError(
+            f"websearch source: 'backend' must be one of {', '.join(_BACKENDS)}, "
+            f"not {backend!r}"
+        )
+
     api_key_env = cfg.get("api_key_env", "BRAVE_API_KEY")
-    api_key = os.environ.get(api_key_env)
-    if not api_key:
+    api_key = os.environ.get(api_key_env) or ""
+    firecrawl_api_key_env = cfg.get("firecrawl_api_key_env", "FIRECRAWL_API_KEY")
+    firecrawl_api_key = ""
+
+    if backend == "firecrawl":
+        firecrawl_api_key = os.environ.get(firecrawl_api_key_env) or ""
+        if not firecrawl_api_key:
+            raise RuntimeError(
+                f"websearch source needs the Firecrawl API key in "
+                f"${firecrawl_api_key_env} — it is a secret, so it is never "
+                "accepted from config"
+            )
+        # The Brave key stays optional here: it is only the 402 fallback, and
+        # refusing to start without it would make the backend that needs no
+        # fallback impossible to configure.
+    elif not api_key:
         raise RuntimeError(
             f"websearch source needs the Brave Search API key in ${api_key_env} — "
             "it is a secret, so it is never accepted from config"
         )
+
+    if backend == "firecrawl":
+        brave_only = [k for k in ("freshness", "country") if cfg.get(k)]
+        if brave_only:
+            raise RuntimeError(
+                "websearch source: "
+                f"{', '.join(brave_only)} {'is' if len(brave_only) == 1 else 'are'} "
+                "Brave-only and would be silently ignored by the firecrawl "
+                "backend — drop it, or use backend 'brave'"
+            )
 
     queries = cfg.get("queries")
     if not isinstance(queries, list) or not queries:
@@ -325,6 +496,8 @@ def build(cfg: dict) -> Source:
     retval = WebSearchSource(
         api_key=api_key,
         queries=[q.strip() for q in queries],
+        backend=backend,
+        firecrawl_api_key=firecrawl_api_key,
         count=int(cfg.get("count", 10)),
         freshness=str(cfg.get("freshness", "") or ""),
         fetch_page=bool(cfg.get("fetch_page", False)),
