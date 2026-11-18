@@ -8,8 +8,6 @@ search-engine-as-source. A `site:linkedin.com/posts` query and a
 
     "source": {
       "type": "websearch",
-      "backend": "firecrawl",
-      "firecrawl_api_key_env": "FIRECRAWL_API_KEY",
       "api_key_env": "BRAVE_API_KEY",
       "queries": ["<city> small business networking", "site:eventbrite.com <city>"],
       "count": 10,
@@ -24,7 +22,24 @@ runs, and that failure mode is what this plugin exists not to repeat.
 
 ## Two backends, and when the second one matters
 
-`backend` is `brave` (the default, unchanged) or `firecrawl`.
+`backend` is `brave` (the default, unchanged) or `firecrawl`:
+
+    "source": {
+      "type": "websearch",
+      "backend": "firecrawl",
+      "firecrawl_api_key_env": "FIRECRAWL_API_KEY",
+      "api_key_env": "BRAVE_API_KEY",
+      "queries": ["\"I own a\" plumbing business"],
+      "count": 10
+    }
+
+`freshness` and `country` are Brave's parameters and have no verified Firecrawl
+equivalent, so combining either with `backend: "firecrawl"` is refused at build
+time rather than accepted and dropped. Asking for the past week and silently
+getting everything is the kind of quiet wrongness this plugin exists to avoid,
+and guessing at a translation would be worse: the config would then look
+honoured while meaning something nobody checked. Whoever needs it can add the
+mapping against a real reply.
 
 The difference that justifies the second one is **quoted phrases**. A query that
 finds a business owner identifying themselves is recognisable by its
@@ -263,9 +278,13 @@ class WebSearchSource:
         """
         body = {"query": query, "limit": self.count, "sources": ["web"]}
         headers = {"Authorization": f"Bearer {self.firecrawl_api_key}"}
-        resp = requests.post(
-            _FIRECRAWL_ENDPOINT, json=body, headers=headers, timeout=self.timeout
-        )
+        try:
+            resp = requests.post(
+                _FIRECRAWL_ENDPOINT, json=body, headers=headers, timeout=self.timeout
+            )
+        except requests.RequestException as exc:
+            self.query_errors.append((query, f"firecrawl {type(exc).__name__}: {exc}"))
+            return ([], False)
         if resp.status_code == 402:
             return ([], True)
         if not resp.ok:
@@ -320,9 +339,13 @@ class WebSearchSource:
             "Accept": "application/json",
             "X-Subscription-Token": self.api_key,
         }
-        resp = requests.get(
-            _BRAVE_ENDPOINT, params=params, headers=headers, timeout=self.timeout
-        )
+        try:
+            resp = requests.get(
+                _BRAVE_ENDPOINT, params=params, headers=headers, timeout=self.timeout
+            )
+        except requests.RequestException as exc:
+            self.query_errors.append((query, f"{type(exc).__name__}: {exc}"))
+            return []
         if resp.status_code == 429:
             self.query_errors.append((query, "429 rate limited"))
             return []
@@ -452,6 +475,16 @@ def build(cfg: dict) -> Source:
             f"websearch source needs the Brave Search API key in ${api_key_env} — "
             "it is a secret, so it is never accepted from config"
         )
+
+    if backend == "firecrawl":
+        brave_only = [k for k in ("freshness", "country") if cfg.get(k)]
+        if brave_only:
+            raise RuntimeError(
+                "websearch source: "
+                f"{', '.join(brave_only)} {'is' if len(brave_only) == 1 else 'are'} "
+                "Brave-only and would be silently ignored by the firecrawl "
+                "backend — drop it, or use backend 'brave'"
+            )
 
     queries = cfg.get("queries")
     if not isinstance(queries, list) or not queries:
