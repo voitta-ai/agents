@@ -606,6 +606,36 @@ payload merged with each step's returned dict. Shipped:
 
 ## Operating notes
 
+### Reading a run log
+
+Every line `agent run` writes is prefixed with the local time and its UTC
+offset:
+
+```
+2026-11-18T12:25:04-08:00 agent=leads status=ok fetched=153 new=38 sent=38 unscored=0 seen=12497
+```
+
+The prefix is applied to stdout and stderr for the duration of the run, so the
+summary line, the per-signal lines and whatever a source plugin printed all
+carry it, and so does a traceback. Nothing else about the lines changed, so the
+two idioms worth knowing still work:
+
+```bash
+# the score distribution of a run. The leading space is load-bearing: without
+# it the `unscored id=` lines match too and inflate the count.
+grep ' scored id=' logs/run.error.log | sed 's/.*score=\([0-9]*\).*/\1/' | sort -n
+
+# every run's outcome, oldest first
+grep ' status=' logs/run.log
+```
+
+Why it is worth having: seven consecutive failed runs used to produce seven
+byte-identical lines, so the log could not distinguish a day-long outage from a
+few bad runs, and dating one meant reading `state/seen.json`'s mtime and the
+launchd plist instead. Deriving the times from the plist's
+`StartCalendarInterval` is worse than it looks — it yields the times a run
+*should* have had, which is not when it ran.
+
 ### Slack renders mrkdwn, not Markdown
 
 Everything this repo posts to a Slack webhook goes through one function,

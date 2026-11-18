@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+import traceback
 from pathlib import Path
 
 from framework.approval_buttons import ListenerError, run_listener
@@ -36,6 +37,7 @@ from framework.registry import (
     build_source,
     load_plugins,
 )
+from framework.runlog import timestamped
 from framework.runner import run
 from framework.schedule import ScheduleError, install_schedule, uninstall_schedule
 from framework.state import SeenStore
@@ -73,7 +75,39 @@ def _report_failed_plugins(failures: dict[str, PluginImportFailure]) -> None:
         )
 
 
+# The exceptions `main()` turns into a one-line message and its own exit code.
+# `_cmd_run` lets these through untouched: they mean no run happened, so there
+# is no run log for them to belong to.
+_MAIN_FORMATS = (ConfigError, ListenerError, UnknownPluginError, PluginImportError)
+
+
 def _cmd_run(args: argparse.Namespace) -> int:
+    """Timestamp the whole run's output, then run (issue #139).
+
+    The wrapper goes around everything, not just `run()`, because a plugin that
+    failed to import is a fact about this run and lands in the same log as the
+    summary line.
+
+    A traceback needs printing from in here rather than being left to the
+    interpreter. The interpreter prints it only once the exception has left this
+    function, which is after the wrapper put the real streams back, so an
+    escaping exception would write the one part of a failed run that explains it
+    as the only untimed lines in the file. Printing it inside and exiting with
+    `SystemExit` keeps it timestamped and stops the interpreter printing it a
+    second time.
+    """
+    with timestamped():
+        try:
+            retval = _run_workspace(args)
+        except _MAIN_FORMATS:
+            raise
+        except BaseException:
+            traceback.print_exc()
+            raise SystemExit(1)
+    return retval
+
+
+def _run_workspace(args: argparse.Namespace) -> int:
     cfg = load_workspace(args.workspace)
 
     _report_failed_plugins(load_plugins())
@@ -219,7 +253,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         retval = args.func(args)
-    except (ConfigError, ListenerError, UnknownPluginError, PluginImportError) as exc:
+    except _MAIN_FORMATS as exc:
         print(f"agent: {exc}", file=sys.stderr)
         return 2
     except ScheduleError as exc:
