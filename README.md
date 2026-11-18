@@ -253,7 +253,11 @@ token is named by `bot_token_env`. Install it with `"listen": true` in the
 `approvals` block; `install-schedule` then writes a third job,
 `<label>.approvals.listen`, with `KeepAlive` and no interval, so launchd
 restarts it whenever it exits -- a dropped connection or a slept laptop becomes
-a reconnect. It needs `pip install '.[approvals-buttons]'` (slack_sdk,
+a reconnect. The listener is what holds launchd to that: it polls its own
+connection every 30 seconds and exits nonzero once it has been without one for
+three minutes, since a client that has stopped reconnecting on its own would
+otherwise keep the process alive, the job reported as running, and every button
+in the channel dead. It needs `pip install '.[approvals-buttons]'` (slack_sdk,
 websocket-client).
 
 #### Which Slack app the listener connects as
