@@ -15,7 +15,10 @@ Why Socket Mode. A button needs Slack to deliver the interaction somewhere,
 and the alternative is a public HTTPS endpoint for a fleet of agents that runs
 on one laptop. Socket Mode dials out instead, so `agent approvals --listen` is
 a long-running client holding that connection, installed by `install-schedule`
-with `KeepAlive` (framework/schedule.py) rather than an interval. Config:
+with `KeepAlive` (framework/schedule.py) rather than an interval. That it still
+*has* the connection is checked rather than assumed, because a client that has
+quietly stopped reconnecting leaves the job running and every button dead:
+`_watch_connection`. Config:
 
     "approvals": {
       "channel_id": "C0123456789",
@@ -87,6 +90,7 @@ from __future__ import annotations
 
 import os
 import sys
+import time
 from typing import Any
 
 import requests
@@ -117,6 +121,12 @@ from framework.slack import SLACK_BLOCK_LIMIT, split_for_slack
 ACTION_POST = "approval:post"
 ACTION_DRAFT = "approval:draft"
 ACTION_DISCARD = "approval:discard"
+
+# How the listener decides its connection is gone for good. slack_sdk rebuilds
+# a dropped session from its own monitor thread, so the grace window is there to
+# let that happen: only a connection still absent after it is treated as dead.
+_LIVENESS_POLL_SECONDS = 30.0
+_LIVENESS_GRACE_SECONDS = 180.0
 
 VARIANT_POST = "post"
 VARIANT_DRAFT = "draft"
@@ -679,7 +689,7 @@ def run_listener(cfg: ApprovalsConfig) -> int:
         # launchd restarts this job (KeepAlive), so the socket has to be closed
         # on the way out or every restart leaks one.
         client.connect()
-        _block_forever()
+        _watch_connection(client, cfg.agent)
     except KeyboardInterrupt:
         print(f"agent={cfg.agent} listener stopped", flush=True)
     finally:
@@ -717,3 +727,49 @@ def _block_forever() -> None:
     from threading import Event
 
     Event().wait()
+
+
+def _watch_connection(client: Any, agent: str) -> None:
+    """Block while the connection holds, and exit nonzero once it does not.
+
+    This is what makes `KeepAlive` mean what framework/schedule.py says it
+    means. launchd restarts this job whenever it exits, "which is how a dropped
+    connection or a slept laptop becomes a reconnect" -- but only if a listener
+    that has lost its connection actually exits. Blocking on an event that is
+    never set does not: when slack_sdk stops rebuilding the session, the
+    process stays alive, launchd reports the job as running, and every button
+    in the channel is dead with nothing in any log to say so. Measured once:
+    six days up, zero network sockets open, the last click handled 27 days
+    earlier. The reply grammar kept working the whole time, which is what made
+    it survivable and also what hid it.
+
+    The grace window is why this watches rather than exits on the first miss.
+    The SDK reconnects on its own from its monitor thread, and a laptop waking
+    up or a wifi change should become a reconnect rather than a process
+    restart; `ThrottleInterval` bounds the restarts that do happen at one a
+    minute. So a connection is called dead only once it has been absent across
+    the whole window, and any single poll finding it back resets that.
+
+    Raising `SystemExit` rather than returning keeps the exit code off the
+    healthy path and still runs `run_listener`'s `finally`, which has to close
+    the socket (a restart would otherwise leak one) and the action page.
+    """
+    down_since: float | None = None
+    while True:
+        time.sleep(_LIVENESS_POLL_SECONDS)
+        if client.is_connected():
+            down_since = None
+            continue
+        now = time.monotonic()
+        if down_since is None:
+            down_since = now
+            continue
+        down_for = now - down_since
+        if down_for < _LIVENESS_GRACE_SECONDS:
+            continue
+        print(
+            f"agent={agent} no socket mode connection for {int(down_for)}s: "
+            "exiting so launchd starts a listener that has one",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
