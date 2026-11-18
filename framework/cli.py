@@ -95,13 +95,20 @@ def _cmd_run(args: argparse.Namespace) -> int:
     as the only untimed lines in the file. Printing it inside and exiting with
     `SystemExit` keeps it timestamped and stops the interpreter printing it a
     second time.
+
+    `Exception`, not `BaseException`: a `KeyboardInterrupt` or a `SystemExit`
+    says the run was ended on purpose, and reporting that as a failed run with
+    a traceback and exit 1 would lose the interrupt's own exit status and could
+    have a scheduler retry something a person had just stopped. Those two keep
+    their normal semantics, and the timestamped-traceback guarantee is for the
+    unexpected failures it was written for.
     """
     with timestamped():
         try:
             retval = _run_workspace(args)
         except _MAIN_FORMATS:
             raise
-        except BaseException:
+        except Exception:
             traceback.print_exc()
             raise SystemExit(1)
     return retval
