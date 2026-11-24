@@ -42,15 +42,27 @@ pip install -e .
 mkdir -p ~/agent-workspaces/reddit-leads
 cp agents/reddit-leads/config.example.json \
    ~/agent-workspaces/reddit-leads/config.json
-# Edit that file: the subreddits and the scoring rules are yours. The example
-# ships the keyword scorer, which needs no model and no key; swapping it for
-# "type": "llm" is what the deployment above runs. The Slack webhook is not
-# written in the file -- the route names an environment variable
-# (SLACK_LEADS_WEBHOOK in the example) that holds the URL.
+# Edit that file. Two edits are needed before the first run; the rest is
+# yours.
+#
+#   1. Delete the "drafter" block under "destination". It names three
+#      grounding documents by absolute path, and those are placeholders.
+#      Grounding files are read when the agent starts and a missing one is
+#      refused rather than skipped: a draft makes claims about you, so an
+#      unreadable source is a misconfiguration and not a degraded run. Put
+#      the block back, with real paths, when you want drafts.
+#   2. Set SLACK_LEADS_WEBHOOK. The webhook URL is deliberately not written
+#      in the file -- the route names the environment variable that holds it.
+#
+# After that the subreddits and the scoring rules are yours. The example ships
+# the keyword scorer, which needs no model and no key. Swapping it for
+# "type": "llm" is what the deployment above runs, and that one also needs a
+# model chain: an "llm" block in this file, or a shared one at
+# <workspaces-root>/_shared/llm.json (see LLM waterfall below).
 agent run --workspace ~/agent-workspaces/reddit-leads
 ```
 
-Nothing else is needed to see a run end to end. The workspace is a directory
+With those two edits the run goes end to end. The workspace is a directory
 outside any git checkout holding that agent's config, its dedupe state and its
 logs, which is what makes a merge to master not a deploy; see
 [Layout](#layout). When the run looks right,
