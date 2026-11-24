@@ -19,7 +19,7 @@
   },
   "scorer": {
     "type": "regex",
-    "_comment": "match=presence scores a keyword once however often it appears; the reference counts distinct keywords matched. The grouped alternations (question markers, frustration markers, vendor posts) are deliberate: the reference applies each bonus/penalty ONCE via any(...), so splitting them into separate rules would stack points per matching phrase. The question rule tests the TITLE only, which ^[^\\n]* expresses because Signal.text is 'title\\n\\ncontent'.",
+    "_comment": "match=presence scores a keyword once however often it appears; the reference counts distinct keywords matched. The grouped alternations (question markers, frustration markers, vendor posts) are deliberate: the reference applies each bonus/penalty ONCE via any(...), so splitting them into separate rules would stack points per matching phrase. The question rule tests the TITLE only, which ^[^\\n]* expresses because Signal.text is 'title\\n\\ncontent'. This is the scorer the example ships because it needs no model and no API key: copy the file in, run it, and see a scored run. It is not what the deployment this example came from runs. That one scores with a model, which is the '_llm_scorer_example' block below: make that object the value of 'scorer' in place of this one.",
     "ignore_case": true,
     "match": "presence",
     "floor": 0,
@@ -109,6 +109,13 @@
         "points": -30
       }
     ]
+  },
+  "_llm_scorer_example": {
+    "_comment": "Alternative 'scorer' block, the one the deployment runs (issue #9). The framework ignores this top-level key; to use it, make this object the value of 'scorer' in place of the regex block above. Keyword matching cannot tell \"I hate our spreadsheet process\" from \"I hate how much I love my spreadsheet\"; this asks a model the question the agent actually cares about and reads back a number on the same 0..100 scale, so 'min_score' on the destination's routes keeps working unchanged. There is no 'llm' block here on purpose: the model chain comes from the deployment's <workspaces-root>/_shared/llm.json, and a per-agent chain would be one more copy to keep in step (issue #60). A reply the scorer cannot read as JSON is retried once with the format restated and then raises, which leaves that one signal unscored and unseen rather than scoring it 0 - a 0 would mark it seen and drop it silently.",
+    "type": "llm",
+    "prompt": "Score this post for how strongly it is somebody describing a problem they have, in their own voice, that an outside specialist could be paid to solve. 100 is an operator spelling out a costly, recurring, specific problem and asking how to fix it. 0 is anything else: a vendor pitching, a news link, a general discussion, a question about a hobby, or a complaint with no work behind it. Score the problem, not the writing quality, and be strict - most posts are 0.",
+    "max_tokens": 1500,
+    "_max_tokens_comment": "Set this explicitly and generously. The framework default is 200, and a reasoning model spends its budget on reasoning tokens before it writes any text, so a small budget returns a reply cut off mid-object. The scorer then reports that it found no JSON object with a 'score', quoting a snippet that visibly contains one, which reads like a prompt problem and is a budget problem."
   },
   "destination": {
     "type": "slack",
