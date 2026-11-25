@@ -22,3 +22,6 @@ agents/*/state/
 
 # setuptools build tree
 build/
+
+# wheel and sdist, built by scripts and by CI
+dist/

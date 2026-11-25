@@ -1,0 +1,208 @@
+name: checks
+
+# One workflow on purpose: the release job `needs` the check job, so nothing is
+# published to PyPI or tagged from a master commit whose checks failed or are
+# still running. Two push-triggered workflows have no ordering between them.
+#
+# Same shape as voitta-gateway's, with a wheel where that one has a container
+# image, and one fewer moving part: this package has a single version source
+# (pyproject.toml), so there is no second number to hold equal.
+
+on:
+  pull_request:
+  push:
+    branches: [master]
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    strategy:
+      # Both versions report, rather than the first failure cancelling the
+      # other: "fails on 3.10, passes on 3.13" is the useful signal, and
+      # cancelling hides half of it.
+      fail-fast: false
+      matrix:
+        # 3.10 is the floor pyproject declares; 3.13 is the newest release it
+        # should work on. A single version proves the least interesting case --
+        # whatever happens to be installed -- and the floor is where a consumer
+        # is most likely to be.
+        python-version: ['3.10', '3.13']
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      # Every extra, not just the base dependencies. The import gate below is
+      # only meaningful when each plugin's optional dependency is actually
+      # present: with them missing, a plugin whose dependency is declared
+      # nowhere looks exactly like one whose extra simply was not installed.
+      - name: Install
+        run: pip install -e '.[slack-session,twitter,approvals-buttons]'
+
+      # Known-vulnerability gate over the installed dependency set. The package
+      # itself is editable here and so is excluded; it is the dependencies that
+      # carry the CVEs. --strict: a package pip-audit cannot resolve fails the
+      # build instead of being silently skipped.
+      #
+      # The ignored ids are all one problem. pycookiecheat -- the only way the
+      # slack-session extra reads the browser cookie store -- hard-pins
+      # `cryptography==43.*`, and 0.8.0, its newest release, still does. The 43
+      # line is out of support and carries exactly these vulnerabilities, with
+      # fixes in 44, 46, 48 and 49, none of which that pin admits. So nothing
+      # in this repo resolves them, and the choice is between a gate that can
+      # never pass and an exception that states its own cause.
+      #
+      # The exception is not permanent: the step below fails the build the
+      # moment a different pycookiecheat is installed, because that is the
+      # event which makes this list worth deriving again.
+      - name: pip-audit
+        run: |
+          pip freeze --exclude-editable > /tmp/frozen.txt
+          pip install pip-audit
+          pip-audit --strict --disable-pip --no-deps -r /tmp/frozen.txt \
+            --ignore-vuln PYSEC-2026-1284 \
+            --ignore-vuln PYSEC-2026-2141 \
+            --ignore-vuln PYSEC-2026-35 \
+            --ignore-vuln PYSEC-2026-3553 \
+            --ignore-vuln PYSEC-2026-3554 \
+            --ignore-vuln GHSA-537c-gmf6-5ccf
+
+      # The premise of the exception above, asserted rather than assumed. A
+      # security exception that outlives its cause is worse than no exception,
+      # because it reads as reviewed. pyproject floors pycookiecheat rather than
+      # pinning it, so a new release arrives here on its own; when it does, this
+      # fails with instructions instead of quietly widening what is ignored.
+      - name: The cryptography exception still applies
+        run: |
+          version=$(pip show pycookiecheat | sed -n 's/^Version: //p')
+          if [ "$version" != "0.8.0" ]; then
+            echo "::error::pycookiecheat is $version, not 0.8.0. The cryptography ignores in the pip-audit step were justified by 0.8.0 hard-pinning cryptography==43.*. Check this version's constraint, re-derive the ignore list against it, and update both steps."
+            exit 1
+          fi
+          echo "pycookiecheat $version, cryptography==43.* pin confirmed"
+
+      # Three structural gates in one script, documented in its docstring: every
+      # plugin module imports with all extras installed, the _PLUGIN_MODULES
+      # table agrees with the @register_* decorators, and every "type" in every
+      # shipped example config resolves to a real plugin. This repo carries no
+      # test suite by policy; these are the checks that would have caught the
+      # defects it has actually shipped.
+      - name: Plugins and examples agree with the code
+        run: python3 scripts/check-examples.py
+
+      # The console script is declared metadata, so a broken entry point fails
+      # only on first use -- which, for a published package, is a stranger's
+      # first use.
+      - name: Console script runs
+        run: agent --help > /dev/null
+
+      # Builds the artifacts the release job will publish, so a packaging defect
+      # fails on the PR rather than on master after merge. --strict makes a
+      # metadata warning an error: a missing long_description is a blank PyPI
+      # project page, which is a defect in a published package even though
+      # nothing about the wheel is wrong.
+      - name: Build and check metadata
+        run: |
+          pip install build twine
+          python -m build
+          twine check --strict dist/*
+
+  # Tag-on-bump, as in voitta-gateway. Feature PRs leave the version alone; a
+  # release is its own commit that moves `version` in pyproject.toml. A version
+  # with no tag is published to PyPI, then tagged and released, in that order:
+  # the tag is the record that the release finished, so a failure partway leaves
+  # no tag and a rerun retries the whole thing.
+  release:
+    needs: check
+    # One release at a time, never cancelled midway: two master pushes in quick
+    # succession would otherwise both see the version untagged and race to
+    # publish it from different commits. The second waits, then sees the tag.
+    concurrency:
+      group: release
+      cancel-in-progress: false
+    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+    runs-on: ubuntu-latest
+    # PyPI recommends scoping trusted publishing to a GitHub environment, and
+    # this is what that buys: the OIDC claim carries the environment name, so a
+    # token minted from anywhere else is refused even on a master push, and any
+    # protection rule added here later (a required reviewer, a branch
+    # restriction) gates publishing without touching this file. The name has to
+    # match the environment in the PyPI publisher configuration exactly; a
+    # mismatch fails the upload with a claim error rather than a permission one.
+    environment: pypi
+    permissions:
+      contents: write   # push the tag, create the GitHub release
+      id-token: write   # OIDC for PyPI trusted publishing: no stored API token
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        # The wheel is py3-none-any, so the building interpreter does not end up
+        # in the artifact; the check job above is where the version range is
+        # exercised. tomllib needs 3.11+, which is why this is not the 3.10 floor.
+        with:
+          python-version: '3.12'
+
+      - name: Is this version new?
+        id: version
+        run: |
+          version=$(python3 -c 'import tomllib,pathlib; print(tomllib.loads(pathlib.Path("pyproject.toml").read_text())["project"]["version"])')
+          if [ -z "$version" ]; then
+            echo "::error::could not read [project] version from pyproject.toml"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          if git rev-parse -q --verify "refs/tags/v$version" >/dev/null; then
+            echo "v$version is already tagged; nothing to release."
+            echo "new=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "new=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build
+        if: steps.version.outputs.new == 'true'
+        run: |
+          pip install build
+          python -m build
+
+      # Trusted publishing: the OIDC token above stands in for an API token, so
+      # there is no secret in this repo to leak or rotate. It requires a
+      # one-time publisher configured on pypi.org for this project, naming this
+      # repository and this workflow file.
+      #
+      # skip-existing, because publishing is the one step here that cannot be
+      # undone. A version on PyPI can be yanked but never replaced, so if the
+      # upload succeeds and the tagging step then fails, a rerun must be able to
+      # finish the job rather than die on a duplicate it already uploaded.
+      - name: Publish to PyPI
+        if: steps.version.outputs.new == 'true'
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          skip-existing: true
+
+      - name: Tag and release
+        if: steps.version.outputs.new == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          # Curated notes when the release deserved prose, generated from merged
+          # PR titles otherwise -- a release should never block on writing. The
+          # same artifacts that went to PyPI are attached, so the release page is
+          # a complete install path on its own.
+          notes="docs/release-notes/v$VERSION.md"
+          if [ -f "$notes" ]; then
+            gh release create "v$VERSION" --title "v$VERSION" --notes-file "$notes" \
+              --target "$GITHUB_SHA" dist/*
+          else
+            gh release create "v$VERSION" --title "v$VERSION" --generate-notes \
+              --target "$GITHUB_SHA" dist/*
+          fi

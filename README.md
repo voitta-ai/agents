@@ -1107,6 +1107,28 @@ Equal prefixes mean the same credential. This is how you confirm a deployment is
 bound to the webhook you think it is, and which of several is safe to delete,
 without printing a secret into a terminal, a log, or an agent transcript.
 
+## Releasing
+
+Releases are tag-on-bump. There is no release workflow to run and no tag to
+push by hand: `.github/workflows/checks.yml` reads `version` from
+`pyproject.toml` on every push to master, and if no `v<version>` tag exists it
+publishes the wheel to PyPI, then creates the tag and the GitHub release.
+
+The consequence worth knowing before you open a pull request: **a feature PR
+must leave the version alone.** Bumping it there means the merge publishes,
+which is almost never what a feature PR intends. A release is its own commit
+that moves nothing but the version.
+
+Tag last, deliberately. The tag is the record that a release finished, so a
+failure partway through leaves no tag and a rerun retries the whole thing. The
+upload to PyPI is the one step that cannot be undone -- a version there can be
+yanked but never replaced -- so it is also the one step a rerun skips rather
+than repeats.
+
+Notes come from `docs/release-notes/v<version>.md` when that file exists, and
+are generated from merged pull request titles when it does not. Write the file
+when a release deserves prose; a release should not block on writing it.
+
 ## Status
 
 In use rather than finished: the agents above run on a schedule against live
