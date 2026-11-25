@@ -2,7 +2,16 @@
 name = "agents-framework"
 version = "0.2.0"
 description = "Framework for small, single-purpose pain-signal / lead-finding agents."
-requires-python = ">=3.10"
+# The PyPI project page is this README. Without it the page renders empty,
+# and `twine check --strict` in CI fails rather than warning.
+readme = "README.md"
+# 3.11, not 3.10, for two reasons that arrived together. 3.10 reached
+# end-of-life on 2026-10-01, and filelock -- reached through litellm and
+# huggingface_hub -- publishes its fixes only for 3.11 and up: 4.1.0 is the
+# last build installable on 3.10 and carries seventeen findings fixed in
+# 4.2.1. So the old floor could not be made secure, which the CI audit gate
+# found by failing on 3.10 while passing on 3.13.
+requires-python = ">=3.11"
 license = "AGPL-3.0-or-later"
 license-files = ["LICENSE"]
 dependencies = [
@@ -23,6 +32,11 @@ slack-session = ["pycookiecheat>=0.6"]
 twitter = ["requests-oauthlib>=1.3"]
 # approval buttons over Socket Mode: `agent approvals --listen` (issue #74).
 approvals-buttons = ["slack_sdk>=3.27", "websocket-client>=1.7"]
+
+[project.urls]
+Homepage = "https://github.com/voitta-ai/agents"
+Source = "https://github.com/voitta-ai/agents"
+Releases = "https://github.com/voitta-ai/agents/releases"
 
 [project.scripts]
 agent = "framework.cli:main"
