@@ -21,15 +21,17 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       # Both versions report, rather than the first failure cancelling the
-      # other: "fails on 3.10, passes on 3.13" is the useful signal, and
-      # cancelling hides half of it.
+      # other: "fails on the floor, passes on the newest" is the useful signal,
+      # and cancelling hides half of it. That is not hypothetical -- it is how
+      # the floor moved from 3.10 to 3.11 (see pyproject.toml).
       fail-fast: false
       matrix:
-        # 3.10 is the floor pyproject declares; 3.13 is the newest release it
-        # should work on. A single version proves the least interesting case --
-        # whatever happens to be installed -- and the floor is where a consumer
-        # is most likely to be.
-        python-version: ['3.10', '3.13']
+        # The floor pyproject declares, and the newest release this should work
+        # on. A single version proves the least interesting case -- whatever
+        # happens to be installed -- and the floor is where a consumer is most
+        # likely to be, so it is also where an unpatchable transitive
+        # dependency shows up first.
+        python-version: ['3.11', '3.13']
     steps:
       - uses: actions/checkout@v4
 
@@ -147,7 +149,7 @@ jobs:
       - uses: actions/setup-python@v5
         # The wheel is py3-none-any, so the building interpreter does not end up
         # in the artifact; the check job above is where the version range is
-        # exercised. tomllib needs 3.11+, which is why this is not the 3.10 floor.
+        # exercised. tomllib needs 3.11+, which the floor now satisfies anyway.
         with:
           python-version: '3.12'
 
