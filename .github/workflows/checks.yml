@@ -44,8 +44,17 @@ jobs:
       # only meaningful when each plugin's optional dependency is actually
       # present: with them missing, a plugin whose dependency is declared
       # nowhere looks exactly like one whose extra simply was not installed.
+      #
+      # The list is read out of pyproject rather than written here. A hand-kept
+      # copy would silently stop covering the next extra someone adds, which is
+      # the same drift the _PLUGIN_MODULES check below exists to catch one layer
+      # down -- and a gate whose coverage quietly shrinks is worse than a gate
+      # that fails.
       - name: Install
-        run: pip install -e '.[slack-session,twitter,approvals-buttons]'
+        run: |
+          extras=$(python3 -c 'import tomllib, pathlib; print(",".join(tomllib.loads(pathlib.Path("pyproject.toml").read_text())["project"]["optional-dependencies"]))')
+          echo "extras: $extras"
+          pip install -e ".[$extras]"
 
       # Known-vulnerability gate over the installed dependency set. The package
       # itself is editable here and so is excluded; it is the dependencies that
@@ -169,6 +178,48 @@ jobs:
             echo "new=true" >> "$GITHUB_OUTPUT"
           fi
 
+      # An untagged version is normally one that has never been released. It can
+      # also be one that reached PyPI and failed before the tag, and those two
+      # look identical from here -- which is how a tag ends up on the wrong
+      # commit. If the upload succeeds and the tagging step fails, no tag
+      # exists; the next push to master, any push, still reads this version as
+      # new, rebuilds from THAT commit, skips the already-published files, and
+      # tags that later commit. The tag, the attached artifacts and the package
+      # on PyPI would then describe three different trees, with nothing saying
+      # so.
+      #
+      # So the state is detected rather than guessed at. PyPI answers 200 for a
+      # version it has and 404 for one it does not, and anything else is treated
+      # as unknown and fails: on a publish path, failing closed costs a rerun
+      # and failing open costs a wrong tag. Recovery is deliberately a human
+      # decision, because only a person can say whether to tag the commit that
+      # actually published or to move on to a new version.
+      - name: Is this version already on PyPI?
+        if: steps.version.outputs.new == 'true'
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          # --max-time so an unresponsive PyPI fails in seconds rather than
+          # occupying a runner. `|| true` because the default shell is `bash -e`
+          # and a curl that cannot connect must reach the case below with its
+          # own 000 rather than aborting the step with no message.
+          code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 30 \
+            "https://pypi.org/pypi/agents-framework/$VERSION/json" || true)
+          code=${code:-000}
+          case "$code" in
+            404)
+              echo "$VERSION is not on PyPI; releasing it."
+              ;;
+            200)
+              echo "::error::$VERSION is already on PyPI but has no v$VERSION tag in this repo. That means an earlier run published it and failed before tagging, so this commit is probably not the one that was distributed. Do not let this job tag it. Find the commit whose run uploaded $VERSION, tag that commit and create its release by hand, or bump to a new version in a fresh commit."
+              exit 1
+              ;;
+            *)
+              echo "::error::could not determine whether $VERSION is on PyPI (HTTP $code). Refusing to publish rather than risk a duplicate or a mistagged release."
+              exit 1
+              ;;
+          esac
+
       - name: Build
         if: steps.version.outputs.new == 'true'
         run: |
@@ -184,10 +235,20 @@ jobs:
       # undone. A version on PyPI can be yanked but never replaced, so if the
       # upload succeeds and the tagging step then fails, a rerun must be able to
       # finish the job rather than die on a duplicate it already uploaded.
+      #
+      # Pinned to a commit, not to `release/v1`, because this is the step the
+      # OIDC token is minted for: a moved tag upstream would run unreviewed code
+      # with authority to publish under our name. The two `actions/*` steps above
+      # stay on major tags deliberately -- they are GitHub's own, and pinning
+      # them in a repo with no dependency automation trades an upstream security
+      # fix that arrives by itself for one that waits on somebody noticing.
       - name: Publish to PyPI
         if: steps.version.outputs.new == 'true'
-        uses: pypa/gh-action-pypi-publish@release/v1
+        uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086  # v1.14.3
         with:
+          # Belt and braces behind the PyPI check above: that check is what keeps
+          # a tag off the wrong commit, and this keeps a partially-uploaded set
+          # of files from failing a retry on the ones that landed.
           skip-existing: true
 
       - name: Tag and release
@@ -198,8 +259,12 @@ jobs:
         run: |
           # Curated notes when the release deserved prose, generated from merged
           # PR titles otherwise -- a release should never block on writing. The
-          # same artifacts that went to PyPI are attached, so the release page is
-          # a complete install path on its own.
+          # artifacts are attached too, so the release page is a complete install
+          # path on its own.
+          #
+          # These assets are a copy; PyPI is the authority on what `pip install`
+          # resolves. They are built in this job from this commit, and the PyPI
+          # check above is what guarantees the two came from the same tree.
           notes="docs/release-notes/v$VERSION.md"
           if [ -f "$notes" ]; then
             gh release create "v$VERSION" --title "v$VERSION" --notes-file "$notes" \
